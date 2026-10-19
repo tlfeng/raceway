@@ -1,0 +1,8 @@
+vm-bench.env
+campaigns/
+exports/
+logs/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
