@@ -112,10 +112,10 @@ force_merge_to_one() { # <index> <max_wait_sec>
     "https://$ip:$HTTP_PORT/$idx/_forcemerge?max_num_segments=1" >/dev/null 2>&1
   while [ $SECONDS -lt $deadline ]; do
     n=$(nonseg_shards "$idx")
-    [ "$n" = "0" ] && { log "  段数门禁通过: $idx 每主分片 1 段"; return 0; }
+    [ "$n" = "0" ] && { log "  段数卡点通过: $idx 每主分片 1 段"; return 0; }
     sleep 30
   done
-  log "  段数门禁失败: $idx 仍有 $n 个分片 >1 段"
+  log "  段数卡点失败: $idx 仍有 $n 个分片 >1 段"
   return 1
 }
 
@@ -169,20 +169,20 @@ cpu_affinity_clear() { # 移除 drop-in（服务下次启动恢复全部核）
 
 # 实际堆断言（2026-10-16 新增）：归位重装/工件推送会把 bundle 原版 1g 堆带回来，
 # user-tags 声明的 heap 与实际 -Xmx 可能不一致（10/15 ds3 事故：声明 16g 实际 1g，ez 全部场 -13%）。
-# 必须在引擎冷启动后调用（集群门禁之后）。全臂硬断言——堆由 ibs 部署时 configure_jvm_heap
+# 必须在引擎冷启动后调用（集群卡点之后）。全臂硬断言——堆由 ibs 部署时 configure_jvm_heap
 # 统一设定（easysearch 走 jvm.options 堆行、ES 走 jvm.options.d/heap.options，均为内存/2=16g）。
-heap_gate() { # <arm> <expected:16g> [dir] [svc] → 任一节点实际 -Xmx ≠ 声明则 rc=1
+heap_assert() { # <arm> <expected:16g> [dir] [svc] → 任一节点实际 -Xmx ≠ 声明则 rc=1
   local arm="$1" want="${2:-16g}" dir="${3:-$IBS_BASE/easysearch}" svc="${4:-easysearch}"
   local wg num unit gb ip pid xmx bad=0
   wg=$(echo "$want" | tr 'G' 'g'); wg=${wg%g}
   for ip in "${VM_IPS[@]}"; do
     pid=$(vm "$ip" "ps -eo pid,args | grep 'bin/java' | grep -F '$dir' | grep -v grep | awk '{print \$1}' | head -1")
     if [ -z "$pid" ]; then
-      log "  HEAP-GATE FAIL $ip: 未发现运行中 java 进程（$dir）"; bad=1; continue
+      log "  HEAP-ASSERT FAIL $ip: 未发现运行中 java 进程（$dir）"; bad=1; continue
     fi
     xmx=$(vm "$ip" "ps -p $pid -o args= | grep -oE -- '-Xmx[0-9]+[mMgG]' | head -1")
     if [ -z "$xmx" ]; then
-      log "  HEAP-GATE FAIL $ip: 进程 $pid 无显式 -Xmx（期望 $want）"; bad=1; continue
+      log "  HEAP-ASSERT FAIL $ip: 进程 $pid 无显式 -Xmx（期望 $want）"; bad=1; continue
     fi
     num=$(echo "$xmx" | grep -oE '[0-9]+'); unit=$(echo "$xmx" | grep -oE '[mMgG]$')
     case "$unit" in
@@ -190,9 +190,9 @@ heap_gate() { # <arm> <expected:16g> [dir] [svc] → 任一节点实际 -Xmx ≠
       *)   gb=$num;;
     esac
     if awk -v a="$gb" -v b="$wg" 'BEGIN{exit !(a+0 == b+0)}'; then
-      log "  HEAP-GATE OK $ip: $pid -Xmx=$xmx = 声明 ${want}"
+      log "  HEAP-ASSERT OK $ip: $pid -Xmx=$xmx = 声明 ${want}"
     else
-      log "  HEAP-GATE FAIL $ip: 进程 $pid 实际 $xmx ≠ 声明 ${want}（归位/推送丢堆配置？）"; bad=1
+      log "  HEAP-ASSERT FAIL $ip: 进程 $pid 实际 $xmx ≠ 声明 ${want}（归位/推送丢堆配置？）"; bad=1
     fi
   done
   return $bad

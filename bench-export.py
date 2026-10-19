@@ -327,7 +327,7 @@ def main():
         elif camp not in metas:
             unmatched += 1
 
-    # monitors → system 指标（bench-metric 补一行/场/节点/项）
+    # monitors → system 指标（bench-metric 补一行/场/节点/相位/项）
     sysrows = 0
     for camp, meta in metas.items():
         for key, vals in (meta.get("mon") or {}).items():
@@ -335,12 +335,19 @@ def main():
             # 必须按尾部的 -test-worker-N 切，否则 fid 被截成 "es819"，环境行与场次对不上
             m = re.match(r"^(.*)-(test-worker-\d+)$", key)
             fid, node = (m.group(1), m.group(2)) if m else (key.partition("-")[0], key.partition("-")[2])
+            # 相位后缀 -w/-m/-q（分相位采集，与 race 行 phase=w/q 同词汇）；剥掉后缀让
+            # 环境行与 race 行同 fid 对上，相位记进 phase 字段。报告侧按 fid 聚合取最坏
+            # 即自动跨相位；历史 campaign 无后缀 → phase=""
+            ph = ""
+            if fid.endswith(("-w", "-m", "-q")):
+                ph, fid = fid[-1], fid[:-2]
             for mk, mv in (vals or {}).items():
                 if mv is None:
                     continue
                 sysrows += 1
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                 "@timestamp": None, "campaign": camp, "fid": fid, "node": node,
+                                "phase": ph,
                                 "family": "system", "metric": mk, "stat": "value",
                                 "value": (mv / 100.0 if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util")) else mv),
                                 "unit": ("ratio" if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util"))

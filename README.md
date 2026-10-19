@@ -1,15 +1,15 @@
 # raceway
 
-搜索引擎性能编排（easysearch / elasticsearch × esrally，2~N 节点，拓扑取自 ibs ip.txt）：**配置文件排程、轮内配对交错、门禁链、sidecar 元数据、ES 入库**。一次跑分在 esrally 语境里叫 a race——本工具就是排这些 race 的赛场。
+搜索引擎性能编排（easysearch / elasticsearch × esrally，2~N 节点，拓扑取自 ibs ip.txt）：**配置文件排程、轮内配对交错、卡点链、sidecar 元数据、ES 入库**。一次跑分在 esrally 语境里叫 a race——本工具就是排这些 race 的赛场。
 
-> 命名与生态：配置是车手，轮次是圈速，门禁是赛会检查，campaign 是一场大奖赛。
+> 命名与生态：配置是车手，轮次是圈速，卡点是赛会检查，campaign 是一场大奖赛。
 
 ## 特性
 
 - **配置文件排程**：每行一个被测配置（引擎三元组 + JDK 目录 + 标签），轮内右旋配对交错摊薄时序效应
-- **门禁链**：赛前静默负载门禁 → 集群门禁（可达/green/节点数/版本/节点名/**端口属主**）→ 堆断言 → 绑核断言 → 段数门禁 → 指标非空断言；环境脏数据进不了结论
+- **卡点链**：赛前静默负载卡点 → 集群卡点（可达/green/节点数/版本/节点名/**端口属主**）→ 堆断言 → 绑核断言 → 段数卡点 → 指标非空断言；环境脏数据进不了结论
 - **无臂机制**：变体用户自管（`ENGINE_NAME/ENGINE_VERSION/ENGINE_BUILD` + `JDK_DIR`），实测身份（逐节点 java -version、索引 settings）由 sidecar 自动落档
-- **运维全托管**：部署/冷启动/门禁/卸载统一走 [ibs](https://github.com/tlfeng/ibs) CLI；堆由部署统一设定（内存/2）
+- **运维全托管**：部署/冷启动/卡点/卸载统一走 [ibs](https://github.com/tlfeng/ibs) CLI；堆由部署统一设定（内存/2）
 - **拓扑单事实源**：节点列表/数量/部署范围全部从 ibs `ip.txt` 派生（集群节点=主机名非 esrally 行），2~N 节点免改代码
 - **省心件**：`--dry-run` 排程预览 · 断点续跑（已 VALID 场自动跳过）· `list` 子命令 · 收尾 webhook 通知
 - **结果入库**：一键导出 `bench-env / bench-run / bench-metric` 三索引载荷（单位归一、幂等 upsert），Kibana/Grafana 直接建板
@@ -18,8 +18,8 @@
 
 | 层 | 内容 |
 |---|---|
-| 部署层 | [ibs](https://github.com/tlfeng/ibs) CLI：三节点集群部署（systemd+TLS+admin 初始化）、冷启动、门禁、卸载 |
-| 方法学层 | 本仓库 `run-bench.sh` 等：静默门禁 → 冷启动 → 集群门禁 → 监控 → write race → 段数门禁 → query race → ENV 判定 → 归档 |
+| 部署层 | [ibs](https://github.com/tlfeng/ibs) CLI：三节点集群部署（systemd+TLS+admin 初始化）、冷启动、卡点、卸载 |
+| 方法学层 | 本仓库 `run-bench.sh` 等：静默卡点 → 冷启动 → 集群卡点 → 监控 → write race → 段数卡点 → query race → ENV 判定 → 归档 |
 | 发压层 | esrally 2.12+，benchmark-only pipeline，驱动器与集群分离 |
 
 ## 仓库布局
@@ -29,8 +29,8 @@ run-bench.sh                 唯一编排入口（配置×赛道×轮次；list/
 vm-bench-lib.sh              公共函数库（被 source）
 vm-bench.env.example         共享配置模板（复制为 vm-bench.env 填写；真身不入库）
 reset-env.sh                 环境还原（停/清/卸载）
-precheck-gate.sh             赛前静默负载门禁
-load-monitor.sh              虚机侧零依赖逐秒采样器（纯 /proc）
+precheck.sh                  赛前静默负载卡点
+load-monitor.sh              虚机侧零依赖采样器（纯 /proc，5s；按 w/m/q 相位分 tag）
 cpu-affinity.sh              引擎绑核（模拟小规格招标环境）
 prepare-{codec,hv1024,nested}-track.sh   赛道变体生成（幂等）
 arm-compare.py               两配置对比 + --assert 阈值断言（FAIL 退出码 1）

@@ -298,7 +298,7 @@ c=card('② 写入尾部：bulk service_time 分臂对比（每个赛道一张�
      itemStyle:{color:colors[x.arm]||'#999'},data:[x.p50,x.p90,x.p99,x.p100].map(v=>v==null?null:v*1000)}))});})}
 
 /* 3 逐轮明细 + 环境 */
-c=card('③ 逐场明细：吞吐、任务时长、环境实测','steal / iowait / load1 来自每场逐秒采集（三节点取最坏值），只记录不参与判定；steal 全程 0 说明本环境宿主抢占不是波动主因');
+c=card('③ 逐场明细：吞吐、任务时长、环境实测','steal / iowait / load1 来自每场分相位采样（w/m/q 三相位 × 三节点取最坏，5s 周期），只记录不参与判定；steal 全程 0 说明本环境宿主抢占不是波动主因');
 let tb=el('table');tb.innerHTML='<tr><th>场</th><th>臂</th><th>赛道</th><th>口径B docs/s</th><th>任务 s</th><th>steal 峰%</th><th>iowait 峰%</th><th>load1 峰</th><th>disk util%</th><th>判定</th></tr>'+
  D.cards.flatMap(x=>x.rounds.map(q=>`<tr><td>${q.fid}</td><td class=mut>${x.arm}</td><td>${x.track}</td><td>${num(q.b)}</td><td>${num(q.dur,1)}</td><td>${num((q.env.cpu_steal_max||0),2)}</td><td>${num((q.env.cpu_iowait_avg||0),2)}</td><td>${num(q.env.cpu_load1_max,2)}</td><td>${num(q.env.disk_util_avg,1)}</td><td>${q.status||'—'}</td></tr>`));
 c.appendChild(tb);
@@ -363,7 +363,7 @@ mk(box, {tooltip:{trigger:'axis',formatter:ps=>ps.filter(p=>p.data).map(p=>`${p.
      return camps.map(x=>m[x]?{value:Math.round(m[x].med),campaign:x,n:m[x].n,warn:m[x].warn}:null)})()}))).flat()});
 
 /* 8 环境实测 */
-c=card('⑧ 逐场环境实测（27 场 × 三节点取最坏，逐秒采集）','负载门禁只在起跑前查一次，赛中纯记录：这张图就是"数字可不可信"的证据链。steal 全程 0 ⇒ 宿主抢占不是本批波动来源');
+c=card('⑧ 逐场环境实测（27 场 × 三节点 × w/m/q 三相位取最坏，5s 采样）','负载卡点只在起跑前查一次，赛中纯记录：这张图就是"数字可不可信"的证据链。steal 全程 0 ⇒ 宿主抢占不是本批波动来源');
 {const E=(D.env||[]).filter(x=>x.fid);const names=E.map(x=>x.fid);
  const mkBar=(key,unit,scale)=>({name:key,type:'bar',barMaxWidth:9,tooltip:{valueFormatter:v=>v+' '+unit},
    data:E.map(x=>x[key]==null?null:+(x[key]*(scale||1)).toFixed(3))});
@@ -464,7 +464,7 @@ def main():
             os.path.join(args.export, "bench-metric.jsonl"), ccamp), ccamp)
     payload["head"] = [
         "campaign %s：3 臂 × 3 赛道 × 3 轮 = 27 场，全 VALID、0 重试" % camp,
-        "口径 16g 堆 / 32 vCPU 逐场实测断言；负载门禁仅起跑前一次，赛中逐秒采集只记录",
+        "口径 16g 堆 / 32 vCPU 逐场实测断言；负载卡点仅起跑前一次，赛中分相位采样只记录",
         "写入暖机：geo 20s、nested 25s、hnsw 40s（原 geo 70s / nested 120s 会吃掉测量窗口）",
         "生成于导出载荷 bench-run/bench-metric（离线，未依赖 ES）",
     ]
@@ -472,7 +472,7 @@ def main():
         "Kona 25 与 Oracle GraalVM 25 在三赛道写入上全部持平：geo +0.6%、hnsw +1.9%、nested +2.2%，均小于同臂轮间极差（7.8~25.5%）。此前「Kona 快 14~17%」与「nested GraalVM 快 19%」均未复现，已撤回。",
         "2.5.0 相对 2.4.0 有实质收益：geonames 写入 +12.4%、hnsw 建库 +21.9%、knn 查询 p50 −15~19%、painless_dynamic −17%、bulk p100 5.6s→4.4s；nested 文档灌入 +0.7%（无收益）。",
         "复现性最好的赛道是 hnsw（同臂极差 1.3~3.8%），最差是 nested（14.7~25.5%）；比较结论应取中位并要求 ≥3 轮同场配对。",
-        "环境证据：27 场逐秒采集显示 steal 全程 0.00%、iowait ≤2%、disk util 3~5%、load1 ≤6.6（32 核）、ENV-VERDICT 全 OK ⇒ 宿主抢占无法解释历史上 45% 的读数散布；跨 campaign 电平漂移（hnsw 三批 4828→4652→4199）需在集群内部（merge/页缓存/JIT 状态）继续找因。",
+        "环境证据：27 场分相位采样显示 steal 全程 0.00%、iowait ≤2%、disk util 3~5%、load1 ≤6.6（32 核）、ENV-VERDICT 全 OK ⇒ 宿主抢占无法解释历史上 45% 的读数散布；跨 campaign 电平漂移（hnsw 三批 4828→4652→4199）需在集群内部（merge/页缓存/JIT 状态）继续找因。",
     ]
     if payload.get("codec"):
         ca = {a["key"]: a for a in payload["codec"]["arms"]}
@@ -490,7 +490,7 @@ def main():
                     ("`scroll` p50 %.1fms→%.1fms（%+.0f%%）是最大短板，排序/取源类普遍 +2~4ms" % (
                         scroll["vals"]["ez-def"] * 1000, scroll["vals"]["ez-zstd-sr"] * 1000, scroll["d_ez"]))
                     if (scroll and scroll.get("d_ez") is not None) else "排序/取源类普遍 +2~4ms"),
-                "口径修正：ES 8.19 出厂 `config/jvm.options` 没有 `-Xms/-Xmx`，堆走 JVM 默认（物理内存 1/4 = 8g@32G 虚机）；本 campaign 每场 es819 赛前写死 `jvm.options.d/heap.options` 并由 heap_gate 硬断言，三节点实测 16384MB。10-13/10-15 的 es819 场是 8g vs 16g 不同基，不可与本批直接比。",
+                "口径修正：ES 8.19 出厂 `config/jvm.options` 没有 `-Xms/-Xmx`，堆走 JVM 默认（物理内存 1/4 = 8g@32G 虚机）；本 campaign 每场 es819 赛前写死 `jvm.options.d/heap.options` 并由 heap_assert 硬断言，三节点实测 16384MB。10-13/10-15 的 es819 场是 8g vs 16g 不同基，不可与本批直接比。",
             ]
     html = HTML.replace("__DATA__", json.dumps(payload, ensure_ascii=False))
     html = html.replace("__ECHARTS__", open(args.echarts, encoding="utf-8", errors="replace").read())

@@ -27,14 +27,14 @@
 #             即自动回切自带）。elasticsearch 用自带 JDK，不支持 JDK_DIR。
 #   ARM_LABEL 元数据标签（进 user-tags / sidecar / 场次名），默认 = JDK_DIR basename 或
 #             engine 名+版本（如 easysearch-2.5.0-3015）；多配置时标签必须互不相同
-#   JDK_WANT  可选期望身份 "major|vendor"（如 "25|OpenJDK"），仅作 sidecar 元数据，无硬门禁；
+#   JDK_WANT  可选期望身份 "major|vendor"（如 "25|OpenJDK"），仅作 sidecar 元数据，无硬性卡点；
 #             逐节点实测 java -version 由 sidecar 自动落档（results/<fid>-<ph>-sidecar.json）
 #
 # 每场: reset(只停集群) → 赛前负载检测 → ibs 引擎就位 → JDK 就位(JDK_DIR 换入/回切)
-#       → ibs wipe 冷启动 → 集群门禁(gate 含端口属主) → heap_gate → cpu_gate
-#       → write race → 段数门禁 → query race → ENV 判定 → sidecar/监控归档
-# 口径：堆由 ibs 部署统一设定（内存/2=16g）；负载门禁按 PRECHECK_MODE（each 每场 / once 起跑前）；
-#   场中 load-monitor 逐秒采集仅记录不判成败。codec 是索引设置维度，靠赛道变体承载（gdef/gzstd/gbc）。
+#       → ibs wipe 冷启动 → 集群卡点(含端口属主) → heap_assert → cpu_affinity_assert
+#       → write race → 段数卡点 → query race → ENV 判定 → sidecar/监控归档
+# 口径：堆由 ibs 部署统一设定（内存/2=16g）；负载卡点按 PRECHECK_MODE（each 每场 / once 起跑前）；
+#   场中 load-monitor 分相位采集（w 写入/m 合并/q 查询，5s）仅记录不判成败。codec 是索引设置维度，靠赛道变体承载（gdef/gzstd/gbc）。
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -54,11 +54,12 @@ JDK_DIR=${JDK_DIR:-}
 JDK_WANT=${JDK_WANT:-}
 SHARDS=${SHARDS:-3}          # 性能口径（非拓扑事实）：默认 3 主分片，可按实验覆盖
 REPLICAS=${REPLICAS:-0}
-# 静默负载门禁口径：each=每场赛前一次；once=仅 campaign 起跑前一次
+# 静默负载卡点口径：each=每场赛前一次；once=仅 campaign 起跑前一次
 PRECHECK_MODE=${PRECHECK_MODE:-each}
 case "$PRECHECK_MODE" in each|once) ;; *) die "PRECHECK_MODE 必须是 each|once";; esac
 PCTAG=$([ "$PRECHECK_MODE" = once ] && echo campaign-once || echo PASS)
 FP_DIR=""; LAST_RACE_ID=""; ENV_ID=${ENV_ID:-bench-3node-32c32g}
+CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默卡点阈值内置默认在 precheck.sh）
 
 # ---- 配置文件（第 3 参数或 CONF=）：每行一个配置，轮内右旋配对交错 --------------
 CONF_FILE=${3:-${CONF:-}}
@@ -171,7 +172,7 @@ fi
 
 # 轮内右旋（对配置索引；r1 原序，之后每轮右移一位——配对交错，摊薄时序效应）
 order_for_round() { # <round> → 输出索引序列
-  # ⚠️ 同行 local 不得引用同行变量（见 ibs_gate_wait 注释）——off 必须单独一行
+  # ⚠️ 同行 local 不得引用同行变量（见 ibs_ready_wait 注释）——off 必须单独一行
   local n=${#CONFIGS[@]} i
   local off=$(( ($1 - 1) % n ))
   for i in $(seq 0 $((n-1))); do echo $(( (i - off + n) % n )); done
@@ -219,7 +220,7 @@ ibs_selfcheck() {
   [ -z "$miss" ] || die "ibs 副本缺修复:$miss —— 先同步仓库到 $IBS_ROOT"
 }
 
-# ip.txt 对齐：集群行的第3列按引擎命名模板重写 + 第4列版本（gate 断言源；deploy 只回写版本列）
+# ip.txt 对齐：集群行的第3列按引擎命名模板重写 + 第4列版本（集群卡点断言源；deploy 只回写版本列）
 ibs_sync_ip() { # <engine>
   local eng="$1" f="$IBS_ROOT/configs/ip.txt" ver="$FULL_VER" row=0 i=0 host
   local -a names; names=($(ip_node_names_of "$eng"))
@@ -264,7 +265,7 @@ ibs_wipe2() { # <engine> —— 冷重启（停服→清 data/logs→重启→ES
   return $rc
 }
 
-ibs_gate_wait() { # <engine> <timeout_sec> <logfile>
+ibs_ready_wait() { # <engine> <timeout_sec> <logfile>
   # ⚠️ 同行 local 不得引用同行变量（set -u 下右侧先于赋值展开，报 unbound）
   local eng="$1" tmo="$2" logf="$3"
   local deadline=$((SECONDS + tmo))
@@ -295,7 +296,7 @@ ensure_engine() { # <engine>
   else
     PROGSTEP "  $eng 未安装，部署 $want..."
   fi
-  # uninstall/gate 按 ip.txt 主机名前缀解析角色节点，切换引擎时先对齐到目标，否则报"没有角色节点"
+  # uninstall/集群卡点按 ip.txt 主机名前缀解析角色节点，切换引擎时先对齐到目标，否则报"没有角色节点"
   ibs_sync_ip "$eng"
   ( cd "$IBS_ROOT" && python3 -m ops.clean uninstall "$svc" --yes ) \
     > "$CAMP_DIR/logs/ibs-uninstall-$eng.log" 2>&1
@@ -304,7 +305,7 @@ ensure_engine() { # <engine>
 
 # ---------- JDK 就位（用户自管：JDK_DIR=虚机上的目录；空=回 bundle 自带） --------
 # 首次换装自动把当前 JDK 归档为 jdk.bundled（旧版归档 jdk.bundled-25 复用）；按
-# jdk.path.stamp 幂等跳过；java -version 校验失败回退 jdk.old。不设硬门禁——身份
+# jdk.path.stamp 幂等跳过；java -version 校验失败回退 jdk.old。不设硬性卡点——身份
 # 元数据 = ARM_LABEL + sidecar 逐节点实测 java -version（results/<fid>-<ph>-sidecar.json）。
 ensure_jdk() {
   local ip dir="$EZ_DIR" arch want
@@ -361,9 +362,9 @@ ensure_jdk() {
   return 0
 }
 
-# CPU 绑核门禁：EXPECT_CPU_CORES=N 时断言引擎进程实际亲和核数（drop-in 由
+# CPU 绑核卡点：EXPECT_CPU_CORES=N 时断言引擎进程实际亲和核数（drop-in 由
 # scripts/cpu-affinity.sh apply 预先写入，ibs wipe 重启后生效）；未设置时跳过
-expect_cpu_gate() { # <engine>
+cpu_affinity_assert() { # <engine>
   [ -n "${EXPECT_CPU_CORES:-}" ] || return 0
   local eng="$1" ip l n bad=0 dir svc jvmn
   dir=$(eng_dir_of "$eng"); svc=$(svc2_of "$eng")
@@ -377,13 +378,13 @@ expect_cpu_gate() { # <engine>
       log "  CPU-GATE FAIL $ip: 引擎亲和核数=$n ($l) 期望 $EXPECT_CPU_CORES"; bad=1; continue
     fi
   done
-  # JVM 视角确认（非硬门禁）：_nodes/os 的 available_processors 应等于绑核数
+  # JVM 视角确认（非硬性卡点）：_nodes/os 的 available_processors 应等于绑核数
   jvmn=$(curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 10 "https://${VM_IPS[0]}:$HTTP_PORT/_nodes/os" 2>/dev/null \
     | python3 -c "import json,sys;d=json.load(sys.stdin).get('nodes',{});v={n.get('os',{}).get('available_processors') for n in d.values()};print(v.pop() if len(v)==1 else '?')" 2>/dev/null || echo "?")
   if [ "$jvmn" != "$EXPECT_CPU_CORES" ]; then
     log "  CPU-GATE WARN: JVM availableProcessors=$jvmn ≠ $EXPECT_CPU_CORES（掩码已生效但 JVM 未跟随？查 JDK 版本）"
   fi
-  [ $bad -eq 0 ] && log "  cpu_gate 通过（$NNODES 节点引擎亲和 $EXPECT_CPU_CORES 核，JVM 可见核数=$jvmn）"
+  [ $bad -eq 0 ] && log "  绑核断言通过（$NNODES 节点引擎亲和 $EXPECT_CPU_CORES 核，JVM 可见核数=$jvmn）"
   return $bad
 }
 
@@ -409,7 +410,7 @@ track_tmo_q() { case "$1" in geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_Q";; hnsw) e
 # 非 codec 变体返回空 → 不加标签，历史 campaign 的标签口径不变
 track_codec() { case "$1" in gdef) echo "default";; gzstd) echo "ZSTD+source_reuse";; gbc) echo "best_compression";; *) echo "";; esac; }
 
-monitor_start() { # <fid> <eng> —— 被动逐秒采集（只记录，不做门禁、不触发重试）
+monitor_start() { # <fid> <eng> —— 被动周期采样（5s，只记录，不做卡点、不触发重试）
   local fid="$1" eng="$2" ip dir
   dir=$(eng_dir_of "$eng")
   for ip in "${VM_IPS[@]}"; do
@@ -418,7 +419,7 @@ monitor_start() { # <fid> <eng> —— 被动逐秒采集（只记录，不做�
   done
 }
 
-monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/ 供 ingest 建环境时间序列
+monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/（分相位时间序列，供 ingest 与占用分析）
   local fid="$1" ip k mondir="$CAMP_DIR/monitors"
   mkdir -p "$mondir"
   for k in "${!VM_IPS[@]}"; do
@@ -450,16 +451,19 @@ for p in sorted(glob.glob(os.path.join(d, "*-summary.txt"))):
         fid, node = m.group(1), m.group(2)
     else:
         fid, _, node = fid_node.partition("-")
+    ph = ""                                   # 相位后缀 -w/-m/-q（历史 campaign 无后缀）
+    if fid[-2:] in ("-w", "-m", "-q"):
+        ph, fid = fid[-1], fid[:-2]
     kv = dict(re.findall(r"(\w+)=(\S+)", txt))
     kv.update(re.findall(r"(\w+)=([0-9.]+%?)", txt))
     g = lambda k: kv.get(k, "")
-    rows.append([fid, node, g("ip"), g("samples"), g("load1_max"), g("steal_avg"), g("steal_max"),
+    rows.append([fid, ph, node, g("ip"), g("samples"), g("load1_max"), g("steal_avg"), g("steal_max"),
                  g("iowait_avg"), g("iowait_max"), g("foreign_avg"), g("foreign_max"),
                  g("swapin"), g("disk_util_avg"), (re.search(r"ENV-VERDICT: (\S+)", txt).group(1)
                                                     if re.search(r"ENV-VERDICT: (\S+)", txt) else "")])
 out = os.path.join(d, "ENV-SUMMARY.csv")
 with open(out, "w", encoding="utf-8") as f:
-    f.write("fid,node,ip,samples,load1_max,steal_avg,steal_max,iowait_avg,iowait_max,"
+    f.write("fid,phase,node,ip,samples,load1_max,steal_avg,steal_max,iowait_avg,iowait_max,"
             "foreign_avg,foreign_max,swapin,disk_util_avg,env_verdict\n")
     for r in rows:
         f.write(",".join(str(x).rstrip("%") for x in r) + "\n")
@@ -583,7 +587,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   ./reset-env.sh all --no-wipe >/dev/null 2>&1
   local precheck="$PCTAG"
   if [ "$PRECHECK_MODE" = each ]; then
-    if ! ./precheck-gate.sh quiet > "$CAMP_DIR/logs/precheck-$fid.log" 2>&1; then
+    if ! ./precheck.sh quiet > "$CAMP_DIR/logs/precheck-$fid.log" 2>&1; then
       precheck="FAIL"
       echo "| $fid | SKIP | precheck=FAIL | - |" >> "$RACES"
       PROGSTEP "[$seq] $fid SKIP: 赛前负载检测未通过（logs/precheck-$fid.log）"; return 1
@@ -600,14 +604,14 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     PROGSTEP "[$seq] $fid JDK-SWAP-FAIL"; return 1
   fi
 
-  # 3) 冷启动 + 集群门禁（gate 含端口属主）+ 堆/核门禁
+  # 3) 冷启动 + 集群卡点（含端口属主）+ 堆/核断言
   ibs_wipe2 "$eng" || { echo "| $fid | COLD-START-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid COLD-START-FAIL"; return 1; }
-  ibs_gate_wait "$eng" "$GATE_WAIT_SEC" "$CAMP_DIR/logs/ibs-gate-$fid.log" || {
+  ibs_ready_wait "$eng" "$CLUSTER_WAIT_SEC" "$CAMP_DIR/logs/ibs-ready-$fid.log" || {
     echo "| $fid | CLUSTER-NOT-READY | precheck=$PCTAG | - |" >> "$RACES"
-    PROGSTEP "[$seq] $fid CLUSTER-NOT-READY（logs/ibs-gate-$fid.log）"; return 1; }
-  heap_gate "$eng" "$HEAP" "$(eng_dir_of "$eng")" "$(svc2_of "$eng")" || { echo "| $fid | HEAP-GATE-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid HEAP-GATE-FAIL（实际堆≠声明 heap:$HEAP）"; return 1; }
-  expect_cpu_gate "$eng" || { echo "| $fid | CPU-GATE-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-GATE-FAIL"; return 1; }
-  monitor_start "$fid" "$eng"   # 被动采集整场（含 forcemerge 与查询赛），不参与判定
+    PROGSTEP "[$seq] $fid CLUSTER-NOT-READY（logs/ibs-ready-$fid.log）"; return 1; }
+  heap_assert "$eng" "$HEAP" "$(eng_dir_of "$eng")" "$(svc2_of "$eng")" || { echo "| $fid | HEAP-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid HEAP-ASSERT-FAIL（实际堆≠声明 heap:$HEAP）"; return 1; }
+  cpu_affinity_assert "$eng" || { echo "| $fid | CPU-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-ASSERT-FAIL"; return 1; }
+  monitor_start "$fid-w" "$eng"   # 分相位被动采集：w=写入 m=合并 q=查询（summary 即分相位占用画像），不参与判定
 
   # 4) write-only race
   PROGSTEP "[$seq] $fid write race 开始（timeout $(track_tmo_w "$tk")s）"
@@ -622,16 +626,20 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid write race FAILED rc=$rc（尾部: $(tail -2 "$wlog" | head -1)）"
   capture_race_json "$fid" w "$wlog"
   sidecar_capture "$fid" w "$tk" "$rnd" "$att" "$track" "$tp"
+  monitor_stop "$fid-w"
 
-  # 5) 段数门禁
+  # 5) 段数卡点
   local segok=1
   if [ $rc -eq 0 ]; then
+    monitor_start "$fid-m" "$eng"
     force_merge_to_one "$idx" 1200 || segok=0
+    monitor_stop "$fid-m"
   fi
 
   # 6) query-only race
   local rcq=0
   if [ $rc -eq 0 ] && [ $segok -eq 1 ]; then
+    monitor_start "$fid-q" "$eng"
     PROGSTEP "[$seq] $fid query race 开始"
     timeout "$(track_tmo_q "$tk")" "$RALLY" race --pipeline=benchmark-only \
       --target-hosts="$HOSTS" --track-path="$track" --challenge=query-only \
@@ -641,10 +649,10 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     [ $rcq -ne 0 ] && PROGSTEP "[$seq] $fid query race FAILED rc=$rcq"
     capture_race_json "$fid" q "$qlog"
     sidecar_capture "$fid" q "$tk" "$rnd" "$att" "$track" "$tp"
+    monitor_stop "$fid-q"
   fi
 
   # 7) 判定（监控只记录环境事实、不参与成败；成败看 race 结果与指标真实性）
-  monitor_stop "$fid"
   local t1=$(date +%s)
   local status="VALID" metok=1
   race_metric_ok "$fid" w || { metok=0; PROGSTEP "[$seq] $fid 写赛 throughput 全 null（测量窗口被 warmup 吃掉）"; }
@@ -654,7 +662,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   [ $metok -eq 0 ] && status="METRIC-NULL-FAIL"
   [ $rc -ne 0 ]    && status="WRITE-FAIL"
   [ $rcq -ne 0 ]   && status="QUERY-FAIL"
-  [ $segok -eq 0 ] && status="SEG-GATE-FAIL"
+  [ $segok -eq 0 ] && status="SEG-ASSERT-FAIL"
 
   echo "| $fid | $status | precheck=$PCTAG | $(( (t1-t0)/60 ))min |" >> "$RACES"
   PROGSTEP "[$seq] $fid 完成: $status（$(( (t1-t0)/60 )) 分钟）"
@@ -693,14 +701,14 @@ apply_config "${CONFIGS[0]}"
 load_topology "$ENGINE_NAME"
 PROGSTEP "campaign $CAMP_ID 启动: configs=[${CONF_LABELS[*]}] tracks=${TRACKS[*]} rounds=$ROUNDS（轮内右旋配对交错）topology=$NNODES 节点（ip.txt 行 $NODE_RANGE）"
 echo "# RACES — $CAMP_ID" > "$RACES"
-echo "| 场次 | 状态 | 赛前门禁 | 用时 |" >> "$RACES"
+echo "| 场次 | 状态 | 赛前卡点 | 用时 |" >> "$RACES"
 echo "|---|---|---|---|" >> "$RACES"
 
-# once 模式：场间不再检测负载，起跑前这一次是全 campaign 唯一的静默门禁
+# once 模式：场间不再检测负载，起跑前这一次是全 campaign 唯一的静默卡点
 if [ "$PRECHECK_MODE" = once ]; then
-  PROGSTEP "起跑前静默负载门禁（once 模式，本 campaign 唯一一次）"
-  ./precheck-gate.sh quiet > "$CAMP_DIR/logs/precheck-campaign.log" 2>&1 \
-    || { tail -20 "$CAMP_DIR/logs/precheck-campaign.log"; die "起跑前负载门禁未通过，campaign 终止"; }
+  PROGSTEP "起跑前静默负载卡点（once 模式，本 campaign 唯一一次）"
+  ./precheck.sh quiet > "$CAMP_DIR/logs/precheck-campaign.log" 2>&1 \
+    || { tail -20 "$CAMP_DIR/logs/precheck-campaign.log"; die "起跑前负载卡点未通过，campaign 终止"; }
 fi
 PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_CORES:-全部（不绑核）}"
 

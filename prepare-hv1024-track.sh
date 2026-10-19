@@ -57,7 +57,7 @@ cat > "$TRACK_DIR/track.json" <<EOF
 {% import "rally.helpers" as rally with context %}
 {
   "version": 2,
-  "description": "High-dimensional (1024-dim float, dot_product) HNSW benchmark, 1M docs, separated write/query with segment gate",
+  "description": "High-dimensional (1024-dim float, dot_product) HNSW benchmark, 1M docs, separated write/query with segment checkpoint",
   "indices": [ { "name": "vectors", "body": "index.json" } ],
   "corpora": [
     {
