@@ -1,0 +1,55 @@
+# Elasticsearch 7.10.2 (OSS) + Kibana 7.10.2 (OSS) 本地单机环境
+# 用法:
+#   启动:   docker compose up -d
+#   停止:   docker compose down
+#   停止并清数据: docker compose down -v
+# 访问:
+#   ES:     http://localhost:9200
+#   Kibana: http://localhost:5601
+# 说明:
+#   - OSS 发行版不含 xpack 安全模块，天生无认证/无密码
+#   - 7.10.2 官方镜像只有 linux/amd64，Apple Silicon 上由 Docker Desktop 通过 Rosetta/QEMU 运行
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2
+    container_name: elasticsearch
+    platform: linux/amd64
+    environment:
+      - discovery.type=single-node
+      - cluster.name=es7102-local
+      - node.name=es01
+      - network.host=0.0.0.0
+      - http.port=9200
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana-oss:7.10.2
+    container_name: kibana
+    platform: linux/amd64
+    environment:
+      - SERVER_NAME=kibana
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  esdata:

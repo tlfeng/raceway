@@ -34,13 +34,15 @@ load-monitor.sh              虚机侧零依赖采样器（纯 /proc，5s；按 
 cpu-affinity.sh              引擎绑核（模拟小规格招标环境）
 prepare-{codec,hv1024,nested}-track.sh   赛道变体生成（幂等）
 arm-compare.py               两配置对比 + --assert 阈值断言（FAIL 退出码 1）
+arm-env-table.py             三臂×多赛道"性能×环境"联合表（race.json+sidecar+monitors）
 codec-compare.py             codec 五组合臂三件套（写入/赛末体积/查询）
 bench-sidecar.py             每场环境/身份元数据 sidecar 生成
 bench-export.py / bench-apply.py / bench-report.py   入库载荷 → ES 导入 → 单文件 HTML 报告
 campaign-configs.example.conf      配置文件模板
 campaign-thresholds.example.conf   断言阈值模板
 echarts.min.js               报告内联用（Apache-2.0，见credits）
-docs/METHODOLOGY.md          测试方法学与口径
+docs/                        GUIDE 使用手册 / RUNBOOK 触发手册 / METHODOLOGY 方法学 / hv1024-track 赛道制作
+kibana/                      本地 ES+Kibana 建板环境（docker-compose + TSVB saved objects 生成）
 ```
 
 ## 环境要求
