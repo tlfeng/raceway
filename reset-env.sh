@@ -24,32 +24,37 @@ done
 ENGINES=(easysearch elasticsearch)
 [ "$TARGET" = all ] || ENGINES=("$TARGET")
 
-i=0
-for ip in "${VM_IPS[@]}"; do
-  log "--- ${VM_NAMES[$i]} ($ip) ---"; i=$((i+1))
-  for eng in "${ENGINES[@]}"; do
+# 拓扑单事实源 = ibs ip.txt：按引擎派生角色节点
+declare -a ALL_IPS=()
+for eng in "${ENGINES[@]}"; do
+  load_topology "$eng"
+  log "--- $eng: $NNODES 节点（ip.txt 行 $NODE_RANGE）：${VM_NODES[*]} ---"
+  for ip in "${VM_IPS[@]}"; do
     dir=$(eng_dir "$eng")
-    if ! vm "$ip" "[ -d $dir ]"; then log "  $eng: 未安装，跳过"; continue; fi
-    stop_engine_on_vm "$ip" "$eng" && log "  $eng: 已停止"
+    if ! vm "$ip" "[ -d $dir ]"; then log "  $eng@$ip: 未安装，跳过"; continue; fi
+    stop_engine_on_vm "$ip" "$eng" && log "  $eng@$ip: 已停止"
     u=$(eng_user "$eng")
     if [ "$WIPE" = 1 ] && [ "$PURGE" = 0 ]; then
       if vm "$ip" "rm -rf $dir/data $dir/logs && mkdir -p $dir/data $dir/logs && chown -R $u:$u $dir/data $dir/logs"; then
-        log "  $eng: data/logs 已清空"
+        log "  $eng@$ip: data/logs 已清空"
       else
-        log "  WARN: $eng 清理失败"
+        log "  WARN: $eng@$ip 清理失败"
       fi
     fi
-    if [ "$PURGE" = 1 ]; then
+    if [ "$PURGE" = 1 ] && [ "$ip" = "${VM_IPS[0]}" ]; then
       # 委托 ibs uninstall（自带 systemd 停止 + PID 清杀 + 删目录 + 删单元，一次覆盖全部角色节点）
-      if [ "$ip" = "${VM_IPS[0]}" ]; then
-        if (cd "$IBS_ROOT" && python3 -m ops.clean uninstall "$eng" --yes >/dev/null 2>&1); then
-          log "  $eng: ibs uninstall 完成（全部节点，含 systemd 单元）"
-        else
-          log "  WARN: $eng ibs uninstall 失败（手动: cd $IBS_ROOT && python3 -m ops.clean uninstall $eng --yes）"
-        fi
+      if (cd "$IBS_ROOT" && python3 -m ops.clean uninstall "$eng" --yes >/dev/null 2>&1); then
+        log "  $eng: ibs uninstall 完成（全部节点，含 systemd 单元）"
+      else
+        log "  WARN: $eng ibs uninstall 失败（手动: cd $IBS_ROOT && python3 -m ops.clean uninstall $eng --yes）"
       fi
     fi
+    case " ${ALL_IPS[*]} " in *" $ip "*) ;; *) ALL_IPS+=("$ip");; esac
   done
+done
+
+# 收尾：监控回滚 + 端口确认（对全部涉猎节点去重执行）
+for ip in "${ALL_IPS[@]}"; do
   if [ "$PURGE" = 1 ] && [ "$TARGET" = all ]; then
     vm "$ip" "
       rm -rf $MON_DIR
@@ -61,7 +66,6 @@ for ip in "${VM_IPS[@]}"; do
   else
     vm "$ip" "pkill -f 'load-monitor.sh _loo[p]' 2>/dev/null; true"
   fi
-  # 端口确认
-  if port_free_on_vm "$ip"; then log "  端口 $HTTP_PORT 已释放 ✔"; else log "  WARN: 端口 $HTTP_PORT 仍被占用，请人工检查"; fi
+  if port_free_on_vm "$ip"; then log "  $ip: 端口 $HTTP_PORT 已释放 ✔"; else log "  WARN: $ip 端口 $HTTP_PORT 仍被占用，请人工检查"; fi
 done
 log "reset 完成（target=$TARGET wipe=$WIPE purge=$PURGE）"

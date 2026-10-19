@@ -33,10 +33,35 @@ eng_dir() {
     *) return 1;;
   esac
 }
-# 集群节点名列表（ibs 部署的 hostname 命名）
+# 节点命名模板（ibs_sync_ip 改写 ip.txt 时按序套用；来自 env）
 node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsearch) echo "${VM_NODES_ES[@]}";; *) return 1;; esac; }
 # 服务运行用户（wipe 后 chown 用）
 eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; esac; }
+
+# ---- 拓扑（单事实源 = ibs ip.txt）---------------------------------------------
+# 集群节点 = ip.txt 中主机名不以 esrally 开头的行（esrally 行是驱动器，不进集群）。
+# 产出：VM_IPS/VM_NODES（角色节点数组）、NNODES、NODE_RANGE（ops.deploy -n 的 1-based 行号区间）、
+#       VM_NAMES（env 显式配置的 KVM 客户机名优先且数量须匹配，否则回退集群节点名）。
+# 与引擎无关（行集固定）；引擎切换时由 ibs_sync_ip 改写主机名前缀，行集不变。
+load_topology() { # [engine_name]（仅日志用途）
+  local f="$IBS_ROOT/configs/ip.txt" row=0 host priv declared=0
+  [ -s "$f" ] || die "ibs ip.txt 不存在: $f（拓扑单事实源）"
+  VM_IPS=(); VM_NODES=()
+  NODE_FIRST=""; NODE_LAST=""
+  while read -r _pub priv host _ver; do
+    row=$((row+1))
+    [ -n "$host" ] || continue
+    case "$host" in esrally-*) continue;; esac
+    VM_IPS+=("$priv"); VM_NODES+=("$host")
+    [ -z "$NODE_FIRST" ] && NODE_FIRST=$row
+    NODE_LAST=$row
+  done < "$f"
+  NNODES=${#VM_IPS[@]}
+  [ "$NNODES" -ge 1 ] || die "ip.txt 中没有集群角色节点（esrally 行是驱动器）"
+  NODE_RANGE="$NODE_FIRST-$NODE_LAST"
+  declare -p VM_NAMES >/dev/null 2>&1 && declared=1
+  if [ "$declared" = 0 ] || [ "${#VM_NAMES[@]}" -ne "$NNODES" ]; then VM_NAMES=("${VM_NODES[@]}"); fi
+}
 
 # 目标主机串（rally --target-hosts）
 target_hosts() {

@@ -52,6 +52,8 @@ ENGINE_VERSION=${ENGINE_VERSION:-2.5.0}
 ENGINE_BUILD=${ENGINE_BUILD:-}
 JDK_DIR=${JDK_DIR:-}
 JDK_WANT=${JDK_WANT:-}
+SHARDS=${SHARDS:-3}          # 性能口径（非拓扑事实）：默认 3 主分片，可按实验覆盖
+REPLICAS=${REPLICAS:-0}
 # 静默负载门禁口径：each=每场赛前一次；once=仅 campaign 起跑前一次
 PRECHECK_MODE=${PRECHECK_MODE:-each}
 case "$PRECHECK_MODE" in each|once) ;; *) die "PRECHECK_MODE 必须是 each|once";; esac
@@ -217,16 +219,18 @@ ibs_selfcheck() {
   [ -z "$miss" ] || die "ibs 副本缺修复:$miss —— 先同步仓库到 $IBS_ROOT"
 }
 
-# ip.txt 对齐：第3列主机名 + 第4列版本（gate 断言源；deploy 只回写版本列）
+# ip.txt 对齐：集群行的第3列按引擎命名模板重写 + 第4列版本（gate 断言源；deploy 只回写版本列）
 ibs_sync_ip() { # <engine>
-  local eng="$1" f="$IBS_ROOT/configs/ip.txt" i ver
+  local eng="$1" f="$IBS_ROOT/configs/ip.txt" ver="$FULL_VER" row=0 i=0 host
   local -a names; names=($(ip_node_names_of "$eng"))
-  ver="$FULL_VER"
-  for i in 0 1 2; do
-    awk -v ip="${VM_IPS[$i]}" -v name="${names[$i]}" -v ver="$ver" \
-      '$1==ip{$3=name;$4=ver} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-  done
-  log "  ip.txt 已对齐: ${names[*]} / $ver"
+  while read -r _pub _priv host _v; do
+    row=$((row+1))
+    case "$host" in esrally-*) continue;; esac
+    i=$((i+1))
+    awk -v r="$row" -v name="${names[$((i-1))]:-$host}" -v ver="$ver" 'NR==r{$3=name;$4=ver} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    VM_NODES[$((i-1))]=${names[$((i-1))]:-$host}
+  done < "$f"
+  log "  ip.txt 已对齐: $eng 命名模板 / $ver"
 }
 
 ibs_deploy_engine() { # <engine>
@@ -236,8 +240,8 @@ ibs_deploy_engine() { # <engine>
     elasticsearch) tflag="-t elasticsearch"; vflag="-s $FULL_VER";;
     *) return 1;;
   esac
-  PROGSTEP "  ibs 部署 $eng ($FULL_VER) 开始（约 5-8 分钟）..."
-  ( cd "$IBS_ROOT" && python3 -m ops.deploy $tflag $vflag -n 2-4 --yes ) \
+  PROGSTEP "  ibs 部署 $eng ($FULL_VER) 开始（约 5-8 分钟，节点 $NODE_RANGE）..."
+  ( cd "$IBS_ROOT" && python3 -m ops.deploy $tflag $vflag -n "$NODE_RANGE" --yes ) \
     > "$CAMP_DIR/logs/ibs-deploy-$eng.log" 2>&1
   rc=$?
   if [ $rc -eq 0 ]; then
@@ -251,7 +255,7 @@ ibs_deploy_engine() { # <engine>
 
 ibs_wipe2() { # <engine> —— 冷重启（停服→清 data/logs→重启→ES admin 自愈）
   local eng="$1" rc
-  PROGSTEP "  ibs wipe $(svc2_of "$eng")（三节点并行）..."
+  PROGSTEP "  ibs wipe $(svc2_of "$eng")（$NNODES 节点并行）..."
   ( cd "$IBS_ROOT" && python3 -m ops.clean wipe "$(svc2_of "$eng")" --yes ) \
     > "$CAMP_DIR/logs/ibs-wipe-$eng.log" 2>&1
   rc=$?
@@ -278,6 +282,7 @@ ibs_gate_wait() { # <engine> <timeout_sec> <logfile>
 # REST 只报 version core（2.5.0），无法区分 build 号，live 探测对 build 差异必然漏判。
 ensure_engine() { # <engine>
   local eng="$1" dir svc want cur installed
+  load_topology "$eng"          # 拓扑单事实源：NNODES/NODE_RANGE 随 ip.txt 刷新
   dir=$(eng_dir_of "$eng"); svc=$(svc2_of "$eng")
   want="$FULL_VER"
   cur=$(awk -v ip="${VM_IPS[0]}" '$1==ip{print $4}' "$IBS_ROOT/configs/ip.txt")
@@ -378,7 +383,7 @@ expect_cpu_gate() { # <engine>
   if [ "$jvmn" != "$EXPECT_CPU_CORES" ]; then
     log "  CPU-GATE WARN: JVM availableProcessors=$jvmn ≠ $EXPECT_CPU_CORES（掩码已生效但 JVM 未跟随？查 JDK 版本）"
   fi
-  [ $bad -eq 0 ] && log "  cpu_gate 通过（三节点引擎亲和 $EXPECT_CPU_CORES 核，JVM 可见核数=$jvmn）"
+  [ $bad -eq 0 ] && log "  cpu_gate 通过（$NNODES 节点引擎亲和 $EXPECT_CPU_CORES 核，JVM 可见核数=$jvmn）"
   return $bad
 }
 
@@ -416,7 +421,7 @@ monitor_start() { # <fid> <eng> —— 被动逐秒采集（只记录，不做�
 monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/ 供 ingest 建环境时间序列
   local fid="$1" ip k mondir="$CAMP_DIR/monitors"
   mkdir -p "$mondir"
-  for k in 0 1 2; do
+  for k in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$k]}"
     vm "$ip" "$MON_DIR/load-monitor.sh stop $fid" >/dev/null 2>&1
     vm "$ip" "cat $MON_DIR/mon-$fid.csv" > "$mondir/$fid-${VM_NAMES[$k]}.csv" 2>/dev/null
@@ -486,7 +491,7 @@ env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw
     echo "cpu_model=$(lscpu | awk -F: '/^Model name/{gsub(/^ +/,"",$2);print $2;exit}')"
     echo "mem_gb=$(free -g | awk '/^Mem:/{print $2}')"; } > "$FP_DIR/host.txt" 2>&1
   local i ip nm vc mb pin
-  for i in 0 1 2; do
+  for i in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$i]}"; nm="${VM_NAMES[$i]}"
     vm "$ip" "echo hostname=\$(hostname); echo kernel=\$(uname -r); echo nproc=\$(nproc); \
       echo mem_mb=\$(awk '/MemTotal/{print int(\$2/1024)}' /proc/meminfo); \
@@ -569,7 +574,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local HOSTS; HOSTS=$(target_hosts)
   local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
   local tp=""
-  case "$tk" in geo|nested|gdef|gzstd|gbc) tp="number_of_shards:3,number_of_replicas:0";; esac
+  case "$tk" in geo|nested|gdef|gzstd|gbc) tp="number_of_shards:$SHARDS,number_of_replicas:$REPLICAS";; esac
   local t0=$(date +%s)
 
   PROGSTEP "===== [$seq] $fid 开始 ====="
@@ -612,7 +617,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   timeout "$(track_tmo_w "$tk")" "$RALLY" race --pipeline=benchmark-only \
     --target-hosts="$HOSTS" --track-path="$track" --challenge=write-only \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-    --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,arm:$ARM_LABEL,track:$tk,round:$rnd,nnodes:3,heap:$HEAP,jdk:$ARM_LABEL${ctag}${cdc}" \
+    --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,arm:$ARM_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$ARM_LABEL${ctag}${cdc}" \
     --report-format=markdown --report-file="$wrep" > "$wlog" 2>&1 || rc=$?
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid write race FAILED rc=$rc（尾部: $(tail -2 "$wlog" | head -1)）"
   capture_race_json "$fid" w "$wlog"
@@ -631,7 +636,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     timeout "$(track_tmo_q "$tk")" "$RALLY" race --pipeline=benchmark-only \
       --target-hosts="$HOSTS" --track-path="$track" --challenge=query-only \
       ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,arm:$ARM_LABEL,track:$tk,round:$rnd,nnodes:3,heap:$HEAP,jdk:$ARM_LABEL${ctag}${cdc}" \
+      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,arm:$ARM_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$ARM_LABEL${ctag}${cdc}" \
       --report-format=markdown --report-file="$qrep" > "$qlog" 2>&1 || rcq=$?
     [ $rcq -ne 0 ] && PROGSTEP "[$seq] $fid query race FAILED rc=$rcq"
     capture_race_json "$fid" q "$qlog"
@@ -684,7 +689,9 @@ run_field_with_retry() { # <conf_idx> <track> <round> <seq>
 # ---------- 主流程 ------------------------------------------------------------
 ibs_selfcheck
 
-PROGSTEP "campaign $CAMP_ID 启动: configs=[${CONF_LABELS[*]}] tracks=${TRACKS[*]} rounds=$ROUNDS（轮内右旋配对交错）"
+apply_config "${CONFIGS[0]}"
+load_topology "$ENGINE_NAME"
+PROGSTEP "campaign $CAMP_ID 启动: configs=[${CONF_LABELS[*]}] tracks=${TRACKS[*]} rounds=$ROUNDS（轮内右旋配对交错）topology=$NNODES 节点（ip.txt 行 $NODE_RANGE）"
 echo "# RACES — $CAMP_ID" > "$RACES"
 echo "| 场次 | 状态 | 赛前门禁 | 用时 |" >> "$RACES"
 echo "|---|---|---|---|" >> "$RACES"

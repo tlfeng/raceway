@@ -12,6 +12,9 @@ source ./vm-bench-lib.sh
 MODE="${1:-quiet}"
 [ "$MODE" = quiet ] || die "用法: $0 quiet"
 
+# 拓扑单事实源 = ibs ip.txt（esrally 行是驱动器，不参与门禁）
+load_topology
+
 # 把监控脚本分发到虚机（幂等）
 push_monitor() {
   local ip
@@ -25,7 +28,7 @@ push_monitor() {
 gate_quiet() {
   push_monitor
   local fail=0 ip out load steal free foreign
-  for i in 0 1 2; do
+  for i in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$i]}"
     out=$(vm "$ip" "ENGINE_MARK='$ENGINE_MARK' $MON_DIR/load-monitor.sh probe 6" 2>/dev/null) || { log "FAIL ${VM_NAMES[$i]}: probe 执行失败"; fail=1; continue; }
     log "  ${VM_NAMES[$i]}: $out"

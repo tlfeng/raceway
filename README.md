@@ -1,6 +1,6 @@
 # raceway
 
-三节点搜索引擎性能编排（easysearch / elasticsearch × esrally）：**配置文件排程、轮内配对交错、门禁链、sidecar 元数据、ES 入库**。一次跑分在 esrally 语境里叫 a race——本工具就是排这些 race 的赛场。
+搜索引擎性能编排（easysearch / elasticsearch × esrally，2~N 节点，拓扑取自 ibs ip.txt）：**配置文件排程、轮内配对交错、门禁链、sidecar 元数据、ES 入库**。一次跑分在 esrally 语境里叫 a race——本工具就是排这些 race 的赛场。
 
 > 命名与生态：配置是车手，轮次是圈速，门禁是赛会检查，campaign 是一场大奖赛。
 
@@ -10,6 +10,7 @@
 - **门禁链**：赛前静默负载门禁 → 集群门禁（可达/green/节点数/版本/节点名/**端口属主**）→ 堆断言 → 绑核断言 → 段数门禁 → 指标非空断言；环境脏数据进不了结论
 - **无臂机制**：变体用户自管（`ENGINE_NAME/ENGINE_VERSION/ENGINE_BUILD` + `JDK_DIR`），实测身份（逐节点 java -version、索引 settings）由 sidecar 自动落档
 - **运维全托管**：部署/冷启动/门禁/卸载统一走 [ibs](https://github.com/tlfeng/ibs) CLI；堆由部署统一设定（内存/2）
+- **拓扑单事实源**：节点列表/数量/部署范围全部从 ibs `ip.txt` 派生（集群节点=主机名非 esrally 行），2~N 节点免改代码
 - **省心件**：`--dry-run` 排程预览 · 断点续跑（已 VALID 场自动跳过）· `list` 子命令 · 收尾 webhook 通知
 - **结果入库**：一键导出 `bench-env / bench-run / bench-metric` 三索引载荷（单位归一、幂等 upsert），Kibana/Grafana 直接建板
 
@@ -45,7 +46,7 @@ docs/METHODOLOGY.md          测试方法学与口径
 ## 环境要求
 
 - 驱动宿主机：python3、esrally ≥2.12、ssh 免密到三台被测虚机；部署层依赖 [ibs](https://github.com/tlfeng/ibs) CLI
-- 三台被测虚机（如 32 vCPU/32G）：root 免密、systemd、可解压 bundle
+- N 台被测虚机（如 32 vCPU/32G）：root 免密、systemd、可解压 bundle；驱动器与集群节点规划在 ibs `ip.txt`（esrally 行=驱动器，其余=集群节点）
 - 赛道语料：geonames / hnsw2m / hv1024（jina 1M×1024d）/ nested 任选，放置路径见 `vm-bench.env.example`
 
 ## 快速开始
@@ -53,6 +54,7 @@ docs/METHODOLOGY.md          测试方法学与口径
 ```bash
 cp vm-bench.env.example vm-bench.env && vi vm-bench.env   # 填 IP/凭据/路径（真身不入库）
 scp *.sh *.py vm-bench.env 驱动宿主机:/opt/raceway/       # 脚本在驱动宿主机上运行
+# 拓扑在 ibs ip.txt 里规划（如 1 台 esrally 驱动 + N 台集群节点）
 
 ./run-bench.sh list                                       # 看赛道/近期 campaign
 ./run-bench.sh --dry-run geo 3 my3.conf                   # 排程预览（不执行，秒回）
