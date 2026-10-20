@@ -4,9 +4,13 @@
 
   python3 bench-apply.py --dir exports/<tag> \
       --es https://127.0.0.1:9200 --auth admin:CHANGE_ME [--insecure] [--only bench-run,bench-metric]
+  python3 bench-apply.py --dir exports/<tag> --es http://localhost:9200        # 无鉴权集群
+  python3 bench-apply.py --dir exports/<tag> --es http://localhost:9200 --drop # 先删索引再重建
 
 幂等：每条文档带 _id（race_id / race_id|task|family|stat），重复执行是覆盖不是翻倍。
-只做两件事：① 用 templates.json 建三张索引模板；② 按 jsonl 逐行走 _bulk。
+只做三件事：① 用 templates.json 建三张索引模板；② 按 jsonl 逐行走 _bulk；③ refresh。
+--drop 会先删掉三张索引再重建 —— mapping 变更（如新增 typed 字段）必须走这条路，
+旧索引的 mapping 不会因为换了 template 而自动更新。
 """
 import argparse
 import base64
@@ -23,7 +27,8 @@ IDX = ("bench-env", "bench-run", "bench-metric")
 def post(url, body, auth, insecure, ctype="application/x-ndjson", method="POST"):
     req = urllib.request.Request(url, data=body.encode("utf-8") if isinstance(body, str) else body,
                                  method=method, headers={"Content-Type": ctype})
-    req.add_header("Authorization", "Basic " + base64.b64encode(auth.encode()).decode())
+    if auth:
+        req.add_header("Authorization", "Basic " + base64.b64encode(auth.encode()).decode())
     ctx = ssl._create_unverified_context() if insecure else ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=180, context=ctx) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -33,13 +38,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
     ap.add_argument("--es", required=True)
-    ap.add_argument("--auth", required=True)
+    ap.add_argument("--auth", default=None, help="user:pass；无鉴权集群留空")
     ap.add_argument("--insecure", action="store_true")
     ap.add_argument("--only", default=",".join(IDX))
     ap.add_argument("--batch", type=int, default=1000)
+    ap.add_argument("--drop", action="store_true", help="先删除三张索引（mapping 变更时必需）")
     args = ap.parse_args()
 
     want = [i for i in args.only.split(",") if i in IDX]
+
+    if args.drop:
+        for idx in want:
+            try:
+                post("%s/%s" % (args.es, idx), b"", args.auth, args.insecure, "application/json", "DELETE")
+                print("已删除索引 %s" % idx)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    print("删除 %s 失败: %s" % (idx, e))
+                else:
+                    print("索引 %s 不存在，跳过删除" % idx)
+
     tp = os.path.join(args.dir, "templates.json")
     if os.path.isfile(tp):
         templates = json.load(open(tp, encoding="utf-8"))
