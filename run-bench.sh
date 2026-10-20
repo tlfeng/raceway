@@ -708,6 +708,16 @@ recall_probe() { # <fid> <track_dir> <track_key>
 # 作用域按目标 JDK 主版本号现算，不写死：
 #   javaagent      → 21-:（21 及以上都挂修补版 agent 1.18.15）
 #   UseJVMCICompiler→ 21-<hi>:（hi = max(目标主版本, 26)；OpenJDK 26+ 默认开 JVMCI 必须关）
+#
+# 顺序陷阱（2026-10-21 实测踩坑）：UseJVMCICompiler 在 OpenJDK 26/27 上属实验选项，
+#   显式设置（哪怕是 -XX:- 关掉）也必须先 -XX:+UnlockExperimentalVMOptions 解锁，
+#   且解锁必须排在它前面。发行版原版是「解锁 → 关 → 重新锁上」三连行，
+#   补丁把中间那行删掉后只在文件末尾追加一行 → 解锁早在文件中部就被撤销 →
+#   JVM 直接拒绝启动：
+#     "VM option 'UseJVMCICompiler' is experimental and must be enabled via
+#      -XX:+UnlockExperimentalVMOptions. The unlock option must precede 'UseJVMCICompiler'."
+#   （GraalVM 25 不把它当实验选项，jdk25 臂因此侥幸没炸，换 OpenJDK 26/27 就 3 节点全灭。）
+#   所以追加块必须自带完整三连：解锁 → 关 → 重新锁上。
 jdk_fix_apply() { # <目标 JDK 主版本号>
   local major="${1:-25}"
   [ "$ENGINE_NAME" = easysearch ] || return 0
@@ -724,7 +734,9 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
       # 去掉所有 javaagent 版本作用域行，再写一行 21-:（修补版 agent 覆盖 21+）
       grep -v '^[0-9][0-9-]*:-javaagent:lib/easysearch-security-agent-2.5.0.jar' \$f | grep -v '^[0-9][0-9-]*:.*UseJVMCICompiler' > \$f.new
       printf '21-:-javaagent:lib/easysearch-security-agent-2.5.0.jar\n' >> \$f.new
+      printf '21-$hi:-XX:+UnlockExperimentalVMOptions\n' >> \$f.new
       printf '21-$hi:-XX:-UseJVMCICompiler\n' >> \$f.new
+      printf '21-$hi:-XX:-UnlockExperimentalVMOptions\n' >> \$f.new
       mv \$f.new \$f
       chown easysearch:easysearch \$f; chmod 640 \$f" || { log "  $ip: 修补 jvm.options 失败"; return 1; }
     if [ -f "$agent" ]; then
@@ -733,7 +745,7 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
         || { log "  $ip: 推送修补版 agent 失败"; return 1; }
     fi
   done
-  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$hi:）"
+  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$hi: 带解锁三连）"
 }
 
 # JDK 身份断言：三节点实测 java -version 的主版本号必须等于期望（JDK_WANT="26|OpenJDK"）
