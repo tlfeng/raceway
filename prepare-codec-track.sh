@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# prepare-codec-track.sh —— 生成 geonames 存储压缩对比的三个赛道变体（压测机上运行，幂等）
+# prepare-codec-track.sh —— 生成 geonames 存储压缩对比的三个赛道变体（在压测机上运行，幂等）
 #   ./prepare-codec-track.sh
 #
 # 基座：$TRACK_GEO = $TRACK_GEO（geonames 语料，

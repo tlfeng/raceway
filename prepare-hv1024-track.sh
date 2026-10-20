@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-# prepare-hv1024-track.sh —— 生成 1024 维 HNSW 3 分片赛道变体（幂等，压测机上运行）
+# prepare-hv1024-track.sh —— 生成 1024 维 HNSW 3 分片赛道变体（幂等，在压测机上运行）
 #   ./prepare-hv1024-track.sh
 #
-#   数据来源：官方 esrally 赛道 msmarco-jina-10m-vector（1024 维 float）的 本地化
+#   数据来源：官方 esrally 赛道 msmarco-jina-10m-vector（1024 维 float）的本地化
 #   版本（202609 hv-bench 转码，1M 条子集）：
 #     语料  $HV_CORPUS（env 可覆盖，默认指向本环境落位）
 #           （1,000,000 docs × 1024 维 float，字段 docid + emb，22,739,096,214 字节）
