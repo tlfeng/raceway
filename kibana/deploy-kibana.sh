@@ -67,21 +67,16 @@ start_kibana() {
   mkdir -p "$KB_DATA" "$KB_LOGS"
   cat > "$KB_ROOT/config/kibana.yml" <<EOF
 # 由 deploy-kibana.sh 生成 —— 对接本机 EasySearch 指标库（经协议适配 shim）
+#
+# 配置键按 Kibana 7.17 的 schema 写：7.17 没有 path.logs、也没有 8.x 的
+# logging.log.level（写上去会被配置校验拒绝：
+# "definition for this key is missing"）。其余一律走默认值。
 server.port: $KB_PORT
 server.host: "127.0.0.1"
-server.shutdownTimeout: "30s"
-server.name: "bench-metric-store"
-path.data: $KB_DATA
-path.logs: $KB_LOGS
 elasticsearch.hosts: ["http://127.0.0.1:$SHIM_PORT"]
 elasticsearch.username: "$ES_USER"
 elasticsearch.password: "$ES_PASS"
-elasticsearch.requestTimeout: 60000
-elasticsearch.pingTimeout: 60000
-monitoring.ui.container.elasticsearch.enabled: true
-# Kibana 7.17 的日志配置在 logging.root 下（logging.log.level 是 8.x 的键，
-# 7.17 校验会报 "definition for this key is missing"）
-logging.root.level: info
+path.data: $KB_DATA
 EOF
   chmod 600 "$KB_ROOT/config/kibana.yml"
   cd "$KB_ROOT" || die "进不去 $KB_ROOT"

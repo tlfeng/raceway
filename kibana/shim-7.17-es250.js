@@ -106,9 +106,11 @@ async function fetchNodes() {
     const j = JSON.parse(r.body);
     const nodes = {};
     for (const [id, n] of Object.entries(j.nodes || {})) {
+      // 版本一律伪装成 FAKE_VERSION —— Kibana 的兼容检查会读节点版本
+      const ver = { ...(n.version || {}), number: FAKE_VERSION, distribution: 'elasticsearch' };
       nodes[id] = {
         name: n.name, transport_address: n.transport_address, host: n.host, ip: n.ip,
-        version: n.version, build_flavor: n.build_flavor, build_type: n.build_type,
+        version: ver, build_flavor: n.build_flavor || 'default', build_type: n.build_type,
         http: n.http, roles: n.roles, attributes: n.attributes, settings: n.settings,
       };
     }
@@ -213,6 +215,25 @@ function fakeProductRoot(body) {
   return JSON.stringify(j);
 }
 
+// 节点信息里的版本改写：Kibana 的版本兼容检查读的是 GET /_nodes 里每个节点的
+// version.number（不是 GET /），不改这里它会判定 "v7.17.29 与 v2.5.0 不兼容"。
+function fakeNodesVersion(body) {
+  let j;
+  try { j = JSON.parse(body); } catch (e) { return null; }
+  if (!j || typeof j !== 'object' || !j.nodes || typeof j.nodes !== 'object') return null;
+  let n = 0;
+  for (const node of Object.values(j.nodes)) {
+    if (!node || typeof node !== 'object') continue;
+    if (!node.version) node.version = {};
+    if (node.version.number !== FAKE_VERSION) {
+      node.version.number = FAKE_VERSION;
+      node.version.distribution = 'elasticsearch';
+      n++;
+    }
+  }
+  return n > 0 ? JSON.stringify(j) : null;
+}
+
 http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
@@ -278,6 +299,7 @@ http.createServer((req, res) => {
           };
 
           const isRoot = req.method === 'GET' && /^\/?(\?|$)/.test(req.url);
+          const isNodes = req.method === 'GET' && /^\/_nodes(\/|\?|$)/.test(req.url);
           const isNodesInfo = req.method === 'GET' && /^\/_nodes\/info(\?|$)/.test(req.url);
           const isXpack = req.method === 'GET' && /^\/_xpack(\?|$)/.test(req.url);
           const isOpenPit = req.method === 'POST' && /\/_pit(\?|$)/.test(req.url);
@@ -356,6 +378,19 @@ http.createServer((req, res) => {
                 }
                 send('nodes_info');
               });
+              return;
+            }
+          }
+
+          // 节点信息里的版本改写（Kibana 的版本兼容检查读这里）
+          if (isNodes) {
+            const patched = fakeNodesVersion(outBody.toString('utf8'));
+            if (patched) {
+              outBody = Buffer.from(patched);
+              outHeaders['content-type'] = 'application/json; charset=UTF-8';
+              outHeaders['content-length'] = String(outBody.length);
+              delete outHeaders['content-encoding'];
+              send('nodes_version', 200);
               return;
             }
           }
