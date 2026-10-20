@@ -12,9 +12,11 @@
   bench-run.jsonl     一场 race 一行（含实测 JDK/heap/核数、valid、口径B 速率、fingerprint）
   bench-metric.jsonl  race × task × metric × stat 一行（单位归一 + family + direction）
   manifest.json       计数与来源，供核对
-  apply.sh            之后有 store 集群时一键 bulk 导入（curl，可重复执行=幂等）
+  bench-apply.py      一键 bulk 导入（幂等 upsert）
 
-时间一律 ms→s、字节→GB、百分比→0~1、吞吐保留 docs/s 与 ops/s。
+时间一律 ms→s、字节→GB、吞吐保留 docs/s 与 ops/s。
+error_rate 例外：rally 的 op_metrics.error_rate 本就是 0~1 的比例（实测见过 1.0 = 全量失败），
+**不再按 % 折算**；折算会把 100% 打成 1%，掩盖掉 nested 查询全挂的事故场次。
 """
 import argparse
 import datetime
@@ -99,6 +101,60 @@ def fid_of(d):
     arm = ut.get("arm") or ut.get("engine") or "?"
     tr = TRACK_NAME.get(d.get("track"), d.get("track"))
     return arm, tr, ut
+
+
+# ---------------------------------------------------------------- 环境台账派生 (方案 §3.1)
+
+def env_host_type(env_id, vm_nodes):
+    """物理机形态：kvm-vm / bare-metal / docker —— 从 env_id 与节点清单推断，不猜"""
+    eid = (env_id or "").lower()
+    if "kvm" in eid or "vm" in eid:
+        return "kvm-vm"
+    if "docker" in eid or "container" in eid:
+        return "docker"
+    if vm_nodes:
+        return "kvm-vm" if any(n.get("ip") for n in vm_nodes) else "bare-metal"
+    return None
+
+
+def env_vcpu(vm_nodes):
+    """每节点 vCPU（取第一个节点）"""
+    for n in (vm_nodes or []):
+        v = n.get("nproc_inside") or n.get("vcpu_hypervisor")
+        if v:
+            return v
+    return None
+
+
+def env_mem_gb(vm_nodes):
+    """每节点内存 GB（取第一个节点）"""
+    for n in (vm_nodes or []):
+        v = n.get("mem_gib_hypervisor") or n.get("mem_gb")
+        if v:
+            return v
+    return None
+
+
+def env_notes(e, host_type):
+    """环境说明：由 env 数据派生，不写死资产编号/机房等内部信息"""
+    nodes = e.get("vm_nodes") or []
+    if not nodes:
+        return "单机被测集群；rally 发压机与被测集群分离"
+    unit = {"kvm-vm": "台 KVM 虚机", "docker": "个容器"}.get(host_type, "个节点")
+    return "%d %s组成的被测集群；rally 发压机与被测集群分离" % (len(nodes), unit)
+
+
+def env_os(vm_nodes):
+    """从节点内核推断发行版：6.8.x-generic → Ubuntu 24.04"""
+    for n in (vm_nodes or []):
+        k = n.get("kernel") or ""
+        if k.startswith("6.8."):
+            return "Ubuntu 24.04"
+        if k.startswith("6.5.") or k.startswith("5.15."):
+            return "Ubuntu 22.04"
+        if k:
+            return k
+    return None
 
 
 def load_store(races_dir):
@@ -191,12 +247,16 @@ def emit_metrics(d, run_id, ts, common, out):
             v = om.get(key)
             if v is None:
                 continue
-            fam = "error_rate" if key == "error_rate" else "duration"
-            nv, nu = norm_value(v, "%" if key == "error_rate" else "ms")
+            fam = key
+            # error_rate: rally 给的就是 0~1 比例（实测见过 1.0 = 该 task 全部请求失败），
+            #   当成百分比再 /100 会把 100% 打成 1%，把事故场次洗成"几乎无错"。
+            # duration: rally 给毫秒，归一到秒。
+            raw_unit = "ratio" if key == "error_rate" else "ms"
+            nv, nu = norm_value(v, raw_unit)
             out.append({"_index": "bench-metric", "_id": "%s|%s|%s|value" % (run_id, task, fam),
                         "@timestamp": ts, "task": task, "operation": om.get("operation"),
                         "family": fam, "metric": key, "stat": "value", "value": nv, "unit": nu,
-                        "value_original": v, "unit_original": "%" if key == "error_rate" else "ms",
+                        "value_original": v, "unit_original": raw_unit,
                         "direction": direction_of(fam), **common})
     for key, (fam, unit) in RESULT_METRICS.items():
         v = res.get(key)
@@ -229,6 +289,31 @@ def main():
     for c in sorted(glob.glob(os.path.join(args.campaigns, "*"))):
         if os.path.isdir(c):
             metas[os.path.basename(c)] = load_campaign_meta(c)
+
+    # 预扫 sidecar：学出 arm -> 引擎身份（实测包名/版本/JDK）。
+    # 有些场次没有 sidecar（早期 campaign），但同一实验臂的包是同一份 ——
+    # 用别的场次实测到的身份回填，比留空或按臂名猜要准。
+    arm_identity = {}
+    for meta in metas.values():
+        seen_side = list(meta.get("sidecar", {}).values()) + list(meta.get("sidecar_by_race", {}).values())
+        for s in seen_side:
+            arm = (s.get("run") or {}).get("arm")
+            if not arm or arm in arm_identity:
+                continue
+            se = s.get("engine") or {}
+            base_pkg = os.path.basename(se.get("pkg") or "")
+            eng = ("elasticsearch" if base_pkg.startswith("elasticsearch")
+                   else "easysearch" if base_pkg.startswith("easysearch") else None)
+            vm = se.get("version_measured_nodes") or []
+            jdk_nodes = (s.get("jdk") or {}).get("measured_nodes") or []
+            if eng:
+                arm_identity[arm] = {
+                    "engine": eng, "pkg": se.get("pkg"),
+                    "pkg_sha256": se.get("pkg_sha256"),
+                    "version": vm[0] if vm else se.get("version_from_pkg"),
+                    "build": re.sub(r"-linux.*$", "", se.get("pkg") or "") or None,
+                    "jdk": ",".join(sorted({str(x) for x in jdk_nodes})) or None,
+                }
 
     envs, runs, metrics = {}, [], []
     seen = set()
@@ -270,13 +355,53 @@ def main():
             warn.append("no-sidecar：JDK/heap/clients/bulk 无实测值，仅有 user_tags 声明")
         if status is None:
             warn.append("no-RACES.md：valid 未知（campaign 目录不在或该场未记账）")
-        common = {"race_id": race_id, "campaign": camp, "arm": arm, "track": tr,
+
+        # ---- 实测身份（方案 §3.2「引擎(实测)」+ §3.2「实验变量 typed promote」）----
+        se = side.get("engine") or {}
+        sj = side.get("jdk") or {}
+        srp = side.get("run_params") or {}
+        ident = arm_identity.get(arm) or {}
+        pkg = se.get("pkg") or ident.get("pkg")
+        # 引擎名从包名推导（bench-sidecar.py 同规则）：旧 sidecar 曾把 es819 臂写成 name=easysearch
+        base_pkg = os.path.basename(pkg or "")
+        engine = ("elasticsearch" if base_pkg.startswith("elasticsearch")
+                  else "easysearch" if base_pkg.startswith("easysearch") else None)
+        if not engine:
+            engine = ("easysearch" if (arm or "").startswith("ez")
+                      else "elasticsearch" if (arm or "").startswith("es") else None)
+        if not engine:
+            # 没有 sidecar 的早期 campaign（如 ds3 维度扫描）：rally 记的 distribution-flavor
+            # 足以区分产品线 —— easysearch=oss，elasticsearch=default
+            flavor = (d.get("cluster") or {}).get("distribution-flavor")
+            engine = {"oss": "easysearch", "default": "elasticsearch"}.get(flavor)
+        engine = engine or ident.get("engine")
+        vm = se.get("version_measured_nodes") or []
+        version = (vm[0] if vm else None) or se.get("version_from_pkg") \
+            or ident.get("version") or (d.get("cluster") or {}).get("distribution-version")
+        build = re.sub(r"-linux.*$", "", pkg or "") or None
+        jdk_nodes = sj.get("measured_nodes") or []
+        jdk = ",".join(sorted({str(x) for x in jdk_nodes})) or ut.get("jdk") or ident.get("jdk")
+        heap_max = srp.get("heap_max_measured_mb") or []
+        heap_gb = round(max(heap_max) / 1024, 2) if heap_max else None
+        tp = d.get("track-params") or {}
+        # 实验变量：维度/血统/段形态 —— 从 user-tags 与 track params 提升为 typed 列（方案 §3.2）
+        dims = ut.get("dim") or tp.get("dim")
+        lineage = ut.get("lineage")
+        segment_form = ut.get("segment_form") or tp.get("segment_form")
+
+        common = {"race_id": race_id, "campaign": camp, "arm": arm, "engine": engine,
+                  "version": str(version) if version is not None else None,
+                  "jdk": jdk, "heap_gb": heap_gb,
+                  "dims": dims, "lineage": lineage, "segment_form": segment_form,
                   "codec": codec_of(d, side),
                   "track_raw": d.get("track"), "phase": phase, "round": rnd,
                   "challenge": d.get("challenge"), "env_id": side.get("env", {}).get("env_id"),
                   "valid": (status == "VALID") if status else None, "status": status}
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
-                     "campaign": camp, "fid": fid, "arm": arm, "engine": ut.get("engine"),
+                     "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
+                     "version": str(version) if version is not None else None, "build": build,
+                     "jdk": jdk, "heap_gb": heap_gb,
+                     "dims": dims, "lineage": lineage, "segment_form": segment_form,
                      "track": tr, "track_raw": d.get("track"), "challenge": d.get("challenge"),
                      "phase": phase, "round": rnd, "nnodes": ut.get("nnodes"),
                      "cores_tag": ut.get("cores"), "heap_tag": ut.get("heap"),
@@ -285,8 +410,8 @@ def main():
                      "track_params": d.get("track-params"), "car": d.get("car"),
                      "cluster": d.get("cluster"),
                      "version_from_pkg": (side.get("engine") or {}).get("version_from_pkg"),
-                     "pkg": (side.get("engine") or {}).get("pkg"),
-                     "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256"),
+                     "pkg": pkg,
+                     "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256") or ident.get("pkg_sha256"),
                      "jdk_want": (side.get("jdk") or {}).get("want"),
                      "jdk_measured": (side.get("jdk") or {}).get("measured_nodes"),
                      "jdk_match_want": (side.get("jdk") or {}).get("match_want"),
@@ -316,14 +441,28 @@ def main():
                 envs[eid] = {"_index": "bench-env", "_id": eid, "env_id": eid,
                              "host": e.get("host"), "vm_nodes": e.get("vm_nodes"),
                              "topology": {"node_count": len(e.get("vm_nodes") or []),
-                                          "heap_gb": 16, "gc": "G1",
+                                          "heap_gb": heap_gb, "gc": "G1",
                                           "cpu_pinning": "none" if all(
                                               str(n.get("cpu_pinning_hypervisor")) in ("0", "None", "")
                                               for n in (e.get("vm_nodes") or [{}])) else "pinning"},
-                             "os": "Ubuntu 24.04", "kernel": (e.get("host") or {}).get("kernel"),
-                             "notes": "压测机 宿主 + 三台 KVM 虚机；rally 发压机与被测集群分离",
+                             "host_type": env_host_type(eid, e.get("vm_nodes")),
+                             "vcpu": env_vcpu(e.get("vm_nodes")),
+                             "mem_gb": env_mem_gb(e.get("vm_nodes")),
+                             "cpu_model": (e.get("host") or {}).get("cpu_model"),
+                             "disk_type": None, "disk_path": None,
+                             "os": env_os(e.get("vm_nodes")),
+                             "kernel": (e.get("host") or {}).get("kernel"),
+                             "notes": env_notes(e, env_host_type(eid, e.get("vm_nodes"))),
                              "created_at": ts, "active": True,
                              "source": side.get("source")}
+            elif eid:
+                # 同一环境跨 campaign 复用：堆取各场实测最大值，拓扑以信息更全的一侧为准
+                cur = envs[eid]
+                t = cur.setdefault("topology", {})
+                if heap_gb and (t.get("heap_gb") is None or heap_gb > t["heap_gb"]):
+                    t["heap_gb"] = heap_gb
+                if not cur.get("kernel"):
+                    cur["kernel"] = (e.get("host") or {}).get("kernel")
         elif camp not in metas:
             unmatched += 1
 
@@ -343,6 +482,17 @@ def main():
                 ph, fid = fid[-1], fid[:-2]
             for mk, mv in (vals or {}).items():
                 if mv is None:
+                    continue
+                # env_verdict 是 OK/FAIL 这类**文字**判定，不是数值 —— 塞进 double 的 value 列
+                # 会被 ES 拒收（mapper_parsing_exception），整行静默丢失。改走 value_text 文字列。
+                if isinstance(mv, str):
+                    sysrows += 1
+                    metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
+                                    "@timestamp": None, "campaign": camp, "fid": fid, "node": node,
+                                    "phase": ph,
+                                    "family": "system", "metric": mk, "stat": "value",
+                                    "value": None, "value_text": mv, "unit": "text",
+                                    "value_original": None, "direction": "lower-better"})
                     continue
                 sysrows += 1
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
@@ -370,11 +520,28 @@ def main():
                                     "mapping": {"type": "keyword"}}},
             {"numbers_as_double": {"match": "*", "match_mapping_type": "long",
                                    "mapping": {"type": "double"}}}],
+        # 显式声明实验变量与计数列为 typed —— dims 要能 range/排序，round/attempt 要能当整数分组，
+        # 不能落到 dynamic_templates 的 double 上（方案 §3.2「typed promote」）
         "properties": {"@timestamp": {"type": "date",
                                       "format": "strict_date_optional_time||epoch_millis"},
                        "value": {"type": "double"}, "value_original": {"type": "double"},
+                       "value_text": {"type": "keyword"},
                        "user_tags": {"type": "flattened"}, "track_params": {"type": "flattened"},
-                       "cluster": {"type": "flattened"}}}}}
+                       "cluster": {"type": "flattened"},
+                       "dims": {"type": "integer"}, "round": {"type": "integer"},
+                       "attempt": {"type": "integer"}, "shards": {"type": "integer"},
+                       "replicas": {"type": "integer"}, "clients": {"type": "integer"},
+                       "bulk_size": {"type": "integer"}, "nnodes": {"type": "integer"},
+                       "heap_gb": {"type": "double"}, "vcpu": {"type": "integer"},
+                       "mem_gb": {"type": "double"},
+                       "lineage": {"type": "keyword"}, "segment_form": {"type": "keyword"},
+                       "engine": {"type": "keyword"}, "version": {"type": "keyword"},
+                       "build": {"type": "keyword"}, "jdk": {"type": "keyword"},
+                       "arm": {"type": "keyword"}, "env_id": {"type": "keyword"},
+                       "track": {"type": "keyword"}, "campaign": {"type": "keyword"},
+                       "family": {"type": "keyword"}, "metric": {"type": "keyword"},
+                       "stat": {"type": "keyword"}, "task": {"type": "keyword"},
+                       "unit": {"type": "keyword"}, "valid": {"type": "boolean"}}}}}
     templates = {idx: json.loads(json.dumps(TPL).replace("%s", idx))
                  for idx in ("bench-env", "bench-run", "bench-metric")}
     with open(os.path.join(args.out, "templates.json"), "w", encoding="utf-8") as f:
