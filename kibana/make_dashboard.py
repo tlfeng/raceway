@@ -680,9 +680,14 @@ def diagnose_empty(filt):
     if n_any is None:
         return '（指标库查询失败，未能判定原因）'
     if n_any > 0:
-        return ('有 %d 行符合面板自身过滤，但叠加看板级 `%s` 后归零 —— '
-                '这些行没有 valid 标记（该批次无 RACES.md 记账，导出时 status 为空，'
-                'valid 存为 null），被场次级闸门挡在门外' % (n_any, DASH_SCOPE))
+        # 有行，但叠加看板级闸门后归零 —— 区分两种"闸门不通过"：
+        n_false = _count('%s AND valid: false' % filt)
+        if n_false == n_any:
+            return ('有 %d 行符合面板自身过滤，但 valid=false（该批次记账为非 VALID 场次），'
+                    '被看板级 `%s` 挡在门外' % (n_any, DASH_SCOPE))
+        return ('有 %d 行符合面板自身过滤，但没有 valid 标记（该批次无 RACES.md 记账，'
+                '导出时 status 为空，valid 存为 null），被看板级 `%s` 挡在门外'
+                % (n_any, DASH_SCOPE))
     r = _count_relaxed(filt)
     if r is None:
         return '该赛道/指标在指标库里没有任何行（该阶段没有采集，或该赛道不跑这个阶段）'
