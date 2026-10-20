@@ -92,10 +92,12 @@ else
 fi
 
 if [ "$WHAT" = list ]; then
-  echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested codec both all"
+  echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested codec both all ds"
   echo "配置模板: $(ls "$LIB_DIR"/campaign-configs.example.conf 2>/dev/null || echo scripts/campaign-configs.example.conf)"
   echo "近期 campaign（RACES.md 的 VALID/总场）:"
-  for d in $(ls -dt "$RESULTS_ROOT"/jdk3-* 2>/dev/null | head -8); do
+  # 不限 jdk3-* 前缀：campaign 前缀已随臂族分化（jdk3/vm3/esrm/ds3/ds2/es819…），
+  # 只列 jdk3-* 会把 es819 臂批次、维度扫描批次整批漏掉。
+  for d in $(ls -dt "$RESULTS_ROOT"/*/ 2>/dev/null | head -8); do
     [ -f "$d/RACES.md" ] || continue
     v=$(grep -c "| VALID |" "$d/RACES.md"); t=$(grep -c "^| " "$d/RACES.md")
     echo "  $(basename "$d")  VALID $v/$((t-2))"
