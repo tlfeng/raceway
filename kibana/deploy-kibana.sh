@@ -83,7 +83,9 @@ logging.log.level: info
 EOF
   chmod 600 "$KB_ROOT/config/kibana.yml"
   cd "$KB_ROOT" || die "进不去 $KB_ROOT"
-  setsid nohup ./bin/kibana > /tmp/kibana.out 2>&1 &
+  # Kibana 7.17 默认拒绝以 root 运行（"Kibana should not be run as root"）；
+  # 本实例装在压测机上、由 root 托管，故显式 --allow-root。
+  setsid nohup ./bin/kibana --allow-root > /tmp/kibana.out 2>&1 &
   echo $! > "$PID_KB"
   log "Kibana 启动中 pid=$(cat $PID_KB)（日志 /tmp/kibana.out）"
 }
