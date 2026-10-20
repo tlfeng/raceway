@@ -19,14 +19,18 @@
 bench-env 现场读出渲染, 内嵌真实环境指纹与场次统计, 随每次入库数据变化。
 """
 import argparse
+import base64
 import datetime
 import json
 import os
+import ssl
 import uuid
 from urllib import request as urlreq
 
 ES = 'http://localhost:9200'
 KIBANA = 'http://localhost:5601'
+ES_AUTH = None      # 'user:pass' —— 指标库开了 basic auth 时用
+ES_INSECURE = False # 指标库用自签证书时跳过校验
 
 # 当前目标 Kibana 的版本。7.x 与 8.x 的 saved object schema 有实质差异（见 KIBANA_MAJOR
 # 处的注释），所以建板前先问一次 Kibana 自己，再按版本生成对象 —— 同一份代码
@@ -36,15 +40,34 @@ KIBANA_MAJOR = 0
 
 # ---------------------------------------------------------------- ES helpers
 
+def _es_headers():
+    if not ES_AUTH:
+        return {}
+    tok = base64.b64encode(ES_AUTH.encode('utf-8')).decode('ascii')
+    return {'Authorization': 'Basic ' + tok}
+
+
+def _es_ssl_ctx():
+    if not ES_INSECURE:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def es_get(path):
-    with urlreq.urlopen(ES + path) as r:
+    req = urlreq.Request(ES + path, headers=_es_headers())
+    with urlreq.urlopen(req, context=_es_ssl_ctx()) as r:
         return json.loads(r.read())
 
 
 def es_post(path, body):
+    headers = {'Content-Type': 'application/json'}
+    headers.update(_es_headers())
     req = urlreq.Request(ES + path, data=json.dumps(body).encode('utf-8'),
-                         headers={'Content-Type': 'application/json'})
-    with urlreq.urlopen(req) as r:
+                         headers=headers)
+    with urlreq.urlopen(req, context=_es_ssl_ctx()) as r:
         return json.loads(r.read())
 
 
@@ -854,17 +877,23 @@ def nav_markdown(track_info):
 
 
 def main():
-    global ES, KIBANA
+    global ES, KIBANA, ES_AUTH, ES_INSECURE
     ap = argparse.ArgumentParser()
     ap.add_argument('--import', dest='do_import', action='store_true')
     ap.add_argument('--out', default=os.path.join(os.path.dirname(__file__), 'kibana-objects.ndjson'))
     ap.add_argument('--es', default=ES)
     ap.add_argument('--kibana', default=KIBANA)
+    ap.add_argument('--es-auth', default=None,
+                    help='指标库 basic auth（user:pass）；指标库开了认证时必须给')
+    ap.add_argument('--insecure', action='store_true',
+                    help='指标库用自签证书时跳过证书校验')
     ap.add_argument('--kibana-version', default=None,
                     help='覆盖自动探测的 Kibana 版本（如 7.17.29）；默认问 Kibana 自己')
     args = ap.parse_args()
 
     ES, KIBANA = args.es, args.kibana
+    ES_AUTH = args.es_auth
+    ES_INSECURE = args.insecure
 
     if args.kibana_version:
         global KIBANA_VERSION, KIBANA_MAJOR
