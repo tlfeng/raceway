@@ -64,8 +64,7 @@ def build(runs, detail, sysrows, camp):
         for s in sysrows:
             if s.get("campaign") != camp:
                 continue
-            e = env.setdefault(s["fid"], {"cpu_steal_max": 0, "cpu_iowait_avg": 0,
-                                          "cpu_load1_max": 0, "disk_util_avg": 0})
+            e = env.setdefault(s["fid"], {"cpu_steal_max": 0})
             for k in e:
                 if s.get("metric") == k and s.get("value_original") is not None:
                     e[k] = max(e[k], s["value_original"])
@@ -298,9 +297,9 @@ c=card('② 写入尾部：bulk service_time 分臂对比（每个赛道一张�
      itemStyle:{color:colors[x.arm]||'#999'},data:[x.p50,x.p90,x.p99,x.p100].map(v=>v==null?null:v*1000)}))});})}
 
 /* 3 逐轮明细 + 环境 */
-c=card('③ 逐场明细：吞吐、任务时长、环境实测','steal / iowait / load1 来自每场分相位采样（w/m/q 三相位 × 三节点取最坏，5s 周期），只记录不参与判定；steal 全程 0 说明本环境宿主抢占不是波动主因');
-let tb=el('table');tb.innerHTML='<tr><th>场</th><th>臂</th><th>赛道</th><th>口径B docs/s</th><th>任务 s</th><th>steal 峰%</th><th>iowait 峰%</th><th>load1 峰</th><th>disk util%</th><th>判定</th></tr>'+
- D.cards.flatMap(x=>x.rounds.map(q=>`<tr><td>${q.fid}</td><td class=mut>${x.arm}</td><td>${x.track}</td><td>${num(q.b)}</td><td>${num(q.dur,1)}</td><td>${num((q.env.cpu_steal_max||0),2)}</td><td>${num((q.env.cpu_iowait_avg||0),2)}</td><td>${num(q.env.cpu_load1_max,2)}</td><td>${num(q.env.disk_util_avg,1)}</td><td>${q.status||'—'}</td></tr>`));
+c=card('③ 逐场明细：吞吐、任务时长、环境实测','steal 来自每场分相位采样（w/m/q 三相位 × 三节点取最坏，5s 周期），只记录不参与判定；steal 全程 0 说明本环境宿主抢占不是波动主因');
+let tb=el('table');tb.innerHTML='<tr><th>场</th><th>臂</th><th>赛道</th><th>口径B docs/s</th><th>任务 s</th><th>steal 峰%</th><th>判定</th></tr>'+
+ D.cards.flatMap(x=>x.rounds.map(q=>`<tr><td>${q.fid}</td><td class=mut>${x.arm}</td><td>${x.track}</td><td>${num(q.b)}</td><td>${num(q.dur,1)}</td><td>${num((q.env.cpu_steal_max||0),2)}</td><td>${q.status||'—'}</td></tr>`));
 c.appendChild(tb);
 
 /* 4 查询延迟分臂（每赛道一张，log 轴；下面附同数据表格） */
@@ -370,12 +369,9 @@ c=card('⑧ 逐场环境实测（27 场 × 三节点 × w/m/q 三相位取最坏
  const div=el('div','chart');div.style.height='420px';c.appendChild(div);
  mk(div,{tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},legend:{top:0},grid:{top:40,bottom:70,left:56,right:16},
   xAxis:{type:'category',data:names,axisLabel:{rotate:40,fontSize:9,interval:0}},
-  yAxis:[{type:'value',name:'% / 核数'},{type:'value',name:'load1'}],
+  yAxis:{type:'value',name:'%'},
   series:[Object.assign(mkBar('cpu_steal_max','%'),{itemStyle:{color:'#c0392b'}}),
-          Object.assign(mkBar('cpu_iowait_avg','%'),{itemStyle:{color:'#e08214'}}),
-          Object.assign(mkBar('disk_util_avg','%'),{itemStyle:{color:'#2c7fb8'}}),
-          Object.assign(mkBar('foreign_cpu_max','%'),{itemStyle:{color:'#7f8c8d'}}),
-          Object.assign(mkBar('cpu_load1_max',''),{yAxisIndex:1,itemStyle:{color:'#12355b'}})]});}
+          Object.assign(mkBar('foreign_cpu_max','%'),{itemStyle:{color:'#7f8c8d'}})]});}
 
 /* 9 结论 */
 c=card('⑨ 本轮结论（27 场，全部 VALID）');

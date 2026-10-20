@@ -56,9 +56,10 @@ RESULT_METRICS = {
     "old_gc_time": ("gc", "ms"), "old_gc_count": ("gc", "count"),
     "store_size": ("disk", "bytes"), "translog_size": ("disk", "bytes"),
     "dataset_size": ("disk", "bytes"), "segment_count": ("disk", "count"),
-    "memory_segments": ("memory", "bytes"), "memory_doc_values": ("memory", "bytes"),
-    "memory_terms": ("memory", "bytes"), "memory_norms": ("memory", "bytes"),
-    "memory_points": ("memory", "bytes"), "memory_stored_fields": ("memory", "bytes"),
+    # memory_segments/doc_values/terms/norms/points/stored_fields 六项不入库：
+    # ES 8.19 与 ez240/250 实测恒为 0（新 Lucene 把段 reader 挪到 mmap 堆外，
+    # on-heap 估算衰减为 0；HNSW 向量图本就不在统计内）。仍在真实计数的 on-heap
+    # 段内存（index_writer/version_map/fixed_bit_set）由 bench-sidecar 赛末补采。
 }
 
 
@@ -215,9 +216,7 @@ def load_campaign_meta(camp_dir):
                        if re.search(k + r"=([0-9.]+)", txt) else None)
         m.setdefault("mon", {})[base] = {
             "cpu_steal_avg": g("steal_avg"), "cpu_steal_max": g("steal_max"),
-            "cpu_iowait_avg": g("iowait_avg"), "cpu_load1_max": g("load1_max"),
             "foreign_cpu_max": g("foreign_max"), "swapin": g("swapin"),
-            "disk_util_avg": g("disk_util_avg"),
             "env_verdict": (re.search(r"ENV-VERDICT: (\S+)", txt).group(1)
                             if re.search(r"ENV-VERDICT: (\S+)", txt) else None)}
     return m
@@ -405,7 +404,7 @@ def main():
                   "valid": (status == "VALID") if status else None, "status": status}
         fid_track[fid] = tr
         # fid → 场次时间：monitors 补的 system 行本身没有 @timestamp（它是按场次
-        # 采集的摘要，不是时间序列），不回填时间戳的话 CPU steal / iowait 这类
+        # 采集的摘要，不是时间序列），不回填时间戳的话 CPU steal 这类
         # 数据可信度指标在 Kibana 上画不出折线（x 轴无值）。
         fid_ts.setdefault(fid, ts)
         # fid → 场次有效性：同理，system 行缺 valid 会被 dashboard 的 `valid: true`
@@ -434,6 +433,9 @@ def main():
                      "heap_max_measured_mb": (side.get("run_params") or {}).get("heap_max_measured_mb"),
                      "cores_declared": (side.get("run_params") or {}).get("cores_declared"),
                      "available_processors_measured": (side.get("run_params") or {}).get("available_processors_measured"),
+                     "index_writer_memory_measured_mb": (side.get("run_params") or {}).get("index_writer_memory_measured_mb"),
+                     "version_map_memory_measured_mb": (side.get("run_params") or {}).get("version_map_memory_measured_mb"),
+                     "fixed_bit_set_memory_measured_mb": (side.get("run_params") or {}).get("fixed_bit_set_memory_measured_mb"),
                      "clients": (side.get("run_params") or {}).get("clients"),
                      "bulk_size": (side.get("run_params") or {}).get("bulk_size"),
                      "shards": (side.get("run_params") or {}).get("shards"),
@@ -516,8 +518,8 @@ def main():
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
-                                "value": (mv / 100.0 if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util")) else mv),
-                                "unit": ("ratio" if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util"))
+                                "value": (mv / 100.0 if mk.startswith(("cpu_steal", "foreign")) else mv),
+                                "unit": ("ratio" if mk.startswith(("cpu_steal", "foreign"))
                                          else ("count" if mk == "swapin" else "")),
                                 "value_original": mv, "direction": "lower-better"})
 

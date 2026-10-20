@@ -6,7 +6,7 @@
 
 数据源（都是编排每场落的）：
   results/<fid>-{w,q}-race.json      → 口径A(rally Median Throughput) 与 口径B(语料÷duration)
-  monitors/<fid>-<node>-summary.txt  → 该场采样汇总的 steal/iowait/load1/disk_util/verdict
+  monitors/<fid>-<node>-summary.txt  → 该场采样汇总的 steal/foreign/swapin/verdict
 口径A=warmup 之后样本的中位速率，口径B=含 warmup 的全程平均（docs/metrics.rst:140 duration 含 warmup）。
 """
 import glob
@@ -24,17 +24,16 @@ WARMUP = {"track": 20, "hnsw2m-2m-s3": 40, "nested-s3": 25, "hv1024-s3": 25}
 
 def summary_of(camp_dir, fid):
     """该场三节点环境摘要（取三节点里的最坏值）"""
-    agg = {"samples": 0, "steal_avg": 0.0, "steal_max": 0.0, "iowait_avg": 0.0, "iowait_max": 0.0,
-           "load1_max": 0.0, "disk_util": 0.0, "foreign_max": 0.0, "swapin": 0, "verdict": "NO-DATA"}
+    agg = {"samples": 0, "steal_avg": 0.0, "steal_max": 0.0,
+           "foreign_max": 0.0, "swapin": 0, "verdict": "NO-DATA"}
     files = glob.glob(os.path.join(camp_dir, "monitors", "%s-*-summary.txt" % fid))
     for p in files:
         t = open(p, encoding="utf-8", errors="replace").read()
         g = lambda k, cast=float: (cast(re.search(k + r"=([0-9.]+)", t).group(1))
                                    if re.search(k + r"=([0-9.]+)", t) else 0)
         agg["samples"] += g("samples", int)
-        for k, key in (("steal_avg", "steal_avg"), ("steal_max", "steal_max"), ("iowait_avg", "iowait_avg"),
-                       ("iowait_max", "iowait_max"), ("load1_max", "load1_max"),
-                       ("disk_util_avg", "disk_util"), ("foreign_max", "foreign_max")):
+        for k, key in (("steal_avg", "steal_avg"), ("steal_max", "steal_max"),
+                       ("foreign_max", "foreign_max")):
             agg[key] = max(agg[key], g(k))
         agg["swapin"] += g("swapin", int)
         m = re.search(r"ENV-VERDICT: (\S+)", t)
@@ -85,18 +84,17 @@ def main():
         return 1
 
     if detail:
-        print("%-20s %-7s %-4s %9s %9s %6s %6s %8s %8s %7s %6s %s" % (
-            "场", "臂", "轮", "口径A", "口径B", "任务s", "窗口s", "steal峰", "iowait峰", "util%", "load1", "判定"))
+        print("%-20s %-7s %-4s %9s %9s %6s %6s %8s %8s %s" % (
+            "场", "臂", "轮", "口径A", "口径B", "任务s", "窗口s", "steal峰", "foreign峰", "判定"))
         for r in sorted(rows, key=lambda x: (x["track"], x["camp"], x["fid"])):
             e = r["env"]
-            print("%-20s %-7s %-4s %9s %9.0f %6.1f %6.1f %8.2f %8.2f %7.1f %6.2f %s" % (
+            print("%-20s %-7s %-4s %9s %9.0f %6.1f %6.1f %8.2f %8.2f %s" % (
                 r["fid"][:20], r["arm"], "r%s" % r["round"], ("%.0f" % r["a"]) if r["a"] else "NULL",
-                r["b"] or 0, r["dur"], r["win"], e["steal_max"], e.get("iowait_max", 0),
-                e["disk_util"], e["load1_max"], e["verdict"]))
+                r["b"] or 0, r["dur"], r["win"], e["steal_max"], e["foreign_max"], e["verdict"]))
 
     print("\n=== 按 臂 × 赛道：性能 × 环境 ===")
-    print("%-7s %-7s %3s %9s %8s %8s %9s %8s %8s %7s %7s %s" % (
-        "臂", "赛道", "n", "口径B 中位", "极差%", "A-B偏移%", "bulk p99", "p100", "steal峰", "iowa峰", "util%", "判定"))
+    print("%-7s %-7s %3s %9s %8s %8s %9s %8s %8s %8s %s" % (
+        "臂", "赛道", "n", "口径B 中位", "极差%", "A-B偏移%", "bulk p99", "p100", "steal峰", "foreign峰", "判定"))
     grp = {}
     for r in rows:
         grp.setdefault((r["arm"], r["track"]), []).append(r)
@@ -106,16 +104,15 @@ def main():
         p99 = [y["p99"] for y in v if y["p99"]]
         p100 = [y["p100"] for y in v if y["p100"]]
         st = max((y["env"]["steal_max"] for y in v), default=0)
-        io = max((y["env"]["iowait_max"] for y in v), default=0)
-        du = statistics.mean([y["env"]["disk_util"] for y in v]) if v else 0
+        fo = max((y["env"]["foreign_max"] for y in v), default=0)
         verd = " / ".join(sorted({y["env"]["verdict"] for y in v}))
-        print("%-7s %-7s %3d %9.0f %8.1f %8.2f %8s %8s %8.2f %7.2f %6.1f %s" % (
+        print("%-7s %-7s %3d %9.0f %8.1f %8.2f %8s %8s %8.2f %8.2f %s" % (
             arm, track, len(v), statistics.median(bs) if bs else 0,
             (max(bs) / min(bs) - 1) * 100 if bs and min(bs) else 0,
             statistics.mean(ab) if ab else 0,
             ("%.0f" % statistics.median(p99)) if p99 else "-",
             ("%.0f" % statistics.median(p100)) if p100 else "-",
-            st, io, du, verd))
+            st, fo, verd))
     return 0
 
 

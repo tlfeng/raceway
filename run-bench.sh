@@ -457,14 +457,14 @@ for p in sorted(glob.glob(os.path.join(d, "*-summary.txt"))):
     kv = dict(re.findall(r"(\w+)=(\S+)", txt))
     kv.update(re.findall(r"(\w+)=([0-9.]+%?)", txt))
     g = lambda k: kv.get(k, "")
-    rows.append([fid, ph, node, g("ip"), g("samples"), g("load1_max"), g("steal_avg"), g("steal_max"),
-                 g("iowait_avg"), g("iowait_max"), g("foreign_avg"), g("foreign_max"),
-                 g("swapin"), g("disk_util_avg"), (re.search(r"ENV-VERDICT: (\S+)", txt).group(1)
+    rows.append([fid, ph, node, g("ip"), g("samples"), g("steal_avg"), g("steal_max"),
+                 g("foreign_avg"), g("foreign_max"),
+                 g("swapin"), (re.search(r"ENV-VERDICT: (\S+)", txt).group(1)
                                                     if re.search(r"ENV-VERDICT: (\S+)", txt) else "")])
 out = os.path.join(d, "ENV-SUMMARY.csv")
 with open(out, "w", encoding="utf-8") as f:
-    f.write("fid,phase,node,ip,samples,load1_max,steal_avg,steal_max,iowait_avg,iowait_max,"
-            "foreign_avg,foreign_max,swapin,disk_util_avg,env_verdict\n")
+    f.write("fid,phase,node,ip,samples,steal_avg,steal_max,"
+            "foreign_avg,foreign_max,swapin,env_verdict\n")
     for r in rows:
         f.write(",".join(str(x).rstrip("%") for x in r) + "\n")
 print("ENV-SUMMARY.csv: %d 行 → %s" % (len(rows), out))

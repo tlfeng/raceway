@@ -89,8 +89,7 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 
 每个赛道看板四段：**① 写入**（吞吐/总耗时/Merge·Refresh·Flush 分解/限流/活动次数）、
 **② 查询**（每 workload 的吞吐 + 延迟分位 p50·p90·p99·p999 + 处理时间分位）、
-**③ 资源与存储**（存储/段数/GC 耗时与次数）、**④ 环境健康度**（CPU steal / iowait /
-外来进程 CPU / 负载 / 磁盘利用率 / swap —— 数据可信度，只有带 monitor 采集的赛道有）。
+**③ 资源与存储**（存储/段数/GC 耗时与次数）、**④ 环境健康度**（CPU steal / 外来进程 CPU / swap —— 数据可信度，只有带 monitor 采集的赛道有）。
 
 赛道清单不硬编码，从 ES 实算；新增一场新赛道的压测后重跑 `make_dashboard.py` 就自动
 多一个看板。入口：左侧栏 ☰ → Analytics → Dashboard（`/app/dashboards/list`）。

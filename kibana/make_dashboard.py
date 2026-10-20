@@ -28,6 +28,12 @@ from urllib import request as urlreq
 ES = 'http://localhost:9200'
 KIBANA = 'http://localhost:5601'
 
+# 当前目标 Kibana 的版本。7.x 与 8.x 的 saved object schema 有实质差异（见 KIBANA_MAJOR
+# 处的注释），所以建板前先问一次 Kibana 自己，再按版本生成对象 —— 同一份代码
+# 能在 Kibana 7.17 和 8.1.3 上跑出各自合法的对象。
+KIBANA_VERSION = ''
+KIBANA_MAJOR = 0
+
 # ---------------------------------------------------------------- ES helpers
 
 def es_get(path):
@@ -52,6 +58,59 @@ def kibana_delete(path):
     req = urlreq.Request(KIBANA + path, method='DELETE', headers={'kbn-xsrf': 'true'})
     with urlreq.urlopen(req) as r:
         return json.loads(r.read())
+
+
+def detect_kibana_version():
+    """问 Kibana 自己是什么版本（/api/status → version.number）。
+
+    7.x 与 8.x 的 saved object schema 有实质差异，不探测就按 8.x 生成会在 7.x 上被
+    schema 校验打回：
+      * visualization 的 attributes.version 在 7.x 是**必填**的 semver 字符串；
+        8.x 把它放宽成可选（历史上还踩过非 semver 值让 8.x 迁移函数抛
+        "Invalid Version: 1"）。
+      * index-pattern 的 attributes.timeFieldName 在 7.x 同样必填。
+    探测不到就退回 8.x（与已验证过的行为保持一致）。
+    """
+    global KIBANA_VERSION, KIBANA_MAJOR
+    try:
+        r = kibana_get('/api/status')
+        v = (r.get('version') or {}).get('number') or ''
+    except Exception:                                       # noqa: BLE001
+        v = ''
+    if v:
+        KIBANA_VERSION = v
+        try:
+            KIBANA_MAJOR = int(v.split('.')[0])
+        except ValueError:
+            KIBANA_MAJOR = 0
+    return KIBANA_VERSION
+
+
+def vis_attributes(title, vis_state, search_source=None):
+    """visualization 对象的 attributes —— 按目标 Kibana 版本补齐必填字段。
+
+    **不写 attributes.version**：Kibana 7.x 的 .kibana 索引把
+    `visualization.version` 映射成 **integer**（7.17 源码
+    src/plugins/visualizations/server/saved_objects/visualization.js 的
+    mappings.properties.version = {type: 'integer'}），写 "7.17.29" 这种字符串
+    会被 ES 的 mapper_parsing_exception 打回整批导入；而 Kibana 7.17 自带的
+    导入样例 src/core/public/http/_import_objects.ndjson 里这个字段干脆没有 ——
+    它不是必填项。8.x 那边同样不写（历史上写过非 semver 值让 8.x 迁移函数抛
+    "Invalid Version: 1"）。
+
+    **searchSourceJSON**：7.x 的样例带 query 字段（{"query":{"query":"","language":...},
+    "filter":[]}），8.x 只写 filter 也够。7.x 按样例补齐，8.x 保持原样不动。
+    """
+    if search_source is None:
+        search_source = ('{"query":{"query":"","language":"kuery"},"filter":[]}'
+                         if KIBANA_MAJOR == 7 else '{"filter":[]}')
+    return {
+        'title': title,
+        'visState': vis_state,
+        'uiStateJSON': '{}',
+        'description': '',
+        'kibanaSavedObjectMeta': {'searchSourceJSON': search_source},
+    }
 
 
 def prune_stale(keep_ids):
@@ -103,8 +162,9 @@ def kibana_field_type(es_type):
 
 
 def index_pattern_obj(name):
+    defs = flat_fields(name)
     fields = []
-    for fqn, t in flat_fields(name):
+    for fqn, t in defs:
         numeric = kibana_field_type(t) == 'number'
         fields.append({
             'name': fqn, 'type': kibana_field_type(t), 'esTypes': [t],
@@ -113,7 +173,15 @@ def index_pattern_obj(name):
             'aggregatable': t in ('keyword', 'date', 'boolean') or numeric,
             'readFromDocValues': t in ('keyword', 'date', 'boolean') or numeric,
         })
-    time_field = '@timestamp' if any(f[0] == '@timestamp' for f in flat_fields(name)) else None
+    # timeFieldName 在 Kibana 7.x 的 index-pattern schema 里是必填字符串。
+    # 优先 @timestamp，其次第一个 date 字段，实在没有就还是给 @timestamp
+    # （三张索引都有它，mapping 里读出来的日期字段是兜底）。
+    time_field = None
+    if any(f[0] == '@timestamp' for f in defs):
+        time_field = '@timestamp'
+    else:
+        dates = [f[0] for f in defs if f[1] == 'date']
+        time_field = dates[0] if dates else '@timestamp'
     return {
         'id': name, 'type': 'index-pattern',
         'attributes': {'title': name, 'timeFieldName': time_field,
@@ -368,10 +436,7 @@ def track_panel_specs(track, groups, interval):
     # ---- 环境健康度（数据可信度）：只有带 monitor 采集的赛道才有 ----
     for key, title, metric, fmt in [
             ('steal', 'CPU steal (avg/max) · 数据可信度', 'cpu_steal_avg OR cpu_steal_max', '0.000'),
-            ('iowait', 'CPU iowait (avg)', 'cpu_iowait_avg', '0.000'),
             ('foreign', '外来进程 CPU (max)', 'foreign_cpu_max', '0.000'),
-            ('load1', '系统负载 load1 (max)', 'cpu_load1_max', '0.0a'),
-            ('disk-util', '磁盘利用率 (avg)', 'disk_util_avg', '0.000'),
             ('swapin', '换入次数', 'swapin', '0.0a')]:
         if group_has_metric(track, [], 'system') and system_metric_exists(track, metric):
             specs.append((key, title,
@@ -390,15 +455,7 @@ def visualization_obj(vis_id, title, panel_filter, formatter,
     params['index_pattern_ref_name'] = IP_REF
     return {
         'id': vis_id, 'type': 'visualization',
-        'attributes': {
-            'title': title,
-            'visState': json.dumps(params),
-            'uiStateJSON': '{}',
-            'description': '',
-            # 不写 attributes.version: Kibana 自管, 8.x 迁移会把非 semver 的值喂给 semver 库
-            # ("Migration function for version 7.11.0 threw an error: Invalid Version: 1")
-            'kibanaSavedObjectMeta': {'searchSourceJSON': '{"filter":[]}'},
-        },
+        'attributes': vis_attributes(title, json.dumps(params)),
         'references': [{'id': IP_ID, 'name': IP_REF, 'type': 'index-pattern'}],
         'migrationVersion': {'visualization': '7.10.0'},
     }
@@ -472,14 +529,10 @@ def _bucket(aggs, key):
 def markdown_obj(vis_id, title, md):
     return {
         'id': vis_id, 'type': 'visualization',
-        'attributes': {
-            'title': title,
-            'visState': json.dumps({'type': 'markdown', 'aggs': [],
-                                    'params': {'fontSize': 12, 'markdown': md},
-                                    'title': title}),
-            'uiStateJSON': '{}', 'description': '',
-            'kibanaSavedObjectMeta': {'searchSourceJSON': '{"filter":[]}'},
-        },
+        'attributes': vis_attributes(title, json.dumps(
+            {'type': 'markdown', 'aggs': [],
+             'params': {'fontSize': 12, 'markdown': md},
+             'title': title})),
         'references': [],
         'migrationVersion': {'visualization': '7.10.0'},
     }
@@ -490,14 +543,10 @@ def section_obj(vis_id, title, text):
     md = '**%s** — %s' % (title, text)
     return {
         'id': vis_id, 'type': 'visualization',
-        'attributes': {
-            'title': title,
-            'visState': json.dumps({'type': 'markdown', 'aggs': [],
-                                    'params': {'fontSize': 14, 'markdown': md},
-                                    'title': title}),
-            'uiStateJSON': '{}', 'description': '',
-            'kibanaSavedObjectMeta': {'searchSourceJSON': '{"filter":[]}'},
-        },
+        'attributes': vis_attributes(title, json.dumps(
+            {'type': 'markdown', 'aggs': [],
+             'params': {'fontSize': 14, 'markdown': md},
+             'title': title})),
         'references': [],
         'migrationVersion': {'visualization': '7.10.0'},
     }
@@ -521,7 +570,7 @@ SECTIONS = [
     ('write', '① 写入 (write)', '索引吞吐、总耗时与阶段分解（merge / refresh / flush / 限流）'),
     ('query', '② 查询 (query)', '按 workload 分图：吞吐、延迟分位(p50/p90/p99/p999)、处理时间分位'),
     ('res', '③ 资源与存储', '存储体积 / 段数 / GC 耗时与次数（young/old）'),
-    ('health', '④ 环境健康度', 'CPU steal / iowait / 外来进程 / 负载 / 磁盘 / swap —— 数据可信度'),
+    ('health', '④ 环境健康度', 'CPU steal / 外来进程 / swap —— 数据可信度'),
 ]
 
 
@@ -597,7 +646,7 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
                 query_ids.append(by_key[k])
     query_ids += pick(['err'])
     res_ids = pick(['disk', 'seg', 'gc-time', 'gc-count'])
-    health_ids = pick(['steal', 'iowait', 'foreign', 'load1', 'disk-util', 'swapin'])
+    health_ids = pick(['steal', 'foreign', 'swapin'])
 
     layout = []
     for sec_key, ids in (('write', write_ids), ('query', query_ids),
@@ -777,9 +826,23 @@ def main():
     ap.add_argument('--out', default=os.path.join(os.path.dirname(__file__), 'kibana-objects.ndjson'))
     ap.add_argument('--es', default=ES)
     ap.add_argument('--kibana', default=KIBANA)
+    ap.add_argument('--kibana-version', default=None,
+                    help='覆盖自动探测的 Kibana 版本（如 7.17.29）；默认问 Kibana 自己')
     args = ap.parse_args()
 
     ES, KIBANA = args.es, args.kibana
+
+    if args.kibana_version:
+        global KIBANA_VERSION, KIBANA_MAJOR
+        KIBANA_VERSION = args.kibana_version
+        try:
+            KIBANA_MAJOR = int(KIBANA_VERSION.split('.')[0])
+        except ValueError:
+            KIBANA_MAJOR = 0
+    else:
+        detect_kibana_version()
+    print('目标 Kibana: %s (%s)  ES: %s'
+          % (KIBANA_VERSION or '未知', KIBANA, ES))
 
     objs = [index_pattern_obj('bench-metric'),
             index_pattern_obj('bench-run'),
