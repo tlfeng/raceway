@@ -500,6 +500,9 @@ env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw
     vm "$ip" "echo hostname=\$(hostname); echo kernel=\$(uname -r); echo nproc=\$(nproc); \
       echo mem_mb=\$(awk '/MemTotal/{print int(\$2/1024)}' /proc/meminfo); \
       echo disk_avail_gb=\$(df -BG --output=avail / | tail -1 | tr -d ' G'); \
+      echo disk_path=\$(findmnt -no SOURCE / 2>/dev/null || echo /); \
+      echo disk_type=\$(lsblk -no TYPE \$(findmnt -no SOURCE / 2>/dev/null) 2>/dev/null || echo unknown); \
+      echo disk_rota=\$(lsblk -no rota \$(findmnt -no SOURCE / 2>/dev/null) 2>/dev/null || echo unknown); \
       echo thp=\$(cat /sys/kernel/mm/transparent_hugepage/enabled); \
       echo max_map_count=\$(sysctl -n vm.max_map_count); \
       echo swap_lines=\$(tail -n +2 /proc/swaps | wc -l); \
@@ -550,6 +553,13 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
     "https://${VM_IPS[0]}:$HTTP_PORT/_nodes/_all/jvm,os,process,settings" > "$d/nodes-info.txt" 2>&1 || true
   curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
     "https://${VM_IPS[0]}:$HTTP_PORT/_nodes/_all/stats/jvm,os,process,indices" > "$d/nodes-stats.txt" 2>&1 || true
+  # 完整 stats：thread_pool(拒绝/排队) / breaker(熔断) / query_cache(命中) /
+  # indices.search.query_time(引擎侧累计查询耗时) / fs(磁盘) 只在全量里有。
+  # EasySearch 不认 _nodes/stats/<metric> 形式的指定路径（会 400），所以抓不带 metric 名的全量。
+  # 缺这一路的后果：压测中"是不是把线程池打爆了""缓存命中多少""引擎侧累计查询耗时"
+  # 全部无从回答 —— 饱和与限流在数据上不可区分。
+  curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
+    "https://${VM_IPS[0]}:$HTTP_PORT/_nodes/_all/stats" > "$d/nodes-stats-full.txt" 2>&1 || true
   for ip in "${VM_IPS[@]}"; do vm "$ip" "$dir/jdk/bin/java -version 2>&1" > "$d/jdk-$ip.txt" 2>/dev/null; done
   # 实测生效的索引 settings（codec 类结论的可证明性来源：烘进赛道 ≠ 集群里真是这个值）
   local sidx; sidx=$(track_index "$tk")

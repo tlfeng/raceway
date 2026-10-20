@@ -66,6 +66,15 @@ python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--inse
 python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 ```
 
+> `bench-export.py` 带**口径契约自检**：stat/unit 词表越界、`_id` 撞号、
+> 失败 task 的行与成功 task 混流、closed_loop 任务出现积压等一律**非零退出、
+> 载荷不写出**（排查用 `--allow-fail` 放行）。覆盖率与一致性提示写进
+> `manifest.json` 的 `assertions` / `coverage` 段。
+> 口径详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md#口径契约导出自检)。
+>
+> **stat 归一后 `_id` 会变**（rally 的 `median`→`p50`、`99_99`→`p9999`），
+> 旧索引里的同一条会变成两条 —— 改词表后必须 `bench-apply.py --drop` 重建。
+
 三索引：`bench-env`（环境台账）/ `bench-run`（一场一条主维度表）/ `bench-metric`(一指标一行长表，单位归一)。
 
 口径要点：

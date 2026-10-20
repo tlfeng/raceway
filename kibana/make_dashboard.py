@@ -341,7 +341,8 @@ def group_has_metric(track, tasks, family, unit=None):
     硬出图就是一个恒空的"No results found"面板，比没有更糟。
     """
     tt = '(%s)' % ' OR '.join('task:%s' % x for x in tasks) if tasks else '*'
-    q = 'track:%s AND family:%s%s AND %s' % (
+    # 带 quality:ok —— 否则"该组所有 task 都 degraded"时会白出一个恒空面板
+    q = 'track:%s AND quality:ok AND family:%s%s AND %s' % (
         track, family, (' AND unit:"%s"' % unit) if unit else '', tt)
     n = _count(q)
     return True if n is None else bool(n)
@@ -372,10 +373,16 @@ IDX_PHASE_SPECS = [
 
 def track_panel_specs(track, groups, interval):
     """某赛道的面板规格：[(key, 标题, lucene 过滤, 数字格式, 分组字段, 指标类型, 桶粒度)]"""
-    t = 'track:%s' % track
+    # quality:ok 是所有测量类面板的默认闸门 ——
+    #   degraded = 该 task 的 error_rate>0（该 task 全部请求失败），它吐出的时延量的是
+    #   "失败响应有多快"（实测 p99 只有 0.22s），混进延迟曲线会把引擎显得比实际更快。
+    #   15 场 nested 就是这样在 valid:true 过滤下混进曲线的。
+    # 唯一不放行 degraded 的是错误率面板 —— 它就是要显示失败场次。
+    t = 'track:%s AND quality:ok' % track
+    tq = 'track:%s' % track
     specs = [
-        ('wthr', '写入吞吐 · median docs/s',
-         '%s AND family:throughput AND unit:"docs/s" AND stat:median' % t,
+        ('wthr', '写入吞吐 · p50 docs/s',
+         '%s AND family:throughput AND unit:"docs/s" AND stat:p50' % t,
          '0.0a', 'arm', 'avg', interval),
         ('idx', '索引总耗时 (s)',
          '%s AND family:indexing_time AND metric:total_time AND stat:value' % t,
@@ -394,24 +401,33 @@ def track_panel_specs(track, groups, interval):
         tt = '(%s)' % ' OR '.join('task:%s' % x for x in tasks)
         if group_has_metric(track, tasks, 'throughput', 'ops/s'):
             specs.append(('qthr-' + gid, '%s · 吞吐 (ops/s)' % label,
-                          '%s AND family:throughput AND unit:"ops/s" AND stat:median AND %s' % (t, tt),
+                          '%s AND family:throughput AND unit:"ops/s" AND stat:p50 AND %s' % (t, tt),
                           '0.0a', 'arm', 'avg', interval))
-        # 延迟分位：p50/p90/p99/p999 同量纲（秒）→ 一图多线，比单看 p90 全
+        # ---- 时延三兄弟（2026-10-20 复审重做）----
+        # rally 的 latency 有两种口径，取决于该 operation 有没有 target-throughput：
+        #   闭环（无 target-throughput）: latency ≡ service_time，量单次请求耗时
+        #   开环（有 target-throughput）: latency = 端到端（含发压机积压），
+        #     service_time 才是请求的服务端耗时
+        # 实测 nested 赛道 5 个 operation 实际饱和（target 20 ops/s×2 clients，
+        # achieved 仅 19.86），90 分位 latency 1.477s 而 service_time 只有 36.7ms ——
+        # 差的 40 倍全是发压机积压。把两者画在同一张图上，结论会完全跑偏。
+        # 所以：引擎时延（service_time）当主曲线，端到端（latency）与积压
+        #（queue_time = latency - service_time）各自成图，加工具说明。
+        if group_has_metric(track, tasks, 'service_time'):
+            specs.append(('qlat-' + gid, '%s · 引擎时延分位 (p50/p90/p99)' % label,
+                          '%s AND family:service_time AND stat:(p50 OR p90 OR p99) AND %s' % (t, tt),
+                          '0.0[000]', 'stat', 'avg', interval))
         if group_has_metric(track, tasks, 'latency'):
-            specs.append(('qlat-' + gid, '%s · 延迟分位 (p50/p90/p99/p999)' % label,
-                          '%s AND family:latency AND stat:(p50 OR p90 OR p99 OR p999) AND %s' % (t, tt),
+            specs.append(('qe2e-' + gid, '%s · 端到端时延分位 (p50/p90/p99)' % label,
+                          '%s AND family:latency AND stat:(p50 OR p90 OR p99) AND %s' % (t, tt),
                           '0.0[000]', 'stat', 'avg', interval))
-        # 处理时间：rally 的 processing_time = 服务端处理 + 队列等待，
-        # 与端到端 latency 不同，单独看能分辨"引擎慢"还是"排队久"
-        if group_has_metric(track, tasks, 'processing_time'):
-            specs.append(('qproc-' + gid, '%s · 处理时间分位 (p50/p90/p99)' % label,
-                          '%s AND family:processing_time AND stat:(p50 OR p90 OR p99) AND %s' % (t, tt),
+        if group_has_metric(track, tasks, 'queue_time'):
+            specs.append(('qback-' + gid, '%s · 发压机积压 (p50/p90/p99)' % label,
+                          '%s AND family:queue_time AND stat:(p50 OR p90 OR p99) AND %s' % (t, tt),
                           '0.0[000]', 'stat', 'avg', interval))
-        # service_time 不单独出图：无排队等待时它与 latency 逐点相等（rally 的
-        # latency = service_time + queue），单独画一图全是与延迟重复的线。
 
     specs.append(('err', '错误率 (0-1)',
-                  '%s AND family:error_rate AND stat:value' % t,
+                  '%s AND family:error_rate AND stat:value' % tq,
                   '0.000', 'arm', 'avg', interval))
 
     # ---- 资源与存储 ----
@@ -437,7 +453,13 @@ def track_panel_specs(track, groups, interval):
     for key, title, metric, fmt in [
             ('steal', 'CPU steal (avg/max) · 数据可信度', 'cpu_steal_avg OR cpu_steal_max', '0.000'),
             ('foreign', '外来进程 CPU (max)', 'foreign_cpu_max', '0.000'),
-            ('swapin', '换入次数', 'swapin', '0.0a')]:
+            ('swapin', '换入次数', 'swapin', '0.0a'),
+            # 这三项是 load-monitor.sh 每 5 秒就在采、但摘要里一直没吐出来的量：
+            # 被测引擎自己的 CPU 占用、整机 CPU 占用、磁盘读写吞吐。
+            # 有了它们才能回答"这台机是被打满了还是没吃满""瓶颈在 CPU 还是 IO"。
+            ('engcpu', '被测引擎 CPU 占用 (avg/max)', 'bench_cpu_avg OR bench_cpu_max', '0.000'),
+            ('syscpu', '整机 CPU 占用 user/sys (avg)', 'cpu_usr_avg OR cpu_sys_avg', '0.000'),
+            ('diskio', '磁盘读写吞吐 (MB/s avg/max)', 'disk_rw_mbs_avg OR disk_rw_mbs_max', '0.0')]:
         if group_has_metric(track, [], 'system') and system_metric_exists(track, metric):
             specs.append((key, title,
                           '%s AND family:system AND metric:(%s) AND stat:value' % (t, metric),
@@ -557,8 +579,15 @@ USAGE_MD = '''**看图指南**
   量纲不可比，所以不放在同一张图里对比 —— 对照 opensearch.org/benchmarks 的分页口径。
 - 看板内再按 **workload 分图**：同一赛道内不同 task（term 检索 / country 聚合 / sort /
   decay / KNN k 值）的吞吐与延迟量纲不同，混在一张图里同样是误读。
-- 每点 = 一场 race；曲线 = 实验臂(arm)。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
-- 只看失败场次: 把 KQL 框改成 `valid: false`；限定实验臂: `arm:es819`；限定批次: `campaign:ds3-20261015-233223`
+- 每点 = 一场 race；曲线 = 实验臂(arm)。顶部 KQL 查询框默认 `valid: true AND quality: ok`，可改成任意表达式。
+- **quality 是"这行数据能不能用"的闸门**：degraded = 该 task 的 error_rate>0（全部请求失败），
+  它吐出的时延量的是"失败响应有多快"，混进来会把引擎显得更快。valid 只说明"跑完了"。
+- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定实验臂: `arm:es819`；限定批次: `campaign:ds3-20261015-233223`
+- **时延三兄弟，别混用**：
+  - **引擎时延** (family=service_time) = 服务端执行时间，**跨引擎比较看这个**
+  - **端到端时延** (family=latency) = 含发压机积压；开环 task（设了 target-throughput）
+    饱和时会把 36ms 的引擎耗时放大成 1.4s
+  - **发压机积压** (family=queue_time) = latency − service_time，看"是引擎慢还是发压机排队"
 - 每图一个 family（吞吐/延迟/服务时间/磁盘/GC…），单位已归一（时间 s、大小 GB、错误率 0~1）
 - series=arm: jdk25/kona25=easysearch2.5.0-3015+JDK25, ez240=easysearch2.4.0-2975, es819=ES8.19.23
 - **错误率说明**: rally 的 error_rate 本就是 0~1 比例，1.0 = 该 task 请求全失败（不要按 % 再除）
@@ -568,14 +597,19 @@ USAGE_MD = '''**看图指南**
 
 SECTIONS = [
     ('write', '① 写入 (write)', '索引吞吐、总耗时与阶段分解（merge / refresh / flush / 限流）'),
-    ('query', '② 查询 (query)', '按 workload 分图：吞吐、延迟分位(p50/p90/p99/p999)、处理时间分位'),
+    ('query', '② 查询 (query)', '按 workload 分图：吞吐、引擎时延 / 端到端时延 / 发压机积压（p50/p90/p99）'),
     ('res', '③ 资源与存储', '存储体积 / 段数 / GC 耗时与次数（young/old）'),
     ('health', '④ 环境健康度', 'CPU steal / 外来进程 / swap —— 数据可信度'),
 ]
 
 
 def _dashboard(panels, refs, dash_id, title, time_from, time_to, description,
-               scope='valid: true'):
+               scope='valid: true AND quality: ok'):
+    # 默认闸门加 quality:ok ——
+    #   valid 只说明"这场跑完了且状态是 VALID"，不说明结果可用。
+    #   实测 15 场 nested 有一个 operation error_rate=1.0（全部请求失败），
+    #   status 仍是 VALID → valid:true，这些失败 task 的"快速失败"时延
+    #   会混进查询延迟曲线。quality 才是"这行数据能不能用"的闸门。
     return {
         'id': dash_id, 'type': 'dashboard',
         'attributes': {
@@ -641,7 +675,7 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
                       'flush-time', 'throttle', 'idx-events'])
     query_ids = []
     for gid, _label, _tasks in groups:
-        for k in ('qthr-' + gid, 'qlat-' + gid, 'qproc-' + gid):
+        for k in ('qthr-' + gid, 'qlat-' + gid, 'qe2e-' + gid, 'qback-' + gid):
             if k in by_key:                 # 该 workload 没有这个指标时面板就不存在
                 query_ids.append(by_key[k])
     query_ids += pick(['err'])

@@ -43,9 +43,33 @@ PHASE = {"write-only": "w", "query-only": "q", "index-only": "w",
          "nested-search-challenge": "wq", "default": "wq"}
 LOWER_BETTER = ("latency", "service_time", "processing_time", "error_rate", "duration",
                 "indexing_time", "merge_time", "refresh_time", "flush_time", "gc",
-                "disk", "store", "system", "memory")
-STAT_MAP = {"50_0": "p50", "90_0": "p90", "99_0": "p99", "99_9": "p999", "100_0": "p100",
-            "min": "min", "max": "max", "mean": "mean", "median": "median"}
+                "disk", "store", "system", "memory", "queue_time")
+# 注意：recall 是 higher-better（召回越高越好），不能进这个列表。
+# 只列当前真正会产出且方向一致的 family —— 列表里出现"还没实现"的名字，
+# 将来谁走 direction_of() 就会拿到相反的方向。
+# ---------------------------------------------------------------------------
+# 口径契约（词表）：stat / unit 只允许出现在这两个闭集里。
+#
+# 为什么要闭集（2026-10-20 复审）：
+#  1) rally 的原始 stat 名有 "50_0"/"90_0"/"99_0"/"99_9"/"99_99"/"100_0"/"median"…
+#     旧映射漏了 "99_99"（rally 的 99.99 分位）→ 它原样漏进 stat 列，
+#     于是 stat 列同时存在 p999 与 99_99 两个名字指同一类分位，画图按 stat 过滤会静默漏一半。
+#  2) rally 的 "median"（吞吐块）与 "50_0"（时延块）是同一个统计量，
+#     却落成 p50 与 median 两个名字 —— 同一根 stat 轴上混两种标签，不可比。
+#  3) unit 同理：漏一个就多一种量纲，跨 family 求和/对比会出错。
+# 归一后 stat 轴全域一致；旧名 → 新名会改 _id（见 --drop 说明），必须重建索引。
+CANON_STATS = ("value", "mean", "p50", "p90", "p99", "p999", "p9999", "p100", "min", "max")
+CANON_UNITS = ("s", "ms", "ops/s", "docs/s", "pages/s", "MB/s", "GB", "MB", "bytes",
+               "count", "ratio", "percent", "text", "")
+CANON_QUALITY = ("ok", "degraded", "unknown")
+CANON_LATENCY_MODE = ("open_loop", "closed_loop", "unknown")
+# 兜底别名（同一块里归一后撞名时用）：非致命，但必须在 manifest 里可见
+_STAT_ALIAS_RE = re.compile(r"^(?:value|mean|p50|p90|p99|p999|p9999|p100|min|max)_raw\d*$")
+STAT_MAP = {"50_0": "p50", "median": "p50", "90_0": "p90", "99_0": "p99",
+            "99_9": "p999", "99_99": "p9999", "100_0": "p100",
+            "min": "min", "max": "max", "mean": "mean", "value": "value"}
+# 归一后仍与同块其它 key 撞名时的兜底后缀（保证 _id 唯一，撞名本身会被断言抓到）
+STAT_ALIAS_SUFFIX = "_raw"
 RESULT_METRICS = {
     "total_time": ("indexing_time", "ms"), "merge_time": ("merge_time", "ms"),
     "merge_count": ("merge", "count"), "refresh_time": ("refresh_time", "ms"),
@@ -80,6 +104,34 @@ def direction_of(family):
     return "lower-better" if any(k in family for k in LOWER_BETTER) else "higher-better"
 
 
+# system 家族（load-monitor.sh 采样）里各指标的量纲与方向。
+# 百分比类一律归一到 0~1 的 ratio；吞吐类保留原单位。
+_SYS_PCT = ("cpu_steal", "foreign_cpu", "cpu_usr", "cpu_sys", "bench_cpu")
+_SYS_MBPS = ("disk_rw_mbs", "net_rx_mbs", "net_tx_mbs")
+_SYS_GB = ("mem_avail_gb",)
+
+
+def unit_of(metric):
+    if metric.startswith(_SYS_PCT):
+        return "ratio"
+    if metric.startswith(_SYS_MBPS):
+        return "MB/s"
+    if metric.startswith(_SYS_GB):
+        return "GB"
+    if metric == "swapin":
+        return "count"
+    return ""
+
+
+def direction_of_system(metric):
+    """system 家族的方向：
+    污染类（steal/外来进程/swap）与 CPU 负载类 → 越低越干净（lower-better）；
+    吞吐类（磁盘/网络）与内存余量 → 越高越好（higher-better）。"""
+    if metric.startswith(_SYS_MBPS) or metric.startswith(_SYS_GB):
+        return "higher-better"
+    return "lower-better"
+
+
 def codec_of(d, side):
     """本场**实测生效**的存储编码（codec 对比结论的分组键）：
     优先 sidecar 的 _settings 回读 → user_tags.codec → 赛道变体名期望值；都没有则 None（非 codec 场）。"""
@@ -95,6 +147,16 @@ def codec_of(d, side):
     if ut.get("codec"):
         return ut["codec"]
     return TRACK_CODEC.get(d.get("track"))
+
+
+def knn_params_of(side):
+    """KNN 索引参数（k / ef_search / num_candidates / M / ef_construction / index type / 量化）。
+
+    没有实测来源就返回 None —— 不臆造。KNN 赛道只比吞吐不看召回、不记索引参数，
+    "快"是拿不同候选集换来的，比值没有意义。
+    """
+    p = ((side or {}).get("run_params") or {}).get("knn_params")
+    return p if isinstance(p, dict) and p else None
 
 
 def fid_of(d):
@@ -217,31 +279,146 @@ def load_campaign_meta(camp_dir):
         m.setdefault("mon", {})[base] = {
             "cpu_steal_avg": g("steal_avg"), "cpu_steal_max": g("steal_max"),
             "foreign_cpu_max": g("foreign_max"), "swapin": g("swapin"),
+            # load-monitor.sh 每 5 秒就采到、但摘要里一直只吐 5 个键的其余量 ——
+            # 现在补进摘要，这里一并接住（无需新增探针、无需改采样节奏）：
+            "cpu_usr_avg": g("cpu_usr_avg"), "cpu_usr_max": g("cpu_usr_max"),
+            "cpu_sys_avg": g("cpu_sys_avg"), "cpu_sys_max": g("cpu_sys_max"),
+            "bench_cpu_avg": g("bench_cpu_avg"), "bench_cpu_max": g("bench_cpu_max"),
+            "disk_rw_mbs_avg": g("disk_rw_mbs_avg"), "disk_rw_mbs_max": g("disk_rw_mbs_max"),
+            "net_rx_mbs_avg": g("net_rx_mbs_avg"), "net_tx_mbs_avg": g("net_tx_mbs_avg"),
+            "mem_avail_gb_min": g("mem_avail_gb_min"),
             "env_verdict": (re.search(r"ENV-VERDICT: (\S+)", txt).group(1)
                             if re.search(r"ENV-VERDICT: (\S+)", txt) else None)}
     return m
 
 
-def emit_metrics(d, run_id, ts, common, out):
+def task_quality(om):
+    """单个 operation 的可信度。
+
+    ok       = error_rate == 0，该 task 的时延/吞吐是成功请求的
+    degraded = error_rate > 0（rally 记的是 0~1 比例，1.0 = 该 task 全部请求失败）
+    unknown  = rally 没给 error_rate
+    """
+    er = om.get("error_rate")
+    if er is None:
+        return "unknown"
+    try:
+        return "degraded" if float(er) > 0 else "ok"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _blk_mean(blk, stats=("mean", "p50", "median", "50_0")):
+    """取块里的一个代表值（优先 mean，其次 p50/median/50_0 —— 原始块里是 rally 的
+    "50_0" 这种 key，不是归一后的 "p50"）"""
+    for s in stats:
+        v = blk.get(s)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def latency_semantics(lat_blk, svc_blk, gt_mode):
+    """判定一个 task 的 latency 口径。
+
+    rally 的 latency 有两种语义，取决于该 operation 是否设了 target-throughput（开环节流）：
+      * 闭环（无 target-throughput）：latency ≡ service_time，量的是单次请求耗时
+      * 开环（有 target-throughput）：latency = 从计划发出到响应返回的端到端时间，
+        **包含发压机侧的积压延迟**；service_time 才是请求本身的服务端耗时
+    实测：nested 赛道 6 个 operation 全带 target-throughput，其中 5 个实际饱和
+    （target 20 ops/s×2 clients，achieved 仅 19.86），90 分位 latency 1.477s 而
+    service_time 只有 36.7ms —— 差的 40 倍全是发压机积压，不是引擎慢。
+
+    返回 (mode, backlog_ratio, source)：
+      mode   ∈ {"open_loop", "closed_loop", "unknown"}
+      backlog_ratio = (latency_mean - service_time_mean) / latency_mean ∈ [0,1]
+      source ∈ {"groundtruth", "inferred", "unknown"}
+    gt_mode 来自 track spec 实参（sidecar.run_params.latency_modes），是地面真值；
+    没有真值时按数据推断（推断不可证伪，单独计数上报，不当成实测）。
+    """
+    lm, sm = _blk_mean(lat_blk), _blk_mean(svc_blk)
+    ratio = None
+    if lm is not None and sm is not None and lm > 0:
+        ratio = max(0.0, min(1.0, (lm - sm) / lm))
+    if gt_mode in ("open_loop", "closed_loop"):
+        return gt_mode, ratio, "groundtruth"
+    if ratio is None:
+        return "unknown", None, "unknown"
+    return ("open_loop" if ratio > 0.01 else "closed_loop"), ratio, "inferred"
+
+
+def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counters=None):
     """race.json → bench-metric 行"""
     res = d.get("results") or {}
+    gt_modes = ((side or {}).get("run_params") or {}).get("latency_modes") or {}
     for om in res.get("op_metrics") or []:
         task = om.get("task") or om.get("operation") or "?"
+        q = (quality_of or task_quality)(om)
+        lat_blk = om.get("latency") or {}
+        svc_blk = om.get("service_time") or {}
+        mode, backlog, lsrc = latency_semantics(lat_blk, svc_blk, gt_modes.get(task))
+        if counters is not None:
+            counters["latency_mode_" + lsrc] = counters.get("latency_mode_" + lsrc, 0) + 1
+        row_common = dict(common)
+        row_common["quality"] = q
+        row_common["latency_mode"] = mode
+        if backlog is not None:
+            row_common["backlog_ratio"] = backlog
         for key in ("throughput", "latency", "service_time", "processing_time"):
             blk = om.get(key) or {}
             unit = blk.get("unit") or ({"throughput": "ops/s", "latency": "ms",
                                         "service_time": "ms", "processing_time": "ms"}[key])
             family = key
+            # 撞名判定必须**按 family 独立**：_id 里带 family，latency 的 p50 与
+            # service_time 的 p50 是两行数据，不算撞名。只有同一个块里既有 50_0
+            # 又有 median 这种才需要兜底后缀。
+            seen_stat = {}
             for k, v in blk.items():
                 if k == "unit" or v is None:
                     continue
                 stat = STAT_MAP.get(k, k)
+                base, n = stat, 1
+                while stat in seen_stat:
+                    stat = "%s%s%d" % (base, STAT_ALIAS_SUFFIX, n)
+                    n += 1
+                seen_stat[stat] = True
                 nv, nu = norm_value(v, unit)
                 out.append({"_index": "bench-metric", "_id": "%s|%s|%s|%s" % (run_id, task, family, stat),
                             "@timestamp": ts, "task": task, "operation": om.get("operation"),
                             "family": family, "metric": family, "stat": stat,
                             "value": nv, "unit": nu, "value_original": v, "unit_original": unit,
-                            "direction": direction_of(family), **common})
+                            "direction": direction_of(family), **row_common})
+        # ---- 派生：发压机积压 = latency - service_time（开环 task 才会有）----
+        lat_u, svc_u = lat_blk.get("unit"), svc_blk.get("unit")
+        if lat_u and svc_u and lat_u == svc_u:
+            qseen = {}
+            for k in sorted(set(lat_blk) & set(svc_blk)):
+                if k == "unit":
+                    continue
+                lv, sv = lat_blk.get(k), svc_blk.get(k)
+                if lv is None or sv is None:
+                    continue
+                try:
+                    diff = float(lv) - float(sv)
+                except (TypeError, ValueError):
+                    continue
+                if diff <= 0:
+                    continue
+                stat = STAT_MAP.get(k, k)
+                base, n = stat, 1
+                while stat in qseen:
+                    stat = "%s%s%d" % (base, STAT_ALIAS_SUFFIX, n)
+                    n += 1
+                qseen[stat] = True
+                nv, nu = norm_value(diff, lat_u)
+                out.append({"_index": "bench-metric", "_id": "%s|%s|queue_time|%s" % (run_id, task, stat),
+                            "@timestamp": ts, "task": task, "operation": om.get("operation"),
+                            "family": "queue_time", "metric": "queue_time", "stat": stat,
+                            "value": nv, "unit": nu, "value_original": diff, "unit_original": lat_u,
+                            "direction": direction_of("queue_time"), **row_common})
         for key in ("error_rate", "duration"):
             v = om.get(key)
             if v is None:
@@ -256,7 +433,8 @@ def emit_metrics(d, run_id, ts, common, out):
                         "@timestamp": ts, "task": task, "operation": om.get("operation"),
                         "family": fam, "metric": key, "stat": "value", "value": nv, "unit": nu,
                         "value_original": v, "unit_original": raw_unit,
-                        "direction": direction_of(fam), **common})
+                        "direction": direction_of(fam), **row_common})
+    # ---- 赛级指标（results 块）----
     for key, (fam, unit) in RESULT_METRICS.items():
         v = res.get(key)
         if v is None:
@@ -274,6 +452,120 @@ def emit_metrics(d, run_id, ts, common, out):
                     "family": fam, "metric": key, "stat": stat, "value": nv, "unit": nu,
                     "value_original": v, "unit_original": unit,
                     "direction": direction_of(fam), **common})
+    # ---- 召回率（ground truth 由 campaign 离线算好写进 sidecar）----
+    for task, m in ((side or {}).get("recall") or {}).items():
+        if not isinstance(m, dict):
+            continue
+        for label, v in m.items():
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            stat = STAT_MAP.get(label, label)
+            out.append({"_index": "bench-metric", "_id": "%s|%s|recall|%s" % (run_id, task, stat),
+                        "@timestamp": ts, "task": task, "operation": None,
+                        "family": "recall", "metric": "recall", "stat": stat,
+                        "value": fv, "unit": "ratio", "value_original": fv, "unit_original": "ratio",
+                        "direction": "higher-better", **common})
+
+
+# ---------------------------------------------------------------------------
+# 导出期口径契约断言（2026-10-20 复审新增）
+#
+# 导出是纯函数、产出可 diff 的载荷快照 —— 架构上完全有能力在写出前发现口径缺陷。
+# 上一版没有这一步，于是下面三类问题全部静默进了 ES：
+#   1) stat 词表越界：rally 的 99_99 分位原样漏进 stat 列，与 p999 并存
+#   2) 失败 task 的时延行与成功 task 混在同一张延迟曲线里（15 场 nested，valid=true）
+#   3) 同一 (family, stat) 在不同 task 下量着不同的东西（开环/闭环的 latency）
+# 现在这三条是**致命**的：导出直接非零退出，不让脏数据进库。
+# 覆盖率与一致性提示是**非致命**的：写进 manifest 供核对，不阻断流水线。
+# ---------------------------------------------------------------------------
+def validate_payload(runs, metrics):
+    """返回 (problems, warnings, coverage)"""
+    problems, warnings = [], []
+    ids = set()
+    stat_count, unit_count, aliases = {}, {}, {}
+    for m in metrics:
+        i = m.get("_id")
+        if i in ids:
+            problems.append("重复 _id（后写的会静默覆盖先写的）: %s" % i)
+        ids.add(i)
+        st = m.get("stat")
+        if st not in CANON_STATS:
+            if st and _STAT_ALIAS_RE.match(st):
+                aliases[st] = aliases.get(st, 0) + 1
+            else:
+                problems.append("stat 越界（不在词表内）: %r  %s" % (st, i))
+        stat_count[st] = stat_count.get(st, 0) + 1
+        u = m.get("unit")
+        if u not in CANON_UNITS:
+            problems.append("unit 越界（不在词表内）: %r  %s" % (u, i))
+        unit_count[u] = unit_count.get(u, 0) + 1
+        qv = m.get("quality")
+        if qv is not None and qv not in CANON_QUALITY:
+            problems.append("quality 越界（不在词表内）: %r  %s" % (qv, i))
+        lm = m.get("latency_mode")
+        if lm is not None and lm not in CANON_LATENCY_MODE:
+            problems.append("latency_mode 越界（不在词表内）: %r  %s" % (lm, i))
+    if aliases:
+        warnings.append("stat 归一后撞名，已用兜底别名区分（%d 行）: %s"
+                        % (sum(aliases.values()), sorted(aliases)))
+    # 同一 (场次, task) 的所有行 quality 必须一致
+    # 注意必须用复合键：task 名在不同场次之间会重名（index-append 每个场次都有），
+    # 只按 task 分组会把不同场次的质量标记混在一起比。
+    tq = {}
+    for m in metrics:
+        t = m.get("task")
+        if not t:
+            continue
+        k = (m.get("race_id"), t)
+        q = m.get("quality")
+        if k in tq and tq[k] != q:
+            problems.append("同一 (场次, task) 的行 quality 不一致: %s/%s (%s vs %s)"
+                            % (k[0], t, tq[k], q))
+        tq.setdefault(k, q)
+    # error_rate>0 的 task 整块必须 degraded
+    for m in metrics:
+        if m.get("family") == "error_rate" and (m.get("value") or 0) > 0:
+            k = (m.get("race_id"), m.get("task"))
+            if tq.get(k) != "degraded":
+                problems.append("error_rate>0 的 (场次, task) 未标 degraded: %s/%s" % k)
+    # closed_loop 的 task 不应出现积压（口径与实测矛盾）
+    for m in metrics:
+        if m.get("family") == "latency" and m.get("latency_mode") == "closed_loop":
+            br = m.get("backlog_ratio")
+            if br is not None and br > 0.01:
+                problems.append("closed_loop 任务出现积压（口径矛盾）: %s br=%.3f"
+                                % (m.get("task"), br))
+    # 场次级：quality 必须是各 task 的最差
+    for r in runs:
+        dt = r.get("degraded_tasks") or []
+        q = r.get("quality")
+        if dt and q != "degraded":
+            problems.append("场次有 degraded task 但 quality 不是 degraded: %s" % r.get("race_id"))
+        if not dt and q == "degraded":
+            problems.append("场次标 degraded 但没有 degraded task: %s" % r.get("race_id"))
+    # 覆盖率（非致命）
+    n = len(runs) or 1
+    def cov(fn):
+        return round(100.0 * sum(1 for r in runs if fn(r)) / n, 1)
+    cover = {
+        "env_id": cov(lambda r: bool(r.get("env_id"))),
+        "dims": cov(lambda r: r.get("dims") is not None),
+        "segment_form": cov(lambda r: bool(r.get("segment_form"))),
+        "codec": cov(lambda r: bool(r.get("codec"))),
+        "sidecar": cov(lambda r: not any(str(w).startswith("no-sidecar")
+                                         for w in (r.get("caliber_warnings") or []))),
+        "quality_ok": cov(lambda r: r.get("quality") == "ok"),
+        "degraded_races": sum(1 for r in runs if r.get("quality") == "degraded"),
+    }
+    for k, v in cover.items():
+        if k != "degraded_races" and v < 50.0:
+            warnings.append("字段覆盖率偏低: %s = %.1f%%（过滤条件用该字段会漏掉大半场次）" % (k, v))
+    return problems, warnings, {"fields": cover, "stat_histogram": stat_count,
+                                "unit_histogram": unit_count, "stat_aliases": aliases}
 
 
 def main():
@@ -281,6 +573,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--races", default="/root/.rally/benchmarks/races")
     ap.add_argument("--campaigns", default="campaigns")
+    ap.add_argument("--allow-fail", action="store_true",
+                    help="口径契约断言失败也照样写出载荷（仅用于排查，默认失败即非零退出）")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -315,9 +609,12 @@ def main():
                 }
 
     envs, runs, metrics = {}, [], []
+    counters = {}          # 导出期统计（口径来源分布等），进 manifest
     fid_track = {}          # fid → 归一化赛道名；monitors 补的 system 行靠它回填 track
     fid_ts = {}             # fid → 场次时间；system 行靠它回填 @timestamp（画折线的前提）
     fid_valid = {}          # fid → 场次有效性；system 行靠它回填 valid（否则被 KQL 过滤）
+    fid_quality = {}        # fid → 场次级 quality；system 行同样要带 quality，
+                            #   否则看板上 quality:ok 的闸门会把整个环境健康度段落过滤空
     fid_arm = {}            # fid → 实验臂；system 行靠它回填 arm（否则按 arm 分线的面板拿不到 series）
     seen = set()
     unmatched = 0
@@ -392,11 +689,37 @@ def main():
         lineage = ut.get("lineage")
         segment_form = ut.get("segment_form") or tp.get("segment_form")
 
+        # ---- 场次可信度（2026-10-20 复审新增）----
+        # RACES.md 的 status 只反映"这场跑完了没有"，不反映"结果可不可用"。
+        # 实测 15 场 nested 的某个 operation error_rate=1.0（该 task 全部请求失败），
+        # status 却是 VALID → valid:true → 这些失败 task 的"漂亮延迟"（失败响应很快，
+        # p99 只有 0.22s）被混进查询延迟曲线，把引擎显得比实际更快。
+        # 这里按 task 逐个判 error_rate，场次级取最差；行级 quality 由 emit_metrics 落。
+        op_metrics = (d.get("results") or {}).get("op_metrics") or []
+        task_quality_map = {}
+        for om in op_metrics:
+            t = om.get("task") or om.get("operation") or "?"
+            task_quality_map[t] = task_quality(om)
+        degraded_tasks = sorted(t for t, q in task_quality_map.items() if q == "degraded")
+        if degraded_tasks:
+            race_quality = "degraded"
+        elif status is None:
+            race_quality = "unknown"
+        else:
+            race_quality = "ok"
+        # 赛级指标（store_size / segment_count / GC / merge…）量的是**写阶段**的状态，
+        # 一个查询 task 失败不该把它们一起降级 —— 否则 15 场 nested 的磁盘与 GC 数据
+        # 会因为一个查询 task 挂了而从看板上消失。只有写阶段自己失败才降级。
+        write_degraded = any(t.startswith("index") for t in degraded_tasks)
+        race_row_quality = "degraded" if write_degraded else "ok"
+
         common = {"race_id": race_id, "campaign": camp, "arm": arm, "engine": engine,
                   "version": str(version) if version is not None else None,
                   "jdk": jdk, "heap_gb": heap_gb,
                   "dims": dims, "lineage": lineage, "segment_form": segment_form,
                   "codec": codec_of(d, side),
+                  "quality": race_row_quality,
+                  "knn_params": knn_params_of(side),
                   # track 必须进 common：bench-metric 的指标行没有它就没法按赛道过滤，
                   # 而按赛道拆看板要求每个指标行都带归一化后的赛道名
                   "track": tr, "track_raw": d.get("track"), "phase": phase, "round": rnd,
@@ -410,6 +733,7 @@ def main():
         # fid → 场次有效性：同理，system 行缺 valid 会被 dashboard 的 `valid: true`
         # 查询框整体过滤掉，CPU steal 这类面板就全空。
         fid_valid.setdefault(fid, (status == "VALID") if status else None)
+        fid_quality.setdefault(fid, race_row_quality)
         fid_arm.setdefault(fid, arm)
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
                      "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
@@ -447,10 +771,12 @@ def main():
                      "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
                      "write_task_duration_s": dur, "throughput_docs_per_s_whole": rate_b,
                      "status": status, "valid": (status == "VALID") if status else None,
+                     "quality": race_quality, "degraded_tasks": degraded_tasks,
+                     "knn_params": knn_params_of(side),
                      "caliber_warnings": warn,
                      "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
                      "fingerprint": hashlib.sha1(("%s|%s|%s" % (race_id, status, d["_path"])).encode()).hexdigest()})
-        emit_metrics(d, race_id, ts, common, metrics)
+        emit_metrics(d, race_id, ts, common, metrics, side=side, counters=counters)
         if side:
             e = side.get("env") or {}
             eid = e.get("env_id")
@@ -507,6 +833,7 @@ def main():
                     metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                     "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
+                                    "quality": fid_quality.get(fid) or "ok",
                                     "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
                                     "value": None, "value_text": mv, "unit": "text",
@@ -516,12 +843,29 @@ def main():
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                 "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
+                                    "quality": fid_quality.get(fid) or "ok",
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
-                                "value": (mv / 100.0 if mk.startswith(("cpu_steal", "foreign")) else mv),
-                                "unit": ("ratio" if mk.startswith(("cpu_steal", "foreign"))
-                                         else ("count" if mk == "swapin" else "")),
-                                "value_original": mv, "direction": "lower-better"})
+                                "value": (mv / 100.0 if unit_of(mk) == "ratio" else mv),
+                                "unit": unit_of(mk),
+                                "value_original": mv, "direction": direction_of_system(mk)})
+
+    # ---- 口径契约断言：先验后写，脏载荷不进库 ----
+    problems, warnings, cover = validate_payload(runs, metrics)
+    if problems:
+        print("!! 口径契约断言失败（%d 项）—— 载荷未写出：" % len(problems))
+        for p in problems[:30]:
+            print("   - %s" % p)
+        if len(problems) > 30:
+            print("   ... 其余 %d 项见 manifest" % (len(problems) - 30))
+        if not args.allow_fail:
+            with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump({"generated_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           "assertions": {"status": "fail", "problems": problems, "warnings": warnings},
+                           "coverage": cover}, f, ensure_ascii=False, indent=1)
+            return 2
+    for w in warnings:
+        print("   提示: %s" % w)
 
     with open(os.path.join(args.out, "bench-run.jsonl"), "w", encoding="utf-8") as f:
         for r in runs:
@@ -560,7 +904,22 @@ def main():
                        "track": {"type": "keyword"}, "campaign": {"type": "keyword"},
                        "family": {"type": "keyword"}, "metric": {"type": "keyword"},
                        "stat": {"type": "keyword"}, "task": {"type": "keyword"},
-                       "unit": {"type": "keyword"}, "valid": {"type": "boolean"}}}}}
+                       "unit": {"type": "keyword"}, "valid": {"type": "boolean"},
+                       # ---- 口径契约（2026-10-20 复审新增）----
+                       # quality: 这行数据可不可信（ok / degraded / unknown）
+                       #   degraded = 该 task 的 error_rate>0，其时延量的是"失败响应有多快"，
+                       #   混进延迟曲线会把引擎显得更快 —— 看板上必须按 quality 过滤。
+                       # latency_mode: latency 的口径（open_loop 含发压机积压 / closed_loop / unknown）
+                       # backlog_ratio: (latency_mean - service_time_mean)/latency_mean，发压机积压占比
+                       "quality": {"type": "keyword"},
+                       "latency_mode": {"type": "keyword"},
+                       "backlog_ratio": {"type": "double"},
+                       "degraded_tasks": {"type": "keyword"},
+                       "knn_params": {"type": "flattened"},
+                       "corpus": {"type": "object", "properties": {
+                           "name": {"type": "keyword"}, "docs": {"type": "long"},
+                           "spec_hash": {"type": "keyword"}}},
+                       "disk_type": {"type": "keyword"}, "disk_path": {"type": "keyword"}}}}}
     templates = {idx: json.loads(json.dumps(TPL).replace("%s", idx))
                  for idx in ("bench-env", "bench-run", "bench-metric")}
     with open(os.path.join(args.out, "templates.json"), "w", encoding="utf-8") as f:
@@ -572,7 +931,12 @@ def main():
                    "bench_env": len(envs), "system_rows": sysrows,
                    "campaigns_with_dir": sorted(metas), "races_without_campaign_dir": unmatched,
                    "valid_true": sum(1 for r in runs if r.get("valid") is True),
-                   "valid_null": sum(1 for r in runs if r.get("valid") is None)},
+                   "valid_null": sum(1 for r in runs if r.get("valid") is None),
+                   "assertions": {"status": "pass" if not problems else "fail",
+                                  "problems": problems, "warnings": warnings},
+                   "coverage": cover,
+                   "latency_mode_source": {k: v for k, v in (counters or {}).items()
+                                           if k.startswith("latency_mode_")}},
                   f, ensure_ascii=False, indent=1)
     shutil.copy2(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench-apply.py"),
                  os.path.join(args.out, "bench-apply.py"))
