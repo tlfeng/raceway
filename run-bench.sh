@@ -216,14 +216,20 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
     echo "排程模式: SCHEDULE_FILE=$SCHEDULE_FILE"
     echo "臂定义:   ARMS_FILE=$ARMS_FILE"
     [ "${DS_HOURS:-0}" -gt 0 ] && echo "窗底守卫: ${DS_HOURS}h（窗底留 20min 余量）"
-    echo "| # | 臂 | 赛道 | 轮 | recall | est(min) |"
-    echo "|---|---|---|---|---|---|"
+    echo "| # | 臂 | 赛道 | 轮 | recall | est(min) | 引擎身份 |"
+    echo "|---|---|---|---|---|---|---|"
     n=0
     while read -r arm tk rnd do_recall est; do
       arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
       [ -n "$arm" ] || continue
       n=$((n+1))
-      printf "| %d | %s | %s | %s | %s | %s |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}"
+      _c=$(arm_config "$arm")
+      if [ -z "$_c" ]; then
+        printf "| %d | %s | %s | %s | %s | %s | **臂未定义** |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}"
+        continue
+      fi
+      apply_config "$_c"
+      printf "| %d | %s | %s | %s | %s | %s | %s %s (%s) |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}" "$ENGINE_NAME" "$FULL_VER" "$ARM_LABEL"
     done < "$SCHEDULE_FILE"
     echo "共 $n 场。DRY=1/--dry-run 不会创建 campaign、不会触碰集群。"
     exit 0
