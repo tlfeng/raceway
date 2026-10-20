@@ -32,6 +32,19 @@ KIBANA = 'http://localhost:5601'
 ES_AUTH = None      # 'user:pass' —— 指标库开了 basic auth 时用
 ES_INSECURE = False # 指标库用自签证书时跳过校验
 
+# ---------------------------------------------------------------- 看板级默认闸门
+#
+# 看板顶部 KQL 查询框的默认值。**故意不含 quality: ok**：
+#   quality 闸门放在**每个测量类面板自己的 filter** 里（track_panel_specs 里
+#   的 t = 'track:<赛道> AND quality:ok'），逐面板精确生效。
+#   如果在看板级再叠一层 quality:ok，唯一的例外 —— 错误率面板 —— 就被自己废掉了：
+#   错误率面板的本意就是显示失败场次（degraded task 的 error_rate>0），
+#   而 degraded 行恰恰带 quality:degraded，被看板级 quality:ok 一过滤，
+#   这个面板永远只能是 0 错误率，等于把"失败"这个信号藏起来。
+#   valid: true 是场次级闸门（这场跑完了、且 RACES.md 记为 VALID），
+#   它对所有面板一视同仁，留在看板级。
+DASH_SCOPE = 'valid: true'
+
 # 当前目标 Kibana 的版本。7.x 与 8.x 的 saved object schema 有实质差异（见 KIBANA_MAJOR
 # 处的注释），所以建板前先问一次 Kibana 自己，再按版本生成对象 —— 同一份代码
 # 能在 Kibana 7.17 和 8.1.3 上跑出各自合法的对象。
@@ -357,6 +370,22 @@ def _count(q):
         return None
 
 
+def panel_has_data(filt, scope=DASH_SCOPE):
+    """该面板在**看板真实口径**下有没有数据。
+
+    为什么必须带上看板级 scope：
+      只查面板自己的 filter 会漏判。实测 hvtp200k 两个赛道：面板过滤本身有 1~6 行
+      （quality:ok），但那批 one-off 场次没有 RACES.md 记账 → 导出时 status=None →
+      valid 为空 → 被看板级 `valid: true` 整体挡掉 → 面板在浏览器里恒空。
+      预检不叠加看板口径，就会生成一批"永远空着"的面板。
+    """
+    if not filt:
+        return True
+    q = '(%s) AND (%s)' % (scope, filt) if scope else filt
+    n = _count(q)
+    return True if n is None else bool(n)
+
+
 def group_has_metric(track, tasks, family, unit=None):
     """该 workload 组在给定赛道下是否真有这个 family 的数据。
 
@@ -602,9 +631,14 @@ USAGE_MD = '''**看图指南**
   量纲不可比，所以不放在同一张图里对比 —— 对照 opensearch.org/benchmarks 的分页口径。
 - 看板内再按 **workload 分图**：同一赛道内不同 task（term 检索 / country 聚合 / sort /
   decay / KNN k 值）的吞吐与延迟量纲不同，混在一张图里同样是误读。
-- 每点 = 一场 race；曲线 = 实验臂(arm)。顶部 KQL 查询框默认 `valid: true AND quality: ok`，可改成任意表达式。
-- **quality 是"这行数据能不能用"的闸门**：degraded = 该 task 的 error_rate>0（全部请求失败），
-  它吐出的时延量的是"失败响应有多快"，混进来会把引擎显得更快。valid 只说明"跑完了"。
+- 每点 = 一场 race；曲线 = 实验臂(arm)。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
+- **两层闸门，各管各的**：
+  - `valid`（看板级，管所有面板）= 场次跑完了、且 RACES.md 记为 VALID。没记账的批次
+    （早期 one-off 场次）没有这个标记，**默认不出图** —— 它们不可信，不能和正式批次同图比较。
+  - `quality`（面板级，每个测量类面板自带 `quality:ok`）= 这行数据能不能用。
+    degraded = 该 task 的 error_rate>0（全部请求失败），它吐出的时延量的是"失败响应有多快"，
+    混进来会把引擎显得更快。**错误率面板是唯一的例外**，它刻意不带 quality 闸门 ——
+    它就是要显示失败场次。
 - 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定实验臂: `arm:es819`；限定批次: `campaign:ds3-20261015-233223`
 - **时延三兄弟，别混用**：
   - **引擎时延** (family=service_time) = 服务端执行时间，**跨引擎比较看这个**
@@ -626,13 +660,64 @@ SECTIONS = [
 ]
 
 
+def _count_relaxed(filt):
+    """把面板 filter 里的 quality:ok 放宽成 quality:*，看是不是闸门把它挡了。
+    filter 里没有 quality:ok 时返回 None（无从放宽）。"""
+    relaxed = filt.replace('quality:ok', 'quality:*')
+    if relaxed == filt:
+        return None
+    n = _count(relaxed)
+    return None if n is None else n
+
+
+def diagnose_empty(filt):
+    """判定"这个面板为什么空"，用数据说话，不硬编码文案。
+
+    返回一句话，直接写进看板的说明面板里 —— 面板不出图必须给理由，
+    否则看板上少了一张图，读者无从知道是"没数据"还是"我漏看了"。
+    """
+    n_any = _count(filt)                       # 面板自身口径（不含看板级闸门）
+    if n_any is None:
+        return '（指标库查询失败，未能判定原因）'
+    if n_any > 0:
+        return ('有 %d 行符合面板自身过滤，但叠加看板级 `%s` 后归零 —— '
+                '这些行没有 valid 标记（该批次无 RACES.md 记账，导出时 status 为空，'
+                'valid 存为 null），被场次级闸门挡在门外' % (n_any, DASH_SCOPE))
+    r = _count_relaxed(filt)
+    if r is None:
+        return '该赛道/指标在指标库里没有任何行（该阶段没有采集，或该赛道不跑这个阶段）'
+    if r > 0:
+        return ('面板口径下无数据行；把 quality 闸门放宽后有 %d 行 —— '
+                '说明这些行是 degraded/unknown，被 quality 闸门正确排除，'
+                '它们量的是"失败响应有多快"，不该混进延迟曲线' % r)
+    return '该赛道/指标在指标库里没有任何行'
+
+
+def nodata_markdown(track, dropped):
+    """某个赛道"没出图的面板"清单 + 每个面板空的原因"""
+    md = ['**本看板未出图的面板（%d 个）**' % len(dropped),
+          '',
+          '下列面板在看板口径（看板级 `%s` + 各面板自己的过滤）下**一行数据都没有**，'
+          '所以**没有生成面板** —— 而不是生成了却画不出曲线。' % DASH_SCOPE,
+          '',
+          '| 面板 | 空的原因 |',
+          '|---|---|']
+    for title, reason in dropped:
+        md.append('| %s | %s |' % (title, reason))
+    md.append('')
+    md.append('> 数据补齐后重跑 `make_dashboard.py --import`，面板会自动出现。')
+    return '\n'.join(md)
+
+
 def _dashboard(panels, refs, dash_id, title, time_from, time_to, description,
-               scope='valid: true AND quality: ok'):
-    # 默认闸门加 quality:ok ——
-    #   valid 只说明"这场跑完了且状态是 VALID"，不说明结果可用。
+               scope=DASH_SCOPE):
+    # 看板级默认闸门 = DASH_SCOPE（valid: true）。
+    #   valid 只说明"这场跑完了且状态是 VALID"，不说明结果可用；
     #   实测 15 场 nested 有一个 operation error_rate=1.0（全部请求失败），
     #   status 仍是 VALID → valid:true，这些失败 task 的"快速失败"时延
-    #   会混进查询延迟曲线。quality 才是"这行数据能不能用"的闸门。
+    #   会混进查询延迟曲线。**quality 闸门在每个测量类面板自己的 filter 里**
+    #   （见 track_panel_specs 的 t），错误率面板则刻意不带 quality ——
+    #   它就是要显示失败场次。两层闸门各管各的，详见 DASH_SCOPE 的注释。
     return {
         'id': dash_id, 'type': 'dashboard',
         'attributes': {
@@ -676,7 +761,14 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
 
     specs = track_panel_specs(track, groups, interval)
     by_key = {}
+    dropped = []
     for key, title, filt, fmt, terms, mtype, iv in specs:
+        # 通用空面板过滤：在看板真实口径（看板级 KQL + 面板 filter）下没数据就不出图。
+        #   group_has_metric 之类的预检只看面板自己的 filter，会漏判"被看板级闸门挡掉"的情况。
+        #   硬出图就是一个恒空的 "No results found" 面板，比没有更糟。
+        if not panel_has_data(filt):
+            dropped.append((title, diagnose_empty(filt)))
+            continue
         vis_id = 'bench-%s-%s' % (track, key)
         by_key[key] = vis_id
         objs.append(visualization_obj(vis_id, title, filt, fmt,
@@ -721,6 +813,15 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
         if len(vis_ids) % 2:
             y += 13
 
+    # 没出图的面板：必须留一张说明面板讲清"为什么没有"，
+    # 否则读者看到少了一张图，无从判断是"没数据"还是"我漏看了"。
+    if dropped:
+        nid = 'bench-%s-nodata' % track
+        objs.append(markdown_obj(nid, '未出图面板', nodata_markdown(track, dropped)))
+        by_key['nodata'] = nid
+        add(nid, 0, y, 48, 9)
+        y += 9
+
     label = TRACK_LABEL.get(track, track)
     dash = _dashboard(panels, refs, 'bench-%s' % track,
                        'Benchmark · %s · %s' % (track, label),
@@ -728,7 +829,7 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
                        'esrally 赛道 %s 的独立看板（%s）；对照 opensearch.org/benchmarks '
                        '的"每个 track 一个页面"口径，不同赛道不混图' % (track, label))
     objs.append(dash)
-    return objs
+    return objs, dropped
 
 
 def es_track_facts():
@@ -860,14 +961,16 @@ def nav_markdown(track_info):
     md = ['**赛道导航** — 每个 esrally track 一个独立看板'
           '（对照 opensearch.org/benchmarks：HTTP logs / NYC taxis / PMC / Big5 / '
           'Vectorsearch-* … 各自独立页面，不同 workload 不混图）', '']
-    md.append('| 赛道 | 说明 | 场次 | 实验臂 | workload 分组 | 看板路径 |')
-    md.append('|---|---|---|---|---|---|')
+    md.append('| 赛道 | 说明 | 场次 | 实验臂 | workload 分组 | 未出图面板 | 看板路径 |')
+    md.append('|---|---|---|---|---|---|---|')
     for track, info in track_info:
         label = TRACK_LABEL.get(track, track)
         arms = ', '.join(info['arms']) or '—'
         groups = ' / '.join(g[1] for g in info['groups']) or '—'
-        md.append('| `%s` | %s | %d | %s | %s | `/app/dashboards#/view/bench-%s` |'
-                  % (track, label, info['runs'], arms, groups, track))
+        nod = info.get('nodata') or []
+        nodtxt = ('%d 个（%s）' % (len(nod), '、'.join(nod))) if nod else '0'
+        md.append('| `%s` | %s | %d | %s | %s | %s | `/app/dashboards#/view/bench-%s` |'
+                  % (track, label, info['runs'], arms, groups, nodtxt, track))
     md.append('')
     md.append('> **进各赛道看板**：把上表路径粘到地址栏，或左侧栏 ☰ → Analytics → '
               'Dashboard（`/app/dashboards/list`）点对应标题。')
@@ -923,12 +1026,14 @@ def main():
         runs = es_track_runs(track)
         interval = pick_interval(info['lo'], info['hi'])
         tf, tt = data_window(track)
-        objs += build_track_dashboard(track, groups, interval, tf, tt)
+        track_objs, dropped = build_track_dashboard(track, groups, interval, tf, tt)
+        objs += track_objs
         track_info.append((track, {'runs': runs['runs'], 'arms': runs['arms'],
-                                    'groups': groups}))
-        print('  track %-12s runs=%-4d arms=%-28s groups=%s interval=%s'
+                                    'groups': groups,
+                                    'nodata': [d[0] for d in dropped]}))
+        print('  track %-12s runs=%-4d arms=%-28s groups=%s interval=%s 未出图面板=%d'
               % (track, runs['runs'], ','.join(runs['arms']),
-                 ','.join(g[0] for g in groups) or '-', interval))
+                 ','.join(g[0] for g in groups) or '-', interval, len(dropped)))
 
     objs.append(markdown_obj('bench-vis-head', '环境说明', env_markdown()))
     objs.append(markdown_obj('bench-vis-nav', '赛道导航', nav_markdown(track_info)))
