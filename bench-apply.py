@@ -11,6 +11,10 @@
 只做三件事：① 用 templates.json 建三张索引模板；② 按 jsonl 逐行走 _bulk；③ refresh。
 --drop 会先删掉三张索引再重建 —— mapping 变更（如新增 typed 字段）必须走这条路，
 旧索引的 mapping 不会因为换了 template 而自动更新。
+
+载荷快照原样入 ES/EasySearch，不因目标集群差异改写数据内容 —— 唯一的例外是
+flattened 字段的显式 null（见 flatten_fields），那是被目标集群的 mapper 逼出来的
+必要处理，对 ES 语义等价。
 """
 import argparse
 import base64
@@ -22,6 +26,33 @@ import urllib.error
 import urllib.request
 
 IDX = ("bench-env", "bench-run", "bench-metric")
+
+
+def flatten_fields(template):
+    """从 index template 里取出映射为 flattened 的字段名。
+
+    flattened 是「对象」型 mapper，但 EasySearch 2.5.0 的实现比 ES 8.x 少一层
+    保护：ES 的 FlattenedFieldMapper.parse 对 null 早返回，EasySearch 没有，
+    于是文档里出现显式 null 时报
+        "tried to parse field [x] as object, but got EOF"
+    flattened 也不认 null_value 参数（实测 unsupported parameters），
+    所以唯一可行的处理是：值为 null 时把字段整个省掉。
+    对 ES 语义等价 —— null 与缺失同样不进倒排、不参与聚合与 exists 查询，
+    只是 _source 里少一个键。
+    """
+    props = ((template or {}).get("template", {}).get("mappings", {}) or {}).get("properties", {}) or {}
+    return {name for name, spec in props.items()
+            if isinstance(spec, dict) and spec.get("type") == "flattened"}
+
+
+def drop_null_flattened(doc, names):
+    """删掉值为 null 的 flattened 字段（原地修改 doc，返回删掉的字段数）。"""
+    dropped = 0
+    for name in names:
+        if name in doc and doc[name] is None:
+            del doc[name]
+            dropped += 1
+    return dropped
 
 
 def post(url, body, auth, insecure, ctype="application/x-ndjson", method="POST"):
@@ -59,6 +90,7 @@ def main():
                     print("索引 %s 不存在，跳过删除" % idx)
 
     tp = os.path.join(args.dir, "templates.json")
+    flat = {}
     if os.path.isfile(tp):
         templates = json.load(open(tp, encoding="utf-8"))
         for idx in want:
@@ -67,6 +99,10 @@ def main():
                          json.dumps(templates[idx]), args.auth, args.insecure,
                          "application/json", "PUT")
                 print("模板 %s → %s" % (idx, r))
+            flat[idx] = flatten_fields(templates.get(idx))
+    else:
+        for idx in want:
+            flat[idx] = set()
 
     total = {}
     for idx in want:
@@ -84,6 +120,7 @@ def main():
                 doc = json.loads(line)
                 rid = doc.pop("_id")
                 doc.pop("_index", None)
+                drop_null_flattened(doc, flat[idx])
                 buf.append(json.dumps({"index": {"_index": idx, "_id": rid}}))
                 buf.append(json.dumps(doc, ensure_ascii=False))
                 if len(buf) >= args.batch * 2:
