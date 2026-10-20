@@ -317,6 +317,9 @@ def main():
 
     envs, runs, metrics = {}, [], []
     fid_track = {}          # fid → 归一化赛道名；monitors 补的 system 行靠它回填 track
+    fid_ts = {}             # fid → 场次时间；system 行靠它回填 @timestamp（画折线的前提）
+    fid_valid = {}          # fid → 场次有效性；system 行靠它回填 valid（否则被 KQL 过滤）
+    fid_arm = {}            # fid → 实验臂；system 行靠它回填 arm（否则按 arm 分线的面板拿不到 series）
     seen = set()
     unmatched = 0
     for d in load_store(args.races):
@@ -401,6 +404,14 @@ def main():
                   "challenge": d.get("challenge"), "env_id": side.get("env", {}).get("env_id"),
                   "valid": (status == "VALID") if status else None, "status": status}
         fid_track[fid] = tr
+        # fid → 场次时间：monitors 补的 system 行本身没有 @timestamp（它是按场次
+        # 采集的摘要，不是时间序列），不回填时间戳的话 CPU steal / iowait 这类
+        # 数据可信度指标在 Kibana 上画不出折线（x 轴无值）。
+        fid_ts.setdefault(fid, ts)
+        # fid → 场次有效性：同理，system 行缺 valid 会被 dashboard 的 `valid: true`
+        # 查询框整体过滤掉，CPU steal 这类面板就全空。
+        fid_valid.setdefault(fid, (status == "VALID") if status else None)
+        fid_arm.setdefault(fid, arm)
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
                      "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
                      "version": str(version) if version is not None else None, "build": build,
@@ -492,7 +503,8 @@ def main():
                 if isinstance(mv, str):
                     sysrows += 1
                     metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
-                                    "@timestamp": None, "campaign": camp, "fid": fid, "node": node,
+                                    "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
+                                    "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
                                     "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
                                     "value": None, "value_text": mv, "unit": "text",
@@ -500,7 +512,8 @@ def main():
                     continue
                 sysrows += 1
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
-                                "@timestamp": None, "campaign": camp, "fid": fid, "node": node,
+                                "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
+                                    "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
                                 "value": (mv / 100.0 if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util")) else mv),
