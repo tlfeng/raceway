@@ -210,6 +210,14 @@ arm_config() { # <臂名>
   return 0
 }
 
+# 排程文件 → 有效行（去 # 行内注释、去首尾空白、去空行）
+# ⚠️ 必须整行剥注释：只剥第一字段的话，行尾注释会落进 est 字段，
+#    随后 $(( est*60 )) 遇非数字直接报错，窗底守卫就失效了。
+schedule_lines() {
+  [ -f "${SCHEDULE_FILE:-}" ] || return 0
+  sed 's/#.*//' "$SCHEDULE_FILE" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
+}
+
 if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   echo "== DRY RUN 排程（不执行任何操作） =="
   if [ -n "${SCHEDULE_FILE:-}" ]; then
@@ -220,7 +228,6 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
     echo "|---|---|---|---|---|---|---|"
     n=0
     while read -r arm tk rnd do_recall est; do
-      arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
       [ -n "$arm" ] || continue
       n=$((n+1))
       _c=$(arm_config "$arm")
@@ -230,7 +237,7 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
       fi
       apply_config "$_c"
       printf "| %d | %s | %s | %s | %s | %s | %s %s (%s) |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}" "$ENGINE_NAME" "$FULL_VER" "$ARM_LABEL"
-    done < "$SCHEDULE_FILE"
+    done < <(schedule_lines)
     echo "共 $n 场。DRY=1/--dry-run 不会创建 campaign、不会触碰集群。"
     exit 0
   fi
@@ -908,10 +915,9 @@ env_fingerprint_raw    # bench-env 台账源（静态部分，每场 sidecar 引
 if [ -n "${SCHEDULE_FILE:-}" ]; then
   TRACKS=()
   while read -r arm tk rnd do_recall est; do
-    arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
     [ -n "$arm" ] || continue
     case " ${TRACKS[*]} " in *" $tk "*) ;; *) TRACKS+=("$tk");; esac
-  done < "$SCHEDULE_FILE"
+  done < <(schedule_lines)
   PROGSTEP "排程赛道集合: ${TRACKS[*]}"
 fi
 
@@ -959,7 +965,6 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
   [ -f "$STATE" ] || : > "$STATE"
   PROGSTEP "排程模式: $SCHEDULE_FILE（臂定义 $ARMS_FILE）"
   while read -r arm tk rnd do_recall est; do
-    arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
     [ -n "$arm" ] || continue
     seqn=$((seqn+1))
     # 断点续跑：STATE 里已有 OK 的场次直接跳过
@@ -991,7 +996,7 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
       echo "FAIL $seqn" >> "$STATE"
     fi
     total=$((total+1))
-  done < "$SCHEDULE_FILE"
+  done < <(schedule_lines)
 else
   for tk in "${TRACKS[@]}"; do
     for r in $(seq 1 "$ROUNDS"); do
