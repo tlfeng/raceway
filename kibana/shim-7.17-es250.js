@@ -106,11 +106,10 @@ async function fetchNodes() {
     const j = JSON.parse(r.body);
     const nodes = {};
     for (const [id, n] of Object.entries(j.nodes || {})) {
-      // 版本一律伪装成 FAKE_VERSION —— Kibana 的兼容检查会读节点版本
-      const ver = { ...(n.version || {}), number: FAKE_VERSION, distribution: 'elasticsearch' };
+      // 版本一律伪装成 ES 形态的对象 —— Kibana 的兼容检查会读节点版本
       nodes[id] = {
         name: n.name, transport_address: n.transport_address, host: n.host, ip: n.ip,
-        version: ver, build_flavor: n.build_flavor || 'default', build_type: n.build_type,
+        version: esNodeVersion(n), build_flavor: n.build_flavor || 'default', build_type: n.build_type,
         http: n.http, roles: n.roles, attributes: n.attributes, settings: n.settings,
       };
     }
@@ -215,6 +214,19 @@ function fakeProductRoot(body) {
   return JSON.stringify(j);
 }
 
+// 节点版本归一：EasySearch 的 _nodes 里 version 是**字符串**（"2.5.0"），
+// 而 ES 7.17 客户端读的是 node.version.number（对象形态）—— 不归一的话
+// Kibana 的兼容检查会判成不兼容。
+function esNodeVersion(node) {
+  const v = (node.version && typeof node.version === 'object') ? { ...node.version } : {};
+  v.number = FAKE_VERSION;
+  v.distribution = 'elasticsearch';
+  if (!v.build_flavor) v.build_flavor = node.build_flavor || 'default';
+  if (!v.build_type) v.build_type = node.build_type || 'tar';
+  if (!v.build_hash) v.build_hash = node.build_hash;
+  return v;
+}
+
 // 节点信息里的版本改写：Kibana 的版本兼容检查读的是 GET /_nodes 里每个节点的
 // version.number（不是 GET /），不改这里它会判定 "v7.17.29 与 v2.5.0 不兼容"。
 function fakeNodesVersion(body) {
@@ -224,12 +236,8 @@ function fakeNodesVersion(body) {
   let n = 0;
   for (const node of Object.values(j.nodes)) {
     if (!node || typeof node !== 'object') continue;
-    if (!node.version) node.version = {};
-    if (node.version.number !== FAKE_VERSION) {
-      node.version.number = FAKE_VERSION;
-      node.version.distribution = 'elasticsearch';
-      n++;
-    }
+    node.version = esNodeVersion(node);
+    n++;
   }
   return n > 0 ? JSON.stringify(j) : null;
 }
