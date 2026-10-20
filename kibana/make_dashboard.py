@@ -257,28 +257,51 @@ def group_tasks(tasks):
     return out
 
 
+def _count(q):
+    """按 Lucene 查命中数；查询失败返回 None（调用方按"有数据"处理，不因查询失败丢面板）"""
+    try:
+        r = es_post('/bench-metric/_count', {'query': {'query_string': {'query': q}}})
+        return r.get('count', 0)
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
 def group_has_metric(track, tasks, family, unit=None):
     """该 workload 组在给定赛道下是否真有这个 family 的数据。
 
     没有就不出那个面板 —— 例如 scroll 是分页操作，只有 latency 没有 throughput，
     硬出图就是一个恒空的"No results found"面板，比没有更糟。
-    ES 不可用时返回 True（退化成"都出图"），不因查询失败而丢面板。
     """
-    tt = '(%s)' % ' OR '.join('task:%s' % x for x in tasks)
+    tt = '(%s)' % ' OR '.join('task:%s' % x for x in tasks) if tasks else '*'
     q = 'track:%s AND family:%s%s AND %s' % (
         track, family, (' AND unit:"%s"' % unit) if unit else '', tt)
-    try:
-        r = es_post('/bench-metric/_count', {'query': {'query_string': {'query': q}}})
-        return bool(r.get('count'))
-    except Exception:                                       # noqa: BLE001
-        return True
+    n = _count(q)
+    return True if n is None else bool(n)
+
+
+def system_metric_exists(track, metric):
+    """该赛道是否有这个 system 指标（只有带 monitor 采集的赛道才有）"""
+    n = _count('track:%s AND family:system AND metric:(%s)' % (track, metric))
+    return True if n is None else bool(n)
 
 
 # 面板过滤的公共部分。family 取值来自 bench-export.py 的 RESULT_METRICS 映射：
-#   segment_count -> family=disk（不是 segments！曾按 segments 写过滤，整块面板恒为空白）
-#   store_size / translog_size / dataset_size -> family=disk
-#   young_gc_time -> family=gc, total_time -> family=indexing_time
+#   segment_count / store_size / translog_size -> family=disk
+#   young_gc_time / old_gc_time -> family=gc
+#   total_time -> family=indexing_time
+# 注意 family 不是按名字归一的：merge_count 属 merge、merge_time 属 merge_time；
+#   merge_throttle_time / refresh_time / flush_time 各是独立 family。
 # 每个面板都带 track:<赛道> —— 不同赛道的同族指标互不干扰，各自独立成看板。
+
+# 索引阶段分解：每个指标 family 不同，逐个写死
+IDX_PHASE_SPECS = [
+    ('merge-time', 'Merge 耗时 (s)', 'family:merge_time AND stat:value', '0.0[00]'),
+    ('refresh-time', 'Refresh 耗时 (s)', 'family:refresh_time AND stat:value', '0.0[00]'),
+    ('flush-time', 'Flush 耗时 (s)', 'family:flush_time AND stat:value', '0.0[00]'),
+    ('throttle', '索引限流时长 (s)', 'family:indexing_throttle_time AND stat:value', '0.0[00]'),
+]
+
+
 def track_panel_specs(track, groups, interval):
     """某赛道的面板规格：[(key, 标题, lucene 过滤, 数字格式, 分组字段, 指标类型, 桶粒度)]"""
     t = 'track:%s' % track
@@ -290,34 +313,70 @@ def track_panel_specs(track, groups, interval):
          '%s AND family:indexing_time AND metric:total_time AND stat:value' % t,
          '0.0[0]', 'arm', 'avg', interval),
     ]
+    # 索引阶段分解：merge / refresh / flush / 限流 的耗时，看索引慢在哪一段
+    for key, title, f, fmt in IDX_PHASE_SPECS:
+        specs.append((key, title, '%s AND %s' % (t, f), fmt, 'arm', 'avg', interval))
+    # 索引活动次数：merge/refresh/flush 各多少次，同量纲（次数）→ 一图多线
+    specs.append(('idx-events', '索引活动次数 (merge/refresh/flush)',
+                  '%s AND family:(merge OR refresh OR flush) AND stat:value '
+                  'AND metric:(merge_count OR refresh_count OR flush_count)' % t,
+                  '0.0a', 'metric', 'avg', interval))
+
     for gid, label, tasks in groups:
         tt = '(%s)' % ' OR '.join('task:%s' % x for x in tasks)
         if group_has_metric(track, tasks, 'throughput', 'ops/s'):
             specs.append(('qthr-' + gid, '%s · 吞吐 (ops/s)' % label,
                           '%s AND family:throughput AND unit:"ops/s" AND stat:median AND %s' % (t, tt),
                           '0.0a', 'arm', 'avg', interval))
+        # 延迟分位：p50/p90/p99/p999 同量纲（秒）→ 一图多线，比单看 p90 全
         if group_has_metric(track, tasks, 'latency'):
-            specs.append(('qlat-' + gid, '%s · 延迟 p90 (s)' % label,
-                          '%s AND family:latency AND stat:p90 AND %s' % (t, tt),
-                          '0.0[00]', 'arm', 'avg', interval))
-    # 服务时间 p99 与错误率按整个赛道汇总：这两项在 workload 之间量纲一致，
-    # 混在一起不会把"不同 workload 对比"的误差引入趋势判断。
-    specs.append(('svc', '服务时间 p99 (s) · 全赛道汇总',
-                  '%s AND family:service_time AND metric:service_time AND stat:p99 '
-                  'AND NOT task:(index-append OR %s)' % (t, MAINT_TASKS),
-                  '0.0[00]', 'arm', 'avg', interval))
+            specs.append(('qlat-' + gid, '%s · 延迟分位 (p50/p90/p99/p999)' % label,
+                          '%s AND family:latency AND stat:(p50 OR p90 OR p99 OR p999) AND %s' % (t, tt),
+                          '0.0[000]', 'stat', 'avg', interval))
+        # 处理时间：rally 的 processing_time = 服务端处理 + 队列等待，
+        # 与端到端 latency 不同，单独看能分辨"引擎慢"还是"排队久"
+        if group_has_metric(track, tasks, 'processing_time'):
+            specs.append(('qproc-' + gid, '%s · 处理时间分位 (p50/p90/p99)' % label,
+                          '%s AND family:processing_time AND stat:(p50 OR p90 OR p99) AND %s' % (t, tt),
+                          '0.0[000]', 'stat', 'avg', interval))
+        # service_time 不单独出图：无排队等待时它与 latency 逐点相等（rally 的
+        # latency = service_time + queue），单独画一图全是与延迟重复的线。
+
     specs.append(('err', '错误率 (0-1)',
                   '%s AND family:error_rate AND stat:value' % t,
                   '0.000', 'arm', 'avg', interval))
+
+    # ---- 资源与存储 ----
     specs.append(('disk', '存储占用 (GB)',
                   '%s AND family:disk AND metric:store_size AND stat:value' % t,
                   '0.0', 'arm', 'avg', interval))
     specs.append(('seg', '段数量',
                   '%s AND family:disk AND metric:segment_count AND stat:value' % t,
                   '0.0a', 'arm', 'avg', interval))
-    specs.append(('gc', 'Young GC 耗时 (s)',
-                  '%s AND family:gc AND metric:young_gc_time AND stat:value' % t,
-                  '0.0[00]', 'arm', 'avg', interval))
+    # memory_* 六个分量与 translog_size 实测全为 0（rally 报告未填充 / 赛末已清空），
+    # 画出来是六条零线，没有信息量 —— 不出图。
+    # GC：耗时与次数各一图（分 young/old 两代，同量纲）
+    specs.append(('gc-time', 'GC 耗时 (s · young/old)',
+                  '%s AND family:gc AND stat:value '
+                  'AND metric:(young_gc_time OR old_gc_time)' % t,
+                  '0.0[00]', 'metric', 'avg', interval))
+    specs.append(('gc-count', 'GC 次数 (young/old)',
+                  '%s AND family:gc AND stat:value '
+                  'AND metric:(young_gc_count OR old_gc_count)' % t,
+                  '0.0a', 'metric', 'avg', interval))
+
+    # ---- 环境健康度（数据可信度）：只有带 monitor 采集的赛道才有 ----
+    for key, title, metric, fmt in [
+            ('steal', 'CPU steal (avg/max) · 数据可信度', 'cpu_steal_avg OR cpu_steal_max', '0.000'),
+            ('iowait', 'CPU iowait (avg)', 'cpu_iowait_avg', '0.000'),
+            ('foreign', '外来进程 CPU (max)', 'foreign_cpu_max', '0.000'),
+            ('load1', '系统负载 load1 (max)', 'cpu_load1_max', '0.0a'),
+            ('disk-util', '磁盘利用率 (avg)', 'disk_util_avg', '0.000'),
+            ('swapin', '换入次数', 'swapin', '0.0a')]:
+        if group_has_metric(track, [], 'system') and system_metric_exists(track, metric):
+            specs.append((key, title,
+                          '%s AND family:system AND metric:(%s) AND stat:value' % (t, metric),
+                          fmt, 'metric' if ' OR ' in metric else 'arm', 'avg', interval))
     return specs
 
 
@@ -459,9 +518,10 @@ USAGE_MD = '''**看图指南**
 # ---------------------------------------------------------------- dashboard
 
 SECTIONS = [
-    ('write', '① 写入 (write)', '索引阶段吞吐与总耗时，docs/s 口径'),
-    ('query', '② 查询 (query)', '按 workload 分图：同一 workload 内才是同量纲可比的'),
-    ('res', '③ 资源与存储', '赛末存储体积、段数、Young GC 耗时'),
+    ('write', '① 写入 (write)', '索引吞吐、总耗时与阶段分解（merge / refresh / flush / 限流）'),
+    ('query', '② 查询 (query)', '按 workload 分图：吞吐、延迟分位(p50/p90/p99/p999)、处理时间分位'),
+    ('res', '③ 资源与存储', '存储体积 / 段数 / GC 耗时与次数（young/old）'),
+    ('health', '④ 环境健康度', 'CPU steal / iowait / 外来进程 / 负载 / 磁盘 / swap —— 数据可信度'),
 ]
 
 
@@ -523,20 +583,27 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
         objs.append(section_obj(sid, stitle, stext))
         by_key['sec-' + skey] = sid
 
-    # 布局：写入段 2 图；查询段 = 每个 workload 2 图 + 服务时间/错误率 2 图；
-    # 资源段 3 图。每段 2 列，行高 13；段标题整行高 3。
+    # 布局：按段排布，每段 2 列，行高 13；段标题整行高 3。
+    # 段内只放实际生成的面板（某指标没数据就不出图，段本身也不会空）。
+    def pick(keys):
+        return [by_key[k] for k in keys if k in by_key]
+
+    write_ids = pick(['wthr', 'idx', 'merge-time', 'refresh-time',
+                      'flush-time', 'throttle', 'idx-events'])
     query_ids = []
     for gid, _label, _tasks in groups:
-        for k in ('qthr-' + gid, 'qlat-' + gid):
+        for k in ('qthr-' + gid, 'qlat-' + gid, 'qproc-' + gid):
             if k in by_key:                 # 该 workload 没有这个指标时面板就不存在
                 query_ids.append(by_key[k])
-    query_ids += [by_key['svc'], by_key['err']]
+    query_ids += pick(['err'])
+    res_ids = pick(['disk', 'seg', 'gc-time', 'gc-count'])
+    health_ids = pick(['steal', 'iowait', 'foreign', 'load1', 'disk-util', 'swapin'])
 
-    layout = [
-        (by_key['sec-write'], [by_key['wthr'], by_key['idx']]),
-        (by_key['sec-query'], query_ids),
-        (by_key['sec-res'], [by_key['disk'], by_key['seg'], by_key['gc']]),
-    ]
+    layout = []
+    for sec_key, ids in (('write', write_ids), ('query', query_ids),
+                         ('res', res_ids), ('health', health_ids)):
+        if ids:
+            layout.append((by_key['sec-' + sec_key], ids))
     y = 0
     for sec_id, vis_ids in layout:
         add(sec_id, 0, y, 48, 3)
