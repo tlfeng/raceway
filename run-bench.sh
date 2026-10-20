@@ -197,7 +197,9 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   exit 0
 fi
 
-CAMP_ID="jdk3-$(date +%Y%m%d-%H%M%S)"
+# campaign 名前缀默认沿用 jdk3（历史惯例）；可用 CAMP_PREFIX 覆盖，
+# 让臂名进 campaign 维度——es819 的批次不该叫 jdk3-*（按批次过滤时看板上会认错臂）
+CAMP_ID="${CAMP_PREFIX:-jdk3}-$(date +%Y%m%d-%H%M%S)"
 CAMP_DIR="$RESULTS_ROOT/$CAMP_ID"
 mkdir -p "$CAMP_DIR/results" "$CAMP_DIR/logs"
 PROG="$CAMP_DIR/PROGRESS.txt"; RACES="$CAMP_DIR/RACES.md"
