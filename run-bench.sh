@@ -178,7 +178,10 @@ declare -a CONF_LABELS CONF_PKGS
 if [ -n "${SCHEDULE_FILE:-}" ]; then
   # 排程模式：配置在排程推进时逐条注册（见主流程），此处只校验臂定义文件存在
   [ -s "$ARMS_FILE" ] || die "排程模式需要臂定义文件: ARMS_FILE=$ARMS_FILE"
-  CONF_LABELS=(); CONF_PKGS=()
+  # CONFIGS 也必须清空：上面 else 分支留的单配置哨兵 ("") 还在，
+  # 而 CONF_LABELS 是空的 → 写 PACKAGES.txt 时 "${CONF_LABELS[0]}"
+  # 在 set -u 下直接报 unbound variable（起跑即崩，DRY 走不到这行所以发现不了）。
+  CONFIGS=(); CONF_LABELS=(); CONF_PKGS=()
 elif [ -n "${CONFIGS[0]:-}" ]; then
   _seen="|"
   for _ln in "${CONFIGS[@]}"; do
@@ -209,6 +212,29 @@ arm_config() { # <臂名>
     case "$name" in '#'*) continue;; esac
     if [ "$name" = "$want" ]; then printf '%s' "$line"; return 0; fi
   done < "$ARMS_FILE"
+  return 0
+}
+
+# 排程模式：这一轮会用到的**所有**安装包（引擎包 + 用户自管 JDK 包 + 修补版 agent）。
+# 排程是推进时逐条注册配置的，起跑那一刻还不知道将来用哪些包；
+# 但臂定义文件是静态的，按它把包全列出来才有可回溯性（对齐 ds3 的 PACKAGES.txt 口径）。
+schedule_packages() {
+  local arm cfg
+  while read -r arm cfg; do
+    [ -n "${arm:-}" ] || continue
+    case "$arm" in '#'*) continue;; esac
+    # 用子 shell 调 apply_config：复用真正的包名解析逻辑（resolve_engine），
+    # 又不污染当前进程的 ENGINE_*/ARM_LABEL
+    ( apply_config "$cfg" >/dev/null 2>&1
+      [ -n "${ENGINE_PKG:-}" ] && printf '%s\n' "$ENGINE_PKG"
+      case "${JDK_DIR:-}" in
+        */jdk-26) printf '%s\n' "$PKG_DIR/openjdk-26_linux-x64_bin.tar.gz";;
+        */jdk-27) printf '%s\n' "$PKG_DIR/openjdk-27_linux-x64_bin.tar.gz";;
+      esac )
+  done < "$ARMS_FILE"
+  # 修补版 agent（JDK 26/27 臂会把它换进引擎目录）
+  [ -f "$ROOT/dsfix/agent-patched-1.18.15.jar" ] && printf '%s\n' "$ROOT/dsfix/agent-patched-1.18.15.jar"
+  [ -f "$PKG_DIR/agent-patched-1.18.15.jar" ] && printf '%s\n' "$PKG_DIR/agent-patched-1.18.15.jar"
   return 0
 }
 
@@ -902,13 +928,22 @@ PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_C
 # 材料指纹（结论可回溯；多配置逐行列出，包指纹去重）
 {
   echo "campaign: $CAMP_ID"
-  echo "configs: ${#CONFIGS[@]}（轮内右旋）"
-  for i in "${!CONFIGS[@]}"; do
-    echo "  [$i] ${CONF_LABELS[$i]}: ${CONFIGS[$i]:-（顶层环境旋钮）}"
-  done
-  for p in "${CONF_PKGS[@]}"; do echo "$p"; done | sort -u | while read -r _p; do
-    sha256sum "$_p" 2>/dev/null
-  done
+  if [ -n "${SCHEDULE_FILE:-}" ]; then
+    # 排程模式：整份排程内联存档 + 所有臂的包指纹（ds3 的 PACKAGES.txt 就是这个口径）
+    echo "schedule: $(schedule_lines | tr '\n' ' ')"
+    echo "arms: $ARMS_FILE"
+    schedule_packages | sort -u | while read -r _p; do
+      [ -f "$_p" ] && sha256sum "$_p" 2>/dev/null
+    done
+  else
+    echo "configs: ${#CONFIGS[@]}（轮内右旋）"
+    for i in "${!CONFIGS[@]}"; do
+      echo "  [$i] ${CONF_LABELS[$i]:-?}: ${CONFIGS[$i]:-（顶层环境旋钮）}"
+    done
+    for p in "${CONF_PKGS[@]}"; do echo "$p"; done | sort -u | while read -r _p; do
+      sha256sum "$_p" 2>/dev/null
+    done
+  fi
 } > "$CAMP_DIR/PACKAGES.txt"
 
 env_fingerprint_raw    # bench-env 台账源（静态部分，每场 sidecar 引用同一份）
@@ -950,7 +985,9 @@ case " ${TRACKS[*]} " in *gdef*|*gzstd*|*gbc*)
 ;; esac
 
 case " ${TRACKS[*]} " in *ds-*)
-  ./prepare-dimsweep-track.sh || die "ds-* 赛道准备失败"
+  # CAMP_DIR 显式传下去：run-bench.sh 里它是普通 shell 变量（没 export），
+  # prepare 脚本要靠它把语料自检记录追加进本 campaign 的 PACKAGES.txt
+  CAMP_DIR="$CAMP_DIR" ./prepare-dimsweep-track.sh || die "ds-* 赛道准备失败"
   for d in "${TRACKS[@]}"; do
     case "$d" in ds-*) [ -d "$ROOT/tracks/$d" ] || die "ds-* 赛道缺失: $ROOT/tracks/$d";; esac
   done
