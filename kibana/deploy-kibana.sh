@@ -79,7 +79,9 @@ elasticsearch.password: "$ES_PASS"
 elasticsearch.requestTimeout: 60000
 elasticsearch.pingTimeout: 60000
 monitoring.ui.container.elasticsearch.enabled: true
-logging.log.level: info
+# Kibana 7.17 的日志配置在 logging.root 下（logging.log.level 是 8.x 的键，
+# 7.17 校验会报 "definition for this key is missing"）
+logging.root.level: info
 EOF
   chmod 600 "$KB_ROOT/config/kibana.yml"
   cd "$KB_ROOT" || die "进不去 $KB_ROOT"
