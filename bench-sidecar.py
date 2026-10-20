@@ -18,6 +18,7 @@ raw 目录里是编排抓好的原始探针（缺失项记 null，不猜值）:
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -61,6 +62,43 @@ def heap_mb(declared):
 
 
 # ---------- 赛道 spec：外部集群运行参数与语料规模（rally race.json 不记这些） ----------
+# operation 级参数（target-throughput / clients / iterations）决定了 rally 的 latency 口径：
+#   设了 target-throughput → 开环节流 → latency 是端到端（含发压机积压）
+#   没设 → 闭环 → latency ≡ service_time
+# 这个信息只在赛道 spec 里，race.json 不记，必须在这里解析出来落进 sidecar，
+# 否则下游只能靠"latency 与 service_time 是否相等"反推（反推在没饱和时不可靠）。
+_OP_RE = re.compile(r'"operation"\s*:\s*"([a-z0-9_-]+)"(?P<rest>[^{}]*?)\}', re.S)
+
+
+def parse_operations(blob):
+    """赛道 spec 文本 → {operation 名: {target_throughput, clients, iterations, warmup_iterations}}"""
+    out = {}
+    for m in _OP_RE.finditer(blob or ""):
+        name, rest = m.group(1), m.group("rest")
+        op = {}
+        for key, field in (("target-throughput", "target_throughput"),
+                           ("clients", "clients"),
+                           ("iterations", "iterations"),
+                           ("warmup-iterations", "warmup_iterations")):
+            mm = re.search(r'"%s"\s*:\s*([0-9.]+)' % re.escape(key), rest)
+            if mm:
+                try:
+                    op[field] = float(mm.group(1)) if "." in mm.group(1) else int(mm.group(1))
+                except ValueError:
+                    pass
+        if op:
+            out[name] = op
+    return out
+
+
+def latency_modes_of(operations):
+    """operation → latency 口径（地面真值，不靠反推）"""
+    modes = {}
+    for name, op in (operations or {}).items():
+        modes[name] = "open_loop" if op.get("target_throughput") else "closed_loop"
+    return modes
+
+
 def track_meta(track_dir, track_params):
     tp = dict(kv_track_params(track_params))
     res = {
@@ -71,6 +109,9 @@ def track_meta(track_dir, track_params):
         "overrides": tp,
         "corpus": None,
         "corpus_docs": None,
+        "corpus_source": None,
+        "operations": {},
+        "latency_modes": {},
         "source": {"bulk_size": None, "clients": None, "corpus_docs": None},
     }
     if not track_dir or not os.path.isdir(track_dir):
@@ -81,19 +122,28 @@ def track_meta(track_dir, track_params):
         m = re.search(r'"corpora"\s*:\s*\[\s*\{[^}]*?"name"\s*:\s*"([^"]+)"', t, re.S)
         if m:
             res["corpus"] = m.group(1)
+        m = re.search(r'"source-path"\s*:\s*"([^"]+)"', t)
+        if m:
+            res["corpus_source"] = m.group(1)
         m = re.search(r'"document-count"\s*:\s*(\d+)', t)
         if m:
             res["corpus_docs"] = int(m.group(1))
             res["source"]["corpus_docs"] = "track.json"
     # spec 里的 jinja 默认值（未被 --track-params 覆盖时即为实际生效值）
     spec = []
+    op_files = {}
+    py_blob = []
     for sub in ("operations", "challenges", "."):
         d = os.path.join(track_dir, sub)
         if not os.path.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".json"):
-                spec.append(read(d, fn) or "")
+                t = read(d, fn) or ""
+                spec.append(t)
+                op_files[fn] = t
+            elif fn.endswith(".py"):
+                py_blob.append(read(d, fn) or "")
     blob = "\n".join(spec)
     for key, pat in (("bulk_size", r'"bulk-size"\s*:\s*\{\{\s*bulk_size\s*\|\s*default\((\d+)\)\}\}'),
                      ("clients", r'"clients"\s*:\s*\{\{\s*bulk_indexing_clients\s*\|\s*default\((\d+)\)\}\}')):
@@ -102,7 +152,111 @@ def track_meta(track_dir, track_params):
             if m:
                 res[key] = int(m.group(1))
                 res["source"][key] = "track spec default"
+    res["operations"] = parse_operations(blob)
+    res["latency_modes"] = latency_modes_of(res["operations"])
+    res["knn_params"] = parse_knn_params(blob, op_files, "\n".join(py_blob))
     return res
+
+
+def parse_knn_params(spec_blob, op_files, py_blob=""):
+    """KNN 索引/查询参数 —— 没有就不臆造。
+
+    KNN 赛道只比吞吐不看召回、不记索引参数，"快"就无从判断是检索算法更优
+    还是候选集/近似程度不同。这里把 dims / 索引类型 / m / ef_construction /
+    num_candidates / 每个 task 的 k 一起落库。
+    """
+    p = {}
+    m = re.search(r'"dims"\s*:\s*(\d+)', spec_blob or "")
+    if m:
+        p["dims"] = int(m.group(1))
+    m = re.search(r'"element_type"\s*:\s*"([^"]+)"', spec_blob or "")
+    if m:
+        p["element_type"] = m.group(1)
+    m = re.search(r'"index_options"\s*:\s*\{[^}]*?"type"\s*:\s*"([^"]+)"', spec_blob or "", re.S)
+    if m:
+        p["index_type"] = m.group(1)
+    for key, field in (("m", "m"), ("ef_construction", "ef_construction")):
+        mm = re.search(r'"index_options"\s*:\s*\{[^}]*?"%s"\s*:\s*(\d+)' % key, spec_blob or "", re.S)
+        if mm:
+            p[field] = int(mm.group(1))
+    # num_candidates 在 param-source 的 .py 里（默认 100），spec JSON 里也可能出现
+    for blob in (spec_blob or "", py_blob or ""):
+        mm = re.search(r'"num[-_]candidates"\s*:\s*(\d+)', blob) or \
+             re.search(r'"num-candidates"\s*,\s*(\d+)', blob)
+        if mm:
+            p["num_candidates"] = int(mm.group(1))
+            break
+    kmap = {}
+    for fname, text in (op_files or {}).items():
+        try:
+            d = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        name = d.get("name")
+        k = d.get("k")
+        if name and k is not None:
+            try:
+                kmap[name] = int(k)
+            except (TypeError, ValueError):
+                pass
+    if kmap:
+        p["k_by_task"] = kmap
+    return p or None
+
+
+def node_extras(full_stats_text):
+    """从完整 _nodes/stats 探针里取"引擎压力与健康"指标。
+
+    只取拿得到就落、拿不到就不落 —— 旧探针（_nodes/stats/jvm,os,process,indices）
+    不含这些字段。缺它们的后果：压测中"是不是把线程池打爆了""缓存命中多少"
+    "引擎侧累计查询耗时"全部无法回答，饱和与限流在数据上不可区分。
+    """
+    nodes = load_nodes(full_stats_text)
+    out = {}
+    for nid, n in nodes.items():
+        e = {}
+        tp = n.get("thread_pool") or {}
+        for pool in ("search", "write", "get", "force_merge"):
+            p = tp.get(pool) or {}
+            if p:
+                e["thread_pool_%s" % pool] = {
+                    "rejected": p.get("rejected"), "queue": p.get("queue"),
+                    "active": p.get("active"), "completed": p.get("completed"),
+                }
+        br = n.get("breaker") or {}
+        if br:
+            e["breaker_tripped"] = sum((v or {}).get("tripped", 0) for v in br.values())
+            e["breaker_tripped_count"] = {k: (v or {}).get("tripped") for k, v in br.items()}
+        qc = ((n.get("indices") or {}).get("query_cache") or {})
+        if qc:
+            e["query_cache"] = {"hit_count": qc.get("hit_count"),
+                                "miss_count": qc.get("miss_count"),
+                                "memory_size_in_bytes": qc.get("memory_size_in_bytes")}
+        idx = n.get("indices") or {}
+        s = idx.get("search") or {}
+        if s:
+            e["engine_query_time_ms"] = s.get("query_time_in_millis")
+            e["engine_query_total"] = s.get("query_total")
+        i = idx.get("indexing") or {}
+        if i:
+            e["engine_index_time_ms"] = i.get("index_time_in_millis")
+            e["engine_index_total"] = i.get("index_total")
+        seg = idx.get("segments") or {}
+        if seg:
+            e["segment_count"] = seg.get("count")
+        fs = n.get("fs") or {}
+        if fs:
+            tot = fs.get("total") or {}
+            e["disk_total_gb"] = round((tot.get("total_in_bytes") or 0) / 1e9, 2) or None
+            e["disk_free_gb"] = round((tot.get("free_in_bytes") or 0) / 1e9, 2) or None
+        pr = n.get("process") or {}
+        if pr.get("cpu"):
+            e["process_cpu_percent"] = (pr.get("cpu") or {}).get("percent")
+        if e:
+            out[nid] = e
+    return out or None
 
 
 def kv_track_params(s):
@@ -208,6 +362,9 @@ def main():
             "nproc_inside": num(d.get("nproc")),
             "mem_gb": round(num(d.get("mem_mb"), 0) / 1024.0, 1) if d.get("mem_mb") else None,
             "disk_avail_gb": num((d.get("disk_avail_gb") or "").strip("G")), "kernel": d.get("kernel"),
+            # 磁盘类型/设备：写入性能的一阶因子，换 NVMe→SATA 的结论没有它做不出来
+            "disk_path": d.get("disk_path"), "disk_type": d.get("disk_type"),
+            "disk_rota": d.get("disk_rota"),
             "thp": m.group(1) if m else (thp_raw or None), "thp_raw": thp_raw or None,
             "max_map_count": num(d.get("max_map_count")),
             "swap_lines": num(d.get("swap_lines")), "cpu_model": d.get("cpu_model"),
@@ -281,12 +438,23 @@ def main():
             "shards": tm["shards"], "replicas": tm["replicas"],
             "bulk_size": tm["bulk_size"], "clients": tm["clients"],
             "params_source": tm["source"], "track_params_passed": args.track_params or None,
+            # operation 级参数与 latency 口径（地面真值）：rally 的 latency 在开环 task
+            # （设了 target-throughput）里含发压机积压，闭环 task 里 ≡ service_time。
+            # 没有这一项，下游只能靠"latency 是否等于 service_time"反推 —— 反推在
+            # 没饱和时会把开环 task 误判成闭环。
+            "operations": tm["operations"] or None,
+            "latency_modes": tm["latency_modes"] or None,
+            # KNN 索引/查询参数：不记就只能比吞吐，无法判断"快"是算法更优还是候选集不同
+            "knn_params": tm["knn_params"],
             # 集群里实测生效的索引 settings（codec/source_reuse 类结论的可证明来源：
             # 赛道烘了某行 ≠ 引擎真接受了那行，ES 拒绝未知设置时会静默回落到默认编码）
             "index_settings_measured": index_settings(read(args.raw, "index-settings.txt")),
         },
-        "corpus": {"name": tm["corpus"], "docs": tm["corpus_docs"]},
+        "corpus": {"name": tm["corpus"], "docs": tm["corpus_docs"],
+                   "source_path": tm["corpus_source"],
+                   "spec_hash": corpus_spec_hash(tm)},
         "cluster_measured": measured,
+        "cluster_extras": node_extras(read(args.raw, "nodes-stats-full.txt")),
         "env": {
             "env_id": args.env_id,
             "host": {"hostname": host.get("hostname"), "cpu_model": host.get("cpu_model"),
@@ -302,6 +470,18 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=1)
     print(f"sidecar → {os.path.basename(args.out)}（测量节点 {len(measured)} 台，指纹 {len(vm_fp)} 台）")
+
+
+def corpus_spec_hash(tm):
+    """语料规格指纹（name + docs + source-path 的稳定摘要）。
+
+    不做内容级哈希（语料是 GB 级，每场重算会把压测机拖垮），而是把"这份语料是哪个
+    spec 的第几版"钉住 —— 同名语料在不同场次是不是同一份，靠它判断。
+    """
+    key = "|".join(str(x) for x in (tm.get("corpus"), tm.get("corpus_docs"), tm.get("corpus_source")))
+    if not any((tm.get("corpus"), tm.get("corpus_docs"), tm.get("corpus_source"))):
+        return None
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
 def index_settings(text):

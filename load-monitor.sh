@@ -156,9 +156,21 @@ summary() {
   awk -F, -v stM="$VERDICT_STEAL_MAX" -v fM="$VERDICT_FOREIGN_MAX" '
     NR>1 {
       n++; st+=$4; f+=$12; sw+=$7
+      us+=$2; sy+=$3; bc+=$11; dr+=$8; rx+=$9; tx+=$10
       if($4>stMx)stMx=$4; if($12>fMx)fMx=$12
+      if($2>usMx)usMx=$2; if($3>syMx)syMx=$3; if($11>bcMx)bcMx=$11
+      if($8>drMx)drMx=$8
+      if(mn==""||$6+0<mn+0)mn=$6
     } END {
       if(n==0){print "ENV-VERDICT: NO-DATA"; exit 1}
+      # 这些量**每 5 秒都在采**，只是摘要里一直只吐 steal/foreign/swapin 三个，
+      # 其余全被扔掉了。补进摘要后 bench-export 直接就能落库 —— 不用新增探针，
+      # 也不用改采样节奏。补的是"引擎到底吃了多少 CPU/IO"这类真口径：
+      #   bench_cpu = 被测引擎进程的 CPU 占用（跨引擎直接可比）
+      #   cpu_usr/cpu_sys = 整机 CPU 占用（负载占比）
+      #   disk_rw_mbs = 磁盘读写吞吐（IO 瓶颈与否）
+      printf "cpu_usr_avg=%.2f cpu_usr_max=%.2f cpu_sys_avg=%.2f cpu_sys_max=%.2f bench_cpu_avg=%.2f bench_cpu_max=%.2f disk_rw_mbs_avg=%.2f disk_rw_mbs_max=%.2f net_rx_mbs_avg=%.2f net_tx_mbs_avg=%.2f mem_avail_gb_min=%.2f\n",
+        us/n, usMx, sy/n, syMx, bc/n, bcMx, dr/n, drMx, rx/n, tx/n, mn
       printf "samples=%d steal_avg=%.2f%% steal_max=%.2f%% foreign_avg=%.2f%% foreign_max=%.2f%% swapin=%d\n",
         n, st/n, stMx, f/n, fMx, sw
       v="OK"; r=""
