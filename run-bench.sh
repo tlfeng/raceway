@@ -1003,7 +1003,13 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
   fi
   [ -f "$STATE" ] || : > "$STATE"
   PROGSTEP "排程模式: $SCHEDULE_FILE（臂定义 $ARMS_FILE）"
-  while read -r arm tk rnd do_recall est; do
+  # ⚠️ 排程输入必须挂到**独立 FD**：循环体里的子命令（ssh / ibs / rally / tar …）
+  # 全部继承 stdin，而 `while read ... done < <(schedule_lines)` 的 stdin 就是排程管道。
+  # 任何一个子命令读一下 stdin，后面还没跑的排程行就被它吃干净了 ——
+  # 实测 24 场只跑了第 1 场：跑完第 1 场后第 2 次 read 立刻 EOF，循环直接收尾。
+  # 修法：排程从 FD 3 读，循环体用 read -u 3；子命令的 stdin 与排程彻底隔离。
+  exec 3< <(schedule_lines)
+  while read -r -u 3 arm tk rnd do_recall est; do
     [ -n "$arm" ] || continue
     seqn=$((seqn+1))
     # 断点续跑：STATE 里已有 OK 的场次直接跳过
@@ -1035,7 +1041,8 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
       echo "FAIL $seqn" >> "$STATE"
     fi
     total=$((total+1))
-  done < <(schedule_lines)
+  done
+  exec 3<&-
 else
   for tk in "${TRACKS[@]}"; do
     for r in $(seq 1 "$ROUNDS"); do
