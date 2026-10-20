@@ -15,14 +15,14 @@
 #
 # ENGINE_MARK：进程归因标记。cmdline 含此串的进程计入 bench 列（被测引擎），
 # 其余计入 foreign 列（外来负载）。注意 merge 写回是内核线程（kworker 无
-# cmdline）→ 计入 foreign，forcemerge 相位 foreign/iowait 偏高属正常。
+# cmdline）→ 计入 foreign，forcemerge 相位 foreign 偏高属正常。
 # 标记必须与部署根一致（ibs 模式即安装根 /infini）；错位时 bench 恒为 0、
 # 引擎 CPU 被计入 foreign，"外来进程"判定失明（202610 教训：legacy
 # /opt/bench 匹配不到任何进程 → bench 恒 0、判定全盲）。
 #
 # CSV 列:
-# ts,cpu_usr,cpu_sys,cpu_iow,cpu_steal,load1,mem_avail_gb,swpin_s,
-# disk_util_pct,disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu
+# ts,cpu_usr,cpu_sys,cpu_steal,load1,mem_avail_gb,swpin_s,
+# disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu
 # ============================================================================
 set -u
 MON_DIR=${RACEWAY_MON_DIR:-/opt/raceway/monitor}   # CSV/pid 落位（与编排侧 BENCH_BASE 一致）
@@ -30,7 +30,6 @@ INTERVAL=${MON_INTERVAL:-5}
 # 赛后判定阈值（独立运行时的默认值）。steal 与赛前卡点 GATE_STEAL 同口径：
 # 任一采样达标即 CONTAMINATED。阈值经 ssh 不透传，改默认值直接改这里。
 VERDICT_STEAL_MAX=${VERDICT_STEAL_MAX:-2.0}
-VERDICT_IOWAIT_AVG=${VERDICT_IOWAIT_AVG:-5}
 VERDICT_FOREIGN_MAX=${VERDICT_FOREIGN_MAX:-5}
 mkdir -p "$MON_DIR"
 
@@ -65,11 +64,10 @@ start_sampler() { # <tag>
 }
 
 _loop() { # <csv> <tag>
-  local csv="$1" tag="$2" dev ncpu mb10
+  local csv="$1" tag="$2" dev mb10
   dev=$(diskdev); dev=${dev%[0-9]*}; dev=${dev%p}; dev=${dev##*/}
-  ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
   mb10=$(( 1048576 * INTERVAL / 10 ))   # 0.1MB/s 分辨率的除数（防整除截断吞掉小流量）
-  echo "ts,cpu_usr,cpu_sys,cpu_iow,cpu_steal,load1,mem_avail_gb,swpin_s,disk_util_pct,disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu" > "$csv"
+  echo "ts,cpu_usr,cpu_sys,cpu_steal,load1,mem_avail_gb,swpin_s,disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu" > "$csv"
   local c0 c1 s0 s1 d0 d1 n0 n1 p0 p1
   c0=$(cpu_line)
   s0=$(awk '/pswpin /{print $2}' /proc/vmstat)
@@ -83,19 +81,17 @@ _loop() { # <csv> <tag>
     read -r _ u0 n0c sy0 id0 iow0 irq0 sirq0 st0 _ _ <<< "$c0"
     dt=$(( (u+n+sy+id+iow+irq+sirq+st) - (u0+n0c+sy0+id0+iow0+irq0+sirq0+st0) ))
     if [ "$dt" -le 0 ]; then c0="$c1"; continue; fi
-    # dt 是全核 jiffies 和（100Hz），除以核数 = 墙钟 ms，供 disk util 归一
-    local wms=$(( dt / ncpu )); [ "$wms" -lt 1 ] && wms=1
+    # dt 是全核 jiffies 和（100Hz），bench/foreign 的进程 jiffies 差按它归一成 %
     usr=$(( 100*(u-u0)   / dt )); sys=$(( 100*(sy-sy0) / dt ))
-    iow=$(( 100*(iow-iow0)/ dt )); stl=$(( 100*(st-st0) / dt ))
+    stl=$(( 100*(st-st0) / dt ))
     l1=$(cut -d' ' -f1 /proc/loadavg)
     m1=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)
     agb=$(( m1 / 1048576 ))   # 页缓存余量：查询性能与其强相关；事件级内存压力看 swpin
     s1=$(awk '/pswpin /{print $2}' /proc/vmstat); sw=$(( s1-s0 )); s0=$s1
-    # diskstats: f6=读扇区 f10=写扇区 f13=io_ticks(ms)
+    # diskstats: f6=读扇区 f10=写扇区
     d1=$(grep " $dev " /proc/diskstats)
-    read -r _ _ _ _ _ sr0 _ _ _ sw0 _ _ ti0 _ <<< "$d0"
-    read -r _ _ _ _ _ sr1 _ _ _ sw1 _ _ ti1 _ <<< "$d1"
-    util=$(( (ti1 - ti0) * 100 / wms ))   # 忙占比，天然 ≤100（不再按 1s 窗口假设封顶）
+    read -r _ _ _ _ _ sr0 _ _ _ sw0 _ <<< "$d0"
+    read -r _ _ _ _ _ sr1 _ _ _ sw1 _ <<< "$d1"
     rw=$(( ( (sr1 - sr0) + (sw1 - sw0) ) * 512 / mb10 ))   # 0.1MB/s
     d0="$d1"
     n1=$(awk -F'[: ]+' '/:/{if($2!="lo") {rx+=$3; tx+=$11}} END{print rx, tx}' /proc/net/dev)
@@ -105,8 +101,8 @@ _loop() { # <csv> <tag>
     bench=$(join_delta "$p0" "$p1" 1); fore=$(join_delta "$p0" "$p1" 0)
     bench=$(( 100*bench/dt )); fore=$(( 100*fore/dt ))
     rm -f "$p0"; p0="$p1"; p1=$(mktemp)
-    printf '%s,%d,%d,%d,%d,%s,%d,%d,%d,%d.%d,%d.%d,%d.%d,%d,%d\n' \
-      "$(date +%s)" "$usr" "$sys" "$iow" "$stl" "$l1" "$agb" "$sw" "$util" \
+    printf '%s,%d,%d,%d,%s,%d,%d,%d.%d,%d.%d,%d.%d,%d,%d\n' \
+      "$(date +%s)" "$usr" "$sys" "$stl" "$l1" "$agb" "$sw" \
       $((rw/10)) $((rw%10)) $((rx/10)) $((rx%10)) $((tx/10)) $((tx%10)) \
       "$bench" "$fore" >> "$csv"
     c0="$c1"
@@ -144,12 +140,12 @@ probe() { # <seconds>
 # summary_quiet <csv> — 输出均值行（供 probe/卡点）
 summary_quiet() {
   awk -F, 'NR>1 {
-    n++; st+=$5; io+=$4; l+=$6; f+=$14; b+=$13
-    if($5>stM)stM=$5; if($4>ioM)ioM=$4; if($6>lM)lM=$6; if($14>fM)fM=$14
+    n++; st+=$4; l+=$5; f+=$12; b+=$11
+    if($4>stM)stM=$4; if($12>fM)fM=$12
   } END {
     if(n==0){print "probe: no data"; exit}
-    printf "load1_avg=%.2f steal_avg=%.2f%% steal_max=%.2f%% iowait_avg=%.2f%% foreign_cpu_avg=%.2f%% foreign_cpu_max=%.2f%% bench_cpu_avg=%.2f%%\n",
-      l/n, st/n, stM, io/n, f/n, fM, b/n
+    printf "load1_avg=%.2f steal_avg=%.2f%% steal_max=%.2f%% foreign_cpu_avg=%.2f%% foreign_cpu_max=%.2f%% bench_cpu_avg=%.2f%%\n",
+      l/n, st/n, stM, f/n, fM, b/n
   }' "$1"
 }
 
@@ -157,18 +153,16 @@ summary_quiet() {
 summary() {
   local csv="$1"
   [ -s "$csv" ] || { echo "ENV-VERDICT: NO-DATA ($csv 不存在或为空)"; exit 2; }
-  awk -F, -v stM="$VERDICT_STEAL_MAX" -v ioA="$VERDICT_IOWAIT_AVG" -v fM="$VERDICT_FOREIGN_MAX" '
+  awk -F, -v stM="$VERDICT_STEAL_MAX" -v fM="$VERDICT_FOREIGN_MAX" '
     NR>1 {
-      n++; st+=$5; io+=$4; l+=$6; f+=$14; sw+=$8; du+=$9
-      if($5>stMx)stMx=$5; if($4>ioMx)ioMx=$4; if($6>lMx)lMx=$6; if($14>fMx)fMx=$14
+      n++; st+=$4; f+=$12; sw+=$7
+      if($4>stMx)stMx=$4; if($12>fMx)fMx=$12
     } END {
       if(n==0){print "ENV-VERDICT: NO-DATA"; exit 1}
-      ioa=io/n
-      printf "samples=%d load1_max=%.2f steal_avg=%.2f%% steal_max=%.2f%% iowait_avg=%.2f%% iowait_max=%.2f%% foreign_avg=%.2f%% foreign_max=%.2f%% swapin=%d disk_util_avg=%.1f%%\n",
-        n, lMx, st/n, stMx, ioa, ioMx, f/n, fMx, sw, du/n
+      printf "samples=%d steal_avg=%.2f%% steal_max=%.2f%% foreign_avg=%.2f%% foreign_max=%.2f%% swapin=%d\n",
+        n, st/n, stMx, f/n, fMx, sw
       v="OK"; r=""
       if (stMx>stM) { v="CONTAMINATED"; r=r " steal超阈值(宿主机超卖噪声,与赛前卡点同口径)" }
-      if (ioa>ioA)  { if(v=="OK")v="WARN"; r=r " iowait偏高(merge相位属正常写回)" }
       if (fMx>fM)   { if(v=="OK")v="WARN"; r=r " 存在外来进程负载" }
       if (sw>0)     { if(v=="OK")v="WARN"; r=r " 发生swap-in" }
       printf "ENV-VERDICT: %s%s\n", v, (r==""?"":r)

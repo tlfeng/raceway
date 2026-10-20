@@ -9,16 +9,30 @@
 
 | 方式 | 版本 | 说明 |
 |---|---|---|
-| 本机 `es-kibana.sh`（**推荐**） | ES 8.1.3 + Kibana 8.1.3 | 工作区脚本，启停干净、无需 Docker |
+| 本机 `es-kibana.sh`（**推荐**） | ES + Kibana **7.17.29 / 8.1.3** | 工作区脚本，启停干净、无需 Docker、无密码无 TLS |
 | 本目录 `docker-compose.yml` | ES/Kibana 7.10.2 OSS | 备选；无认证，Apple Silicon 走 Rosetta |
 
 ```bash
 # 本机（es-kibana.sh 在压测工作区，不在本仓库）
-<工作区>/es-kibana.sh start all
+<工作区>/es-kibana.sh start all --version 7.17    # 或 --version 8.1.3
 
 # 或 docker
 docker compose up -d          # down -v 清数据
 ```
+
+### 7.x 与 8.x 的兼容点（都实测过）
+
+`make_dashboard.py` 会先问 Kibana 自己是什么版本（`GET /api/status` → `version.number`），
+再按版本生成 saved object。差异集中在三处：
+
+| 点 | Kibana 7.17 | Kibana 8.1 |
+|---|---|---|
+| `visualization.attributes.version` | 映射是 **integer**，写字符串整批导入失败 → **不写**（Kibana 自带样例里也没这字段，不是必填） | 同样不写（历史上写过非 semver 值让 8.x 迁移函数抛 `Invalid Version: 1`） |
+| `kibanaSavedObjectMeta.searchSourceJSON` | 按 7.17 自带样例写 `{"query":{"query":"","language":"kuery"},"filter":[]}` | `{"filter":[]}` |
+| `index-pattern.attributes.timeFieldName` | 必填字符串，取不到就兜底第一个 date 字段 | 同 |
+
+> 7.17 的 saved object 索引是 `.kibana_7.17.29_001`（8.x 是 `.kibana_1`），
+> 两个版本的看板各自独立，互不覆盖。
 
 ## 用法
 
@@ -54,7 +68,7 @@ python3 make_dashboard.py --import \
   - **① 写入**：写入吞吐、索引总耗时、Merge/Refresh/Flush 耗时、索引限流时长、索引活动次数
   - **② 查询**：每 workload 一组 —— 吞吐 + **延迟分位 p50/p90/p99/p999** + **处理时间分位 p50/p90/p99**；外加错误率
   - **③ 资源与存储**：存储体积、段数、GC 耗时与次数（young/old）
-  - **④ 环境健康度**（仅带 monitor 采集的赛道）：CPU steal、iowait、外来进程 CPU、负载 load1、磁盘利用率、换入次数
+  - **④ 环境健康度**（仅带 monitor 采集的赛道）：CPU steal、外来进程 CPU、换入次数
 - 3 个 **markdown**：环境说明（环境台账 + 场次体检）、**赛道导航**、看图指南
 - 36 个 **markdown 段标题**：每赛道 4 个（① 写入 ② 查询 ③ 资源与存储 ④ 环境健康度）
 
@@ -118,6 +132,19 @@ Vectorsearch-* 各自独立页面，**不同 track 不混在一张图里**。我
 ```bash
 # 每个面板: (dashboard 的 KQL) AND (面板 filter) → terms 分组 → buckets 非空
 ```
+
+工作区自带的 `verify-dashboard.py` 就是干这个的 —— 它直接调 Kibana 自己的 TSVB 渲染接口
+`POST /api/metrics/vis/data`（7.x / 8.x 同路径），把看板级 KQL 并进面板 filter、
+用看板存的时间窗发真实请求，要求返回的 series 里 bucket 非空：
+
+```bash
+python3 <工作区>/verify-dashboard.py --kibana http://127.0.0.1:5601
+python3 <工作区>/verify-dashboard.py --kibana http://127.0.0.1:5601 --dash bench-geo
+```
+
+> 踩坑：Kibana 7.11+ 的 dashboard 迁移会把 `panelsJSON` 里面板的 `id` 抹掉，改成
+> `panelRefName` + `references`（references 的 `name` 是 panelIndex，面板侧是
+> `panelRefName`）—— 校验脚本按 panelIndex 关联才对得上。
 
 ## es-proxy.py — 诊断工具
 
