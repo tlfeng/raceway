@@ -43,7 +43,8 @@ campaign-configs.example.conf      配置文件模板
 campaign-thresholds.example.conf   断言阈值模板
 echarts.min.js               报告内联用（Apache-2.0，见credits）
 docs/                        GUIDE 使用手册 / RUNBOOK 触发手册 / METHODOLOGY 方法学 / hv1024-track 赛道制作
-kibana/                      Kibana 建板（make_dashboard.py 生成 saved objects；es-proxy.py 诊断代理；
+kibana/                      Kibana 建板（make_dashboard.py 生成 saved objects：每个 esrally track
+                              一个独立看板 + 总览导航页；es-proxy.py 诊断代理；
                               docker-compose.yml 是备用的 7.10 OSS 环境，本机已有 ES/Kibana 时不需要）
 ```
 
@@ -71,12 +72,20 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 
 - **error_rate 按 rally 语义 0~1 原样入库**（`1.0` = 该 task 请求全失败），不按百分比再折算
 - 实验变量 `dims` / `lineage` 从 user-tags 提升为 typed 列，可 range/排序
+- **bench-metric 带 `track` 列**（归一化赛道名）：按赛道拆看板的前提 —— 指标行没有
+  track 就没法按赛道过滤
 - 引擎身份 `engine`（easysearch/elasticsearch）从**包名**推导，不信 sidecar 的 `name` 字段
 - 幂等：文档 `_id` 固定（`race_id` / `race_id|task|family|stat`），重复执行是覆盖不是翻倍
 - 改了 index template 必须 `--drop` 重建索引，旧 mapping 不会自动更新
 
-看板 `bench-overview`（对照 opensearch.org/benchmarks）：顶部 KQL 查询框默认 `valid: true`，
-时间窗按数据实际范围自动计算，每图一个指标族、series 按 `arm`（向量面板按 `dims`）。
+看板对照 [opensearch.org/benchmarks](https://opensearch.org/benchmarks/) 的分页口径：
+**每个 esrally track 一个独立看板**（`bench-geo` / `bench-hnsw` / `bench-nested` /
+`bench-ds-*`），不同赛道的指标不混在一张图里 —— 赛道之间语料、维度、task 集都不同，
+量纲不可比。赛道内再按 workload（term 检索 / country 聚合 / sort / KNN k 值…）分图，
+组内才是同量纲可比的。总览页 `bench-overview` 是导航入口（环境说明 + 赛道导航表）。
+
+赛道清单不硬编码，从 ES 实算；新增一场新赛道的压测后重跑 `make_dashboard.py` 就自动
+多一个看板。入口：左侧栏 ☰ → Analytics → Dashboard（`/app/dashboards/list`）。
 
 面板出问题时用 `kibana/es-proxy.py` 代理 Kibana→ES 看 ES 实际收到的查询（需改 kibana.yml
 的 elasticsearch.hosts，排查完记得改回）。
