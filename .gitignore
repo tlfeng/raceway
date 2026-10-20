@@ -6,3 +6,7 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+
+# Kibana 建板产物：随 bench-env 现场数据生成，含环境指纹与场次统计，
+# 每次生成都会随数据变化 → 不入库，按需本地重建（见 kibana/README.md）
+kibana/kibana-objects.ndjson
