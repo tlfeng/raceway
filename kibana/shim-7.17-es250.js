@@ -106,10 +106,10 @@ async function fetchNodes() {
     const j = JSON.parse(r.body);
     const nodes = {};
     for (const [id, n] of Object.entries(j.nodes || {})) {
-      // 版本一律伪装成 ES 形态的对象 —— Kibana 的兼容检查会读节点版本
+      // 这个回填是给 GET /_nodes/info 用的 —— 该端点在 ES 7.x 里 version 是字符串
       nodes[id] = {
         name: n.name, transport_address: n.transport_address, host: n.host, ip: n.ip,
-        version: esNodeVersion(n), build_flavor: n.build_flavor || 'default', build_type: n.build_type,
+        version: FAKE_VERSION, build_flavor: n.build_flavor || 'default', build_type: n.build_type,
         http: n.http, roles: n.roles, attributes: n.attributes, settings: n.settings,
       };
     }
@@ -214,29 +214,27 @@ function fakeProductRoot(body) {
   return JSON.stringify(j);
 }
 
-// 节点版本归一：EasySearch 的 _nodes 里 version 是**字符串**（"2.5.0"），
-// 而 ES 7.17 客户端读的是 node.version.number（对象形态）—— 不归一的话
-// Kibana 的兼容检查会判成不兼容。
-function esNodeVersion(node) {
-  const v = (node.version && typeof node.version === 'object') ? { ...node.version } : {};
-  v.number = FAKE_VERSION;
-  v.distribution = 'elasticsearch';
-  if (!v.build_flavor) v.build_flavor = node.build_flavor || 'default';
-  if (!v.build_type) v.build_type = node.build_type || 'tar';
-  if (!v.build_hash) v.build_hash = node.build_hash;
-  return v;
-}
+// 节点版本归一（按 ES 7.x 的端点形态）：
+//   GET /_nodes/info → nodes.<id>.version 是**字符串**（"7.17.29"）
+//     Kibana 的兼容检查 ensure_es_version.js 直接把 node.version 喂给 semver.major()，
+//     给对象会抛 "Invalid version. Must be a string. Got type object"。
+//   GET /_nodes      → nodes.<id>.version 是**对象**（{number, build_flavor, ...}）
+//   EasySearch 两个端点都给字符串，所以这里按端点分别伪装。
+const FAKE_VERSION_OBJ = () => ({
+  number: FAKE_VERSION,
+  distribution: 'elasticsearch',
+  build_flavor: 'default',
+  build_type: 'tar',
+});
 
-// 节点信息里的版本改写：Kibana 的版本兼容检查读的是 GET /_nodes 里每个节点的
-// version.number（不是 GET /），不改这里它会判定 "v7.17.29 与 v2.5.0 不兼容"。
-function fakeNodesVersion(body) {
+function fakeNodesVersion(body, asString) {
   let j;
   try { j = JSON.parse(body); } catch (e) { return null; }
   if (!j || typeof j !== 'object' || !j.nodes || typeof j.nodes !== 'object') return null;
   let n = 0;
   for (const node of Object.values(j.nodes)) {
     if (!node || typeof node !== 'object') continue;
-    node.version = esNodeVersion(node);
+    node.version = asString ? FAKE_VERSION : FAKE_VERSION_OBJ();
     n++;
   }
   return n > 0 ? JSON.stringify(j) : null;
@@ -390,9 +388,9 @@ http.createServer((req, res) => {
             }
           }
 
-          // 节点信息里的版本改写（Kibana 的版本兼容检查读这里）
+          // 节点信息里的版本改写（Kibana 的版本兼容检查读 /_nodes/info 里的字符串版本）
           if (isNodes) {
-            const patched = fakeNodesVersion(outBody.toString('utf8'));
+            const patched = fakeNodesVersion(outBody.toString('utf8'), isNodesInfo);
             if (patched) {
               outBody = Buffer.from(patched);
               outHeaders['content-type'] = 'application/json; charset=UTF-8';
