@@ -61,6 +61,20 @@ PCTAG=$([ "$PRECHECK_MODE" = once ] && echo campaign-once || echo PASS)
 FP_DIR=""; LAST_RACE_ID=""; ENV_ID=${ENV_ID:-bench-3node-32c32g}
 CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默卡点阈值内置默认在 precheck.sh）
 
+# ds-*（维度扫描）赛道超时：≥1536 维写入给 14400s，其余 10800s；查询统一 5400s
+: "${TIMEOUT_DS_W:=10800}"; : "${TIMEOUT_DS_W_HI:=14400}"; : "${TIMEOUT_DS_Q:=5400}"
+
+# ---- 排程模式（SCHEDULE_FILE + ARMS_FILE）--------------------------------------
+# 用途：维度扫描这类"高维优先 + 窗底守卫"的固定排程，逐行指定 (臂, 赛道, 轮次, recall, est分钟)。
+#   SCHEDULE_FILE 每行: <臂名> <赛道> <轮次> <recall|norecall> <est分钟>
+#   ARMS_FILE     每行: <臂名> <配置行...>   （配置行语法同 CONF_FILE）
+#   DS_HOURS      >0 时启用窗底守卫：放不下下一场就 DEADLINE-SKIP 并继续后面更便宜的场
+#   CAMP_ID       显式指定可复用同一 campaign 目录 → STATE.txt 断点续跑
+SCHEDULE_FILE=${SCHEDULE_FILE:-}
+ARMS_FILE=${ARMS_FILE:-}
+DS_HOURS=${DS_HOURS:-0}
+CUR_RECALL=0
+
 # ---- 配置文件（第 3 参数或 CONF=）：每行一个配置，轮内右旋配对交错 --------------
 CONF_FILE=${3:-${CONF:-}}
 [ "${2:-}" = "--dry-run" ] && DRY=1
@@ -98,7 +112,9 @@ case "$WHAT" in
   codec) TRACKS=(gdef gzstd gbc);;
   both) TRACKS=(geo hnsw);;
   all) TRACKS=(geo hnsw nested);;
-  *) die "track 参数必须是 geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all";;
+  ds) TRACKS=(ds-g1920 ds-j2048 ds-j1024 ds-g960 ds-j768 ds-j512 ds-j1536);;
+  ds-*) TRACKS=("$WHAT");;
+  *) die "track 参数必须是 geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>";;
 esac
 
 # ---- 配置解析与校验（fail-fast 在建 campaign 目录之前） -------------------------
@@ -157,7 +173,11 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
 
 # 逐配置预校验（pkg 存在/es 约束/标签查重），并落 CONF_LABELS/CONF_PKGS 供日志与指纹
 declare -a CONF_LABELS CONF_PKGS
-if [ -n "${CONFIGS[0]}" ]; then
+if [ -n "${SCHEDULE_FILE:-}" ]; then
+  # 排程模式：配置在排程推进时逐条注册（见主流程），此处只校验臂定义文件存在
+  [ -s "$ARMS_FILE" ] || die "排程模式需要臂定义文件: ARMS_FILE=$ARMS_FILE"
+  CONF_LABELS=(); CONF_PKGS=()
+elif [ -n "${CONFIGS[0]:-}" ]; then
   _seen="|"
   for _ln in "${CONFIGS[@]}"; do
     apply_config "$_ln"
@@ -178,8 +198,36 @@ order_for_round() { # <round> → 输出索引序列
   for i in $(seq 0 $((n-1))); do echo $(( (i - off + n) % n )); done
 }
 
+# 臂名 → 配置行（排程模式用；臂定义文件每行 "<臂名> <配置行...>"）
+arm_config() { # <臂名>
+  local want="$1" name line
+  [ -f "${ARMS_FILE:-}" ] || return 0
+  while read -r name line; do
+    [ -n "${name:-}" ] || continue
+    case "$name" in '#'*) continue;; esac
+    if [ "$name" = "$want" ]; then printf '%s' "$line"; return 0; fi
+  done < "$ARMS_FILE"
+  return 0
+}
+
 if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   echo "== DRY RUN 排程（不执行任何操作） =="
+  if [ -n "${SCHEDULE_FILE:-}" ]; then
+    echo "排程模式: SCHEDULE_FILE=$SCHEDULE_FILE"
+    echo "臂定义:   ARMS_FILE=$ARMS_FILE"
+    [ "${DS_HOURS:-0}" -gt 0 ] && echo "窗底守卫: ${DS_HOURS}h（窗底留 20min 余量）"
+    echo "| # | 臂 | 赛道 | 轮 | recall | est(min) |"
+    echo "|---|---|---|---|---|---|"
+    n=0
+    while read -r arm tk rnd do_recall est; do
+      arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
+      [ -n "$arm" ] || continue
+      n=$((n+1))
+      printf "| %d | %s | %s | %s | %s | %s |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}"
+    done < "$SCHEDULE_FILE"
+    echo "共 $n 场。DRY=1/--dry-run 不会创建 campaign、不会触碰集群。"
+    exit 0
+  fi
   echo "tracks: ${TRACKS[*]}  rounds: $ROUNDS  configs: ${#CONFIGS[@]}"
   echo "| # | 配置 | 引擎身份 | 赛道 | 轮 |"
   echo "|---|---|---|---|---|"
@@ -199,10 +247,12 @@ fi
 
 # campaign 名前缀默认沿用 jdk3（历史惯例）；可用 CAMP_PREFIX 覆盖，
 # 让臂名进 campaign 维度——es819 的批次不该叫 jdk3-*（按批次过滤时看板上会认错臂）
-CAMP_ID="${CAMP_PREFIX:-jdk3}-$(date +%Y%m%d-%H%M%S)"
+# CAMP_ID 显式指定 = 复用同一 campaign 目录 → STATE.txt 断点续跑（排程模式用）
+CAMP_ID="${CAMP_ID:-${CAMP_PREFIX:-jdk3}-$(date +%Y%m%d-%H%M%S)}"
 CAMP_DIR="$RESULTS_ROOT/$CAMP_ID"
 mkdir -p "$CAMP_DIR/results" "$CAMP_DIR/logs"
 PROG="$CAMP_DIR/PROGRESS.txt"; RACES="$CAMP_DIR/RACES.md"
+STATE="$CAMP_DIR/STATE.txt"
 PROGSTEP() { echo "[$(date '+%F %T')] $*" | tee -a "$PROG"; }
 
 # ---------- 引擎映射（ibs 承载部署；路径/服务按 ENGINE_NAME 取） -----------------
@@ -404,10 +454,20 @@ prepare_hnsw_s3() {
   log "hnsw 3 分片变体已生成: $TRACK_HNSW_S3"
 }
 
-track_dir()   { case "$1" in geo) echo "$TRACK_GEO";; gdef) echo "$TRACK_GEO_DEF";; gzstd) echo "$TRACK_GEO_ZSTD_SR";; gbc) echo "$TRACK_GEO_BC";; hnsw) echo "$TRACK_HNSW_S3";; hv1024) echo "$TRACK_HV1024";; nested) echo "$TRACK_NESTED_S3";; esac; }
-track_index() { case "$1" in geo|gdef|gzstd|gbc) echo "geonames";; hnsw|hv1024) echo "vectors";; nested) echo "sonested";; esac; }
-track_tmo_w() { case "$1" in geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_W";; hnsw) echo "$TIMEOUT_HNSW_W";; hv1024) echo "$TIMEOUT_HV1024_W";; nested) echo "$TIMEOUT_NESTED_W";; esac; }
-track_tmo_q() { case "$1" in geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; esac; }
+# ds-*（维度扫描）赛道：目录固定在 $ROOT/tracks/<名字>，索引名 vectors
+# 维度 → 写入超时：≥1536 维给 14400s，其余 10800s（PLAN §五 时间预算）
+track_dims() { case "$1" in ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;; ds-g960) echo 960;; ds-j768) echo 768;; ds-j512) echo 512;; *) return 1;; esac; }
+track_dir()   { case "$1" in geo) echo "$TRACK_GEO";; gdef) echo "$TRACK_GEO_DEF";; gzstd) echo "$TRACK_GEO_ZSTD_SR";; gbc) echo "$TRACK_GEO_BC";; hnsw) echo "$TRACK_HNSW_S3";; hv1024) echo "$TRACK_HV1024";; nested) echo "$TRACK_NESTED_S3";; ds-*) echo "$ROOT/tracks/$1";; esac; }
+track_index() { case "$1" in geo|gdef|gzstd|gbc) echo "geonames";; hnsw|hv1024) echo "vectors";; nested) echo "sonested";; ds-*) echo "vectors";; esac; }
+track_tmo_w() { case "$1" in
+  geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_W";;
+  hnsw) echo "$TIMEOUT_HNSW_W";;
+  hv1024) echo "$TIMEOUT_HV1024_W";;
+  nested) echo "$TIMEOUT_NESTED_W";;
+  ds-*) local dm; dm=$(track_dims "$1") || { echo "$TIMEOUT_DS_W"; return; }
+        if [ "$dm" -ge 1536 ]; then echo "$TIMEOUT_DS_W_HI"; else echo "$TIMEOUT_DS_W"; fi;;
+ esac; }
+track_tmo_q() { case "$1" in geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
 # 变体烘入的 settings（进 user-tags，入库时 codec 是一个维度而不是靠 track 名反推）；
 # 非 codec 变体返回空 → 不加标签，历史 campaign 的标签口径不变
 track_codec() { case "$1" in gdef) echo "default";; gzstd) echo "ZSTD+source_reuse";; gbc) echo "best_compression";; *) echo "";; esac; }
@@ -576,6 +636,81 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
     || log "  警告: sidecar 生成失败 $fid-$ph（不影响 race）"
 }
 
+# ---------- recall 探针（维度扫描 Phase A/B 场）---------------------------------
+# 索引在线时打 k10/ef100 与 k100/ef1000，和精确真值比对召回。
+# 召回塌了的性能数字不作数（PLAN §一 护栏），所以这两档必须落在结果里。
+recall_probe() { # <fid> <track_dir> <track_key>
+  local fid="$1" tdir="$2" tk="$3"
+  local script="${RECALL_SCRIPT:-/testing/aijiami-perf-test/hv-bench/hv-recall-self.py}"
+  [ -f "$script" ] || { log "  警告: recall 探针脚本缺失: $script（跳过）"; return 0; }
+  local idx host; idx=$(track_index "$tk"); host="https://${VM_IPS[0]}:$HTTP_PORT"
+  local k cand out
+  for spec in "10 100" "100 1000"; do
+    k="${spec%% *}"; cand="${spec##* }"
+    out="$CAMP_DIR/results/recall-$fid-k$k.json"
+    if python3 "$script" --host "$host" --user "$ADMIN_USER" --password "$ADMIN_PW" \
+         --index "$idx" --queries "$tdir/queries-recall.jsonl" --truth "$tdir/truth.jsonl" \
+         --k "$k" --candidates "$cand" --limit "${RECALL_LIMIT:-2000}" --tag "$fid" \
+         > "$out" 2> "$CAMP_DIR/logs/recall-$fid-k$k.log"; then
+      log "  recall k=$k: $(grep -o '"avg_recall":[^,]*' "$out" | head -1)"
+    else
+      log "  警告: recall 探针失败 k=$k（见 logs/recall-$fid-k$k.log）"
+    fi
+  done
+}
+
+# ---------- JDK 26/27 臂：场前无条件推送修补组合 + JDK 身份断言 -------------------
+# 为什么每场都要推：easysearch 重装/切臂会把 config/jvm.options 与 lib 下的
+# security agent 还原成发行版原版（原版 agent 1.18.8 不支持 Java 25+，
+# 原版 jvm.options 的 javaagent 作用域只到 21），不推就等于没修。
+#
+# 作用域按目标 JDK 主版本号现算，不写死：
+#   javaagent      → 21-:（21 及以上都挂修补版 agent 1.18.15）
+#   UseJVMCICompiler→ 21-<hi>:（hi = max(目标主版本, 26)；OpenJDK 26+ 默认开 JVMCI 必须关）
+jdk_fix_apply() { # <目标 JDK 主版本号>
+  local major="${1:-25}"
+  [ "$ENGINE_NAME" = easysearch ] || return 0
+  local fixdir="${JDK_FIX_DIR:-$ROOT/dsfix}"
+  local agent="$fixdir/agent-patched-1.18.15.jar"
+  [ -f "$agent" ] || agent="$PKG_DIR/agent-patched-1.18.15.jar"
+  [ -f "$agent" ] || { log "  警告: 修补版 agent 缺失（$agent），跳过 agent 替换"; }
+  local hi=$major; [ "$hi" -lt 26 ] && hi=26
+  local ip
+  for ip in "${VM_IPS[@]}"; do
+    vm "$ip" "set -e
+      f=$EZ_DIR/config/jvm.options
+      [ -f \$f ] || { echo 'jvm.options 缺失' >&2; exit 1; }
+      # 去掉所有 javaagent 版本作用域行，再写一行 21-:（修补版 agent 覆盖 21+）
+      grep -v '^[0-9][0-9-]*:-javaagent:lib/easysearch-security-agent-2.5.0.jar' \$f | grep -v '^[0-9][0-9-]*:.*UseJVMCICompiler' > \$f.new
+      printf '21-:-javaagent:lib/easysearch-security-agent-2.5.0.jar\n' >> \$f.new
+      printf '21-$hi:-XX:-UseJVMCICompiler\n' >> \$f.new
+      mv \$f.new \$f
+      chown easysearch:easysearch \$f; chmod 640 \$f" || { log "  $ip: 修补 jvm.options 失败"; return 1; }
+    if [ -f "$agent" ]; then
+      vmPut "$ip" "$agent" "$EZ_DIR/lib/easysearch-security-agent-2.5.0.jar" >/dev/null \
+        && vm "$ip" "chown easysearch:easysearch $EZ_DIR/lib/easysearch-security-agent-2.5.0.jar" \
+        || { log "  $ip: 推送修补版 agent 失败"; return 1; }
+    fi
+  done
+  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$hi:）"
+}
+
+# JDK 身份断言：三节点实测 java -version 的主版本号必须等于期望（JDK_WANT="26|OpenJDK"）
+jdk_gate() { # <JDK_WANT>
+  local want="$1" ip v got major
+  [ -n "$want" ] || return 0
+  major="${want%%|*}"
+  for ip in "${VM_IPS[@]}"; do
+    v=$(vm "$ip" "$EZ_DIR/jdk/bin/java -version 2>&1 | head -1")
+    got=$(printf '%s' "$v" | grep -oE '"[0-9]+(\.[0-9]+)*' | head -1 | tr -d '"' | cut -d. -f1)
+    if [ "$got" != "$major" ]; then
+      PROGSTEP "  JDK 断言失败 $ip: 期望主版本 $major，实测 '$v'"
+      return 1
+    fi
+  done
+  return 0
+}
+
 run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local idx="$1" tk="$2" rnd="$3" seq="$4" att="${5:-1}"
   apply_config "${CONFIGS[$idx]}"     # 换到本场的配置（引擎/JDK/标签）
@@ -614,6 +749,20 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   if ! ensure_jdk; then
     echo "| $fid | JDK-SWAP-FAIL | precheck=$PCTAG | $(( $(date +%s) - t0 ))s |" >> "$RACES"
     PROGSTEP "[$seq] $fid JDK-SWAP-FAIL"; return 1
+  fi
+  # 2b) JDK 26/27 臂：场前推送修补组合（jvm.options 作用域 + 修补版 agent）并断言 JDK 身份。
+  #     放在 ensure_jdk 之后、ibs wipe 之前 —— wipe 会重启服务，配置必须先落盘。
+  if [ "$eng" = easysearch ]; then
+    local jmajor=25
+    case "${JDK_WANT:-}" in [0-9]*\|*) jmajor="${JDK_WANT%%|*}";; esac
+    if ! jdk_fix_apply "$jmajor"; then
+      echo "| $fid | JDK-FIX-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+      PROGSTEP "[$seq] $fid JDK-FIX-FAIL"; return 1
+    fi
+    if ! jdk_gate "${JDK_WANT:-}"; then
+      echo "| $fid | JDK-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+      PROGSTEP "[$seq] $fid JDK-ASSERT-FAIL"; return 1
+    fi
   fi
 
   # 3) 冷启动 + 集群卡点（含端口属主）+ 堆/核断言
@@ -664,6 +813,12 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     monitor_stop "$fid-q"
   fi
 
+  # 6.5) recall 探针（索引在线时打；召回塌了的性能数字不作数）
+  if [ "${CUR_RECALL:-0}" = "1" ] && [ "$rcq" -eq 0 ]; then
+    PROGSTEP "[$seq] $fid recall 探针开始"
+    recall_probe "$fid" "$track" "$tk"
+  fi
+
   # 7) 判定（监控只记录环境事实、不参与成败；成败看 race 结果与指标真实性）
   local t1=$(date +%s)
   local status="VALID" metok=1
@@ -709,12 +864,17 @@ run_field_with_retry() { # <conf_idx> <track> <round> <seq>
 # ---------- 主流程 ------------------------------------------------------------
 ibs_selfcheck
 
-apply_config "${CONFIGS[0]}"
+apply_config "${CONFIGS[0]:-}"      # 排程模式下为空（配置在推进时逐条注册）
 load_topology "$ENGINE_NAME"
 PROGSTEP "campaign $CAMP_ID 启动: configs=[${CONF_LABELS[*]}] tracks=${TRACKS[*]} rounds=$ROUNDS（轮内右旋配对交错）topology=$NNODES 节点（ip.txt 行 $NODE_RANGE）"
-echo "# RACES — $CAMP_ID" > "$RACES"
-echo "| 场次 | 状态 | 赛前卡点 | 用时 |" >> "$RACES"
-echo "|---|---|---|---|" >> "$RACES"
+if [ -n "${SCHEDULE_FILE:-}" ] && [ -s "$RACES" ]; then
+  # 断点续跑：复用同一 CAMP_ID 时保留既有判定表（追加），否则已完成场会被重跑
+  PROGSTEP "断点续跑：沿用已有判定表 $RACES（已 VALID 的场自动跳过）"
+else
+  echo "# RACES — $CAMP_ID" > "$RACES"
+  echo "| 场次 | 状态 | 赛前卡点 | 用时 |" >> "$RACES"
+  echo "|---|---|---|---|" >> "$RACES"
+fi
 
 # once 模式：场间不再检测负载，起跑前这一次是全 campaign 唯一的静默卡点
 if [ "$PRECHECK_MODE" = once ]; then
@@ -737,6 +897,17 @@ PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_C
 } > "$CAMP_DIR/PACKAGES.txt"
 
 env_fingerprint_raw    # bench-env 台账源（静态部分，每场 sidecar 引用同一份）
+
+# 排程模式：赛道集合从排程文件里收集（prepare/校验按这个集合走）
+if [ -n "${SCHEDULE_FILE:-}" ]; then
+  TRACKS=()
+  while read -r arm tk rnd do_recall est; do
+    arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
+    [ -n "$arm" ] || continue
+    case " ${TRACKS[*]} " in *" $tk "*) ;; *) TRACKS+=("$tk");; esac
+  done < "$SCHEDULE_FILE"
+  PROGSTEP "排程赛道集合: ${TRACKS[*]}"
+fi
 
 prepare_hnsw_s3
 [ -d "$TRACK_HNSW_S3" ] || die "hnsw 3 分片变体准备失败"
@@ -764,16 +935,68 @@ case " ${TRACKS[*]} " in *gdef*|*gzstd*|*gbc*)
     done; } > "$CAMP_DIR/CODEC-VARIANTS.txt"
 ;; esac
 
+case " ${TRACKS[*]} " in *ds-*)
+  ./prepare-dimsweep-track.sh || die "ds-* 赛道准备失败"
+  for d in "${TRACKS[@]}"; do
+    case "$d" in ds-*) [ -d "$ROOT/tracks/$d" ] || die "ds-* 赛道缺失: $ROOT/tracks/$d";; esac
+  done
+;; esac
+
 total=0; okcnt=0; seqn=0
-for tk in "${TRACKS[@]}"; do
-  for r in $(seq 1 "$ROUNDS"); do
-    for idx in $(order_for_round "$r"); do
-      seqn=$((seqn+1))
-      if run_field_with_retry "$idx" "$tk" "$r" "$seqn"; then okcnt=$((okcnt+1)); fi
-      total=$((total+1))
+if [ -n "${SCHEDULE_FILE:-}" ]; then
+  # ---- 排程模式：逐行 (臂, 赛道, 轮次, recall, est分钟)，高维优先 + 窗底守卫 ----
+  DEADLINE=0
+  if [ "${DS_HOURS:-0}" -gt 0 ]; then
+    DEADLINE=$(( $(date +%s) + DS_HOURS*3600 - 1200 ))   # 窗底留 20min 余量
+    PROGSTEP "窗底守卫: ${DS_HOURS}h（截止 $(date -d "@$DEADLINE" '+%F %T') 之前放不下的场次 DEADLINE-SKIP）"
+  fi
+  [ -f "$STATE" ] || : > "$STATE"
+  PROGSTEP "排程模式: $SCHEDULE_FILE（臂定义 $ARMS_FILE）"
+  while read -r arm tk rnd do_recall est; do
+    arm="${arm%%#*}"; arm="$(printf '%s' "$arm" | tr -d '[:space:]')"
+    [ -n "$arm" ] || continue
+    seqn=$((seqn+1))
+    # 断点续跑：STATE 里已有 OK 的场次直接跳过
+    if grep -qx "OK $seqn" "$STATE" 2>/dev/null; then
+      PROGSTEP "[$seqn] $arm-$tk-r$rnd 跳过（STATE 已有 OK $seqn）"
+      continue
+    fi
+    # 窗底守卫：这一场放不下就跳过，继续后面更便宜的场（保证高价值数据先落袋）
+    if [ "$DEADLINE" -gt 0 ]; then
+      _now=$(date +%s)
+      if [ $(( _now + ${est:-0}*60 )) -gt "$DEADLINE" ]; then
+        PROGSTEP "[$seqn] $arm-$tk-r$rnd DEADLINE-SKIP（est=${est}min，距窗底放不下）"
+        echo "SKIP $seqn" >> "$STATE"
+        continue
+      fi
+    fi
+    # 臂 → 配置行
+    _cfg=$(arm_config "$arm")
+    [ -n "$_cfg" ] || die "排程里的臂未在 $ARMS_FILE 定义: $arm"
+    _ci=${#CONFIGS[@]}
+    CONFIGS+=("$_cfg")
+    apply_config "$_cfg"
+    CONF_LABELS+=("$ARM_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
+    CUR_RECALL=0; [ "$do_recall" = "recall" ] && CUR_RECALL=1
+    PROGSTEP "[$seqn] 排程: $arm → $tk r$rnd（臂标签 $ARM_LABEL，recall=$do_recall，est=${est}min）"
+    if run_field_with_retry "$_ci" "$tk" "$rnd" "$seqn"; then
+      okcnt=$((okcnt+1)); echo "OK $seqn" >> "$STATE"
+    else
+      echo "FAIL $seqn" >> "$STATE"
+    fi
+    total=$((total+1))
+  done < "$SCHEDULE_FILE"
+else
+  for tk in "${TRACKS[@]}"; do
+    for r in $(seq 1 "$ROUNDS"); do
+      for idx in $(order_for_round "$r"); do
+        seqn=$((seqn+1))
+        if run_field_with_retry "$idx" "$tk" "$r" "$seqn"; then okcnt=$((okcnt+1)); fi
+        total=$((total+1))
+      done
     done
   done
-done
+fi
 
 env_summary_csv   # monitors/*-summary.txt → ENV-SUMMARY.csv（bench-env/bench-metric 可直接吃）
 PROGSTEP "campaign 结束: $okcnt/$total 场有效。报告: $CAMP_DIR/results/；汇总: $RACES"
