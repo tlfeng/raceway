@@ -575,6 +575,12 @@ def main():
     ap.add_argument("--campaigns", default="campaigns")
     ap.add_argument("--allow-fail", action="store_true",
                     help="口径契约断言失败也照样写出载荷（仅用于排查，默认失败即非零退出）")
+    ap.add_argument("--require-campaign", action="store_true",
+                    help="只导有 campaign 元数据（RACES.md 状态 + sidecar）的场次。"
+                         "rally race store 里混着大量早期 one-off 场次（无 campaign 目录、"
+                         "track 名未归一、多数都叫 track），把它们灌进可视层会造出"
+                         "一个上千场次的'杂赛道'看板，且这些行 valid 为空 —— "
+                         "默认看板闸门会滤掉，但索引里全是噪音。默认不过滤。")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -618,6 +624,7 @@ def main():
     fid_arm = {}            # fid → 实验臂；system 行靠它回填 arm（否则按 arm 分线的面板拿不到 series）
     seen = set()
     unmatched = 0
+    skipped_no_campaign = 0
     for d in load_store(args.races):
         ut = d.get("user-tags") or {}
         camp = ut.get("campaign") or "unknown"
@@ -628,6 +635,9 @@ def main():
         meta = metas.get(camp, {})
         race_id = d.get("race-id") or os.path.basename(os.path.dirname(d["_path"]))
         if race_id in seen:
+            continue
+        if args.require_campaign and camp not in metas:
+            skipped_no_campaign += 1
             continue
         seen.add(race_id)
         ts = d.get("race-timestamp")
@@ -930,6 +940,8 @@ def main():
                    "races_scanned": len(seen), "bench_run": len(runs), "bench_metric": len(metrics),
                    "bench_env": len(envs), "system_rows": sysrows,
                    "campaigns_with_dir": sorted(metas), "races_without_campaign_dir": unmatched,
+                   "skipped_no_campaign": skipped_no_campaign,
+                   "require_campaign": bool(args.require_campaign),
                    "valid_true": sum(1 for r in runs if r.get("valid") is True),
                    "valid_null": sum(1 for r in runs if r.get("valid") is None),
                    "assertions": {"status": "pass" if not problems else "fail",
