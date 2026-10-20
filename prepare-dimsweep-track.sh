@@ -22,6 +22,13 @@ ALL_TRACKS=(ds-g1920 ds-j2048 ds-j1024 ds-g960 ds-j768 ds-j512 ds-j1536)
 TRACKS=("$@")
 [ ${#TRACKS[@]} -eq 0 ] && TRACKS=("${ALL_TRACKS[@]}")
 
+# 自检记录追加到 campaign 的 PACKAGES.txt（起跑时由 run-bench.sh 建好）。
+# 语料自检是"这批数据的语料是可信的"的唯一凭据 —— 不留档就只剩一句"当时看着对"。
+# 独立跑本脚本时（CAMP_DIR 未设）不落盘。
+SELFCHECK_LOG=""
+[ -n "${CAMP_DIR:-}" ] && [ -f "$CAMP_DIR/PACKAGES.txt" ] && \
+  SELFCHECK_LOG="$(mktemp "${TMPDIR:-/tmp}/dimsweep-selfcheck.XXXXXX")"
+
 # 赛道名 → 维度（ds-<血统><维度>；j=jina 系，g=GIST 系）
 track_dims() { case "$1" in
   ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;;
@@ -82,6 +89,8 @@ for tk in "${TRACKS[@]}"; do
   done
 
   log "$tk: 自检通过 dims=$dims docs=${want_n:-?} bytes=$real_b"
+  [ -n "$SELFCHECK_LOG" ] && printf '%s: 自检通过 dims=%s docs=%s bytes=%s corpus=%s\n' \
+    "$tk" "$dims" "${want_n:-?}" "$real_b" "$corpus" >> "$SELFCHECK_LOG"
 done
 
 # ---- 4) esrally info 自检（挑战名/操作名能解析）----------------------------
@@ -93,6 +102,17 @@ for tk in "${TRACKS[@]}"; do
   }
   ch=$(echo "$out" | grep -oiE 'Challenge\(s\):.*' | head -1)
   log "$tk: esrally info 通过 ${ch:-}"
+  [ -n "$SELFCHECK_LOG" ] && printf '%s: esrally info 通过 %s\n' "$tk" "${ch:-}" >> "$SELFCHECK_LOG"
 done
+
+# ---- 5) 自检记录落进 campaign 的 PACKAGES.txt --------------------------------
+if [ -n "$SELFCHECK_LOG" ] && [ -s "$SELFCHECK_LOG" ]; then
+  {
+    echo "--- 语料自检记录 ---"
+    cat "$SELFCHECK_LOG"
+  } >> "$CAMP_DIR/PACKAGES.txt"
+  log "自检记录已追加到 $CAMP_DIR/PACKAGES.txt"
+fi
+rm -f "$SELFCHECK_LOG" 2>/dev/null
 
 log "完成：${#TRACKS[@]} 个 ds-* 赛道就绪"

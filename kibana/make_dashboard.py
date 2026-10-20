@@ -155,21 +155,33 @@ def prune_stale(keep_ids):
     Kibana 的导入只覆盖同名对象，**不会**删掉旧文件 —— 改成按赛道分看板后，
     改造前的单板面板（bench-vis-wthr 等）会变成孤儿留在 Kibana 里，
     所以导入前先清掉不在新集合里的 bench-* 对象。
+
+    ⚠️ 必须**分页遍历**：_find 的 per_page 有上限（200），对象数超过一页时
+    后面那些根本不会被返回 → 永远清不掉。实测看板面板数超过 200 之后，
+    26 个该删的旧面板只删掉了 2 个，剩下 24 个成了没人引用的孤儿。
     """
     removed = 0
     for stype in ('visualization', 'dashboard', 'link'):
-        try:
-            r = kibana_get('/api/saved_objects/_find?type=%s&per_page=200' % stype)
-        except Exception:                                   # noqa: BLE001
-            continue
-        for so in r.get('saved_objects', []):
-            sid = so.get('id') or ''
-            if sid.startswith('bench-') and sid not in keep_ids:
-                try:
-                    kibana_delete('/api/saved_objects/%s/%s' % (stype, sid))
-                    removed += 1
-                except Exception:                           # noqa: BLE001
-                    pass
+        page = 1
+        while True:
+            try:
+                r = kibana_get('/api/saved_objects/_find?type=%s&per_page=200&page=%d'
+                               % (stype, page))
+            except Exception:                                   # noqa: BLE001
+                break
+            sos = r.get('saved_objects') or []
+            for so in sos:
+                sid = so.get('id') or ''
+                if sid.startswith('bench-') and sid not in keep_ids:
+                    try:
+                        kibana_delete('/api/saved_objects/%s/%s' % (stype, sid))
+                        removed += 1
+                    except Exception:                           # noqa: BLE001
+                        pass
+            total = r.get('total', 0)
+            if not sos or page * 200 >= total:
+                break
+            page += 1
     return removed
 
 
@@ -780,12 +792,6 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
                                        terms_field=terms, metric_type=mtype,
                                        interval=iv))
 
-    # 段标题
-    for skey, stitle, stext in SECTIONS:
-        sid = 'bench-%s-sec-%s' % (track, skey)
-        objs.append(section_obj(sid, stitle, stext))
-        by_key['sec-' + skey] = sid
-
     # 布局：按段排布，每段 2 列，行高 13；段标题整行高 3。
     # 段内只放实际生成的面板（某指标没数据就不出图，段本身也不会空）。
     def pick(keys):
@@ -800,13 +806,27 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
                 query_ids.append(by_key[k])
     query_ids += pick(['err'])
     res_ids = pick(['disk', 'seg', 'gc-time', 'gc-count'])
-    health_ids = pick(['steal', 'foreign', 'swapin'])
+    # 环境健康度：6 个系统面板都要上板。此前只摆了 steal/foreign/swapin，
+    # engcpu（被测引擎 CPU 占用）/syscpu（整机 CPU）/diskio（磁盘读写吞吐）
+    # 生成了却没进布局 → Kibana 里躺着没人引用的孤儿，看板上又看不到它们。
+    health_ids = pick(['steal', 'foreign', 'swapin', 'engcpu', 'syscpu', 'diskio'])
 
+    # 段标题：只给**真的有面板**的段建 saved object。
+    #   空段的标题对象建出来也没人引用 → Kibana 里留下一堆孤儿
+    #   （实测 7 个赛道的 sec-health + 2 个 hvtp200k 赛道的 4 个段标题全是孤儿）。
     layout = []
     for sec_key, ids in (('write', write_ids), ('query', query_ids),
                          ('res', res_ids), ('health', health_ids)):
-        if ids:
-            layout.append((by_key['sec-' + sec_key], ids))
+        if not ids:
+            continue
+        stitle = stext = ''
+        for k, t, x in SECTIONS:
+            if k == sec_key:
+                stitle, stext = t, x
+        sid = 'bench-%s-sec-%s' % (track, sec_key)
+        objs.append(section_obj(sid, stitle, stext))
+        by_key['sec-' + sec_key] = sid
+        layout.append((sid, ids))
     y = 0
     for sec_id, vis_ids in layout:
         add(sec_id, 0, y, 48, 3)
