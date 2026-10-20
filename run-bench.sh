@@ -718,6 +718,9 @@ recall_probe() { # <fid> <track_dir> <track_key>
 #      -XX:+UnlockExperimentalVMOptions. The unlock option must precede 'UseJVMCICompiler'."
 #   （GraalVM 25 不把它当实验选项，jdk25 臂因此侥幸没炸，换 OpenJDK 26/27 就 3 节点全灭。）
 #   所以追加块必须自带完整三连：解锁 → 关 → 重新锁上。
+#   第二个坑：作用域必须止于 26。OpenJDK 27 已经移除了 UseJVMCICompiler 选项，
+#   作用域带上 27 会让 JDK 27 直接报 "Unrecognized VM option 'UseJVMCICompiler'"。
+#   JDK 27 里没有 JVMCI 这个概念，不去动它等价于「JVMCI 关」，三臂口径一致。
 jdk_fix_apply() { # <目标 JDK 主版本号>
   local major="${1:-25}"
   [ "$ENGINE_NAME" = easysearch ] || return 0
@@ -726,6 +729,11 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
   [ -f "$agent" ] || agent="$PKG_DIR/agent-patched-1.18.15.jar"
   [ -f "$agent" ] || { log "  警告: 修补版 agent 缺失（$agent），跳过 agent 替换"; }
   local hi=$major; [ "$hi" -lt 26 ] && hi=26
+  # JVMCI 作用域固定止于 26（不跟随目标主版本）：OpenJDK 27 已移除 UseJVMCICompiler，
+  #   作用域带上 27 会让 JDK 27 直接报 "Unrecognized VM option 'UseJVMCICompiler'"。
+  #   JDK 27 里压根没有 JVMCI 这个概念，行为上与「JVMCI 关」等价，
+  #   所以三个臂（GraalVM25 / OpenJDK26 / OpenJDK27）的向量加速路径保持一致。
+  local jci_hi=26
   local ip
   for ip in "${VM_IPS[@]}"; do
     vm "$ip" "set -e
@@ -734,9 +742,9 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
       # 去掉所有 javaagent 版本作用域行，再写一行 21-:（修补版 agent 覆盖 21+）
       grep -v '^[0-9][0-9-]*:-javaagent:lib/easysearch-security-agent-2.5.0.jar' \$f | grep -v '^[0-9][0-9-]*:.*UseJVMCICompiler' > \$f.new
       printf '21-:-javaagent:lib/easysearch-security-agent-2.5.0.jar\n' >> \$f.new
-      printf '21-$hi:-XX:+UnlockExperimentalVMOptions\n' >> \$f.new
-      printf '21-$hi:-XX:-UseJVMCICompiler\n' >> \$f.new
-      printf '21-$hi:-XX:-UnlockExperimentalVMOptions\n' >> \$f.new
+      printf '21-$jci_hi:-XX:+UnlockExperimentalVMOptions\n' >> \$f.new
+      printf '21-$jci_hi:-XX:-UseJVMCICompiler\n' >> \$f.new
+      printf '21-$jci_hi:-XX:-UnlockExperimentalVMOptions\n' >> \$f.new
       mv \$f.new \$f
       chown easysearch:easysearch \$f; chmod 640 \$f" || { log "  $ip: 修补 jvm.options 失败"; return 1; }
     if [ -f "$agent" ]; then
@@ -745,7 +753,7 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
         || { log "  $ip: 推送修补版 agent 失败"; return 1; }
     fi
   done
-  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$hi: 带解锁三连）"
+  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$jci_hi: 带解锁三连；目标 JDK $hi）"
 }
 
 # JDK 身份断言：三节点实测 java -version 的主版本号必须等于期望（JDK_WANT="26|OpenJDK"）
