@@ -214,12 +214,14 @@ function fakeProductRoot(body) {
   return JSON.stringify(j);
 }
 
-// 节点版本归一（按 ES 7.x 的端点形态）：
-//   GET /_nodes/info → nodes.<id>.version 是**字符串**（"7.17.29"）
-//     Kibana 的兼容检查 ensure_es_version.js 直接把 node.version 喂给 semver.major()，
-//     给对象会抛 "Invalid version. Must be a string. Got type object"。
-//   GET /_nodes      → nodes.<id>.version 是**对象**（{number, build_flavor, ...}）
-//   EasySearch 两个端点都给字符串，所以这里按端点分别伪装。
+// 节点版本归一：Kibana 7.17 的兼容检查（ensure_es_version.js）把 node.version
+// 直接喂给 semver.major() —— 必须是**字符串**。给对象会抛
+// "Invalid version. Must be a string. Got type object"。
+// 注意 EasySearch 两个端点给的形态不一致：
+//   GET /_nodes?filter_path=...   → 有 nodes（但 version 是字符串 "2.5.0"）
+//   GET /_nodes/info?filter_path=..→ 返回 {}（没有 nodes 键）—— 需要回填
+// 所以这里统一：所有 /_nodes* 响应里的 version 一律改成字符串 FAKE_VERSION，
+// 且节点集为空时用 GET /_nodes 的结果回填。
 const FAKE_VERSION_OBJ = () => ({
   number: FAKE_VERSION,
   distribution: 'elasticsearch',
@@ -227,14 +229,14 @@ const FAKE_VERSION_OBJ = () => ({
   build_type: 'tar',
 });
 
-function fakeNodesVersion(body, asString) {
+function fakeNodesVersion(body) {
   let j;
   try { j = JSON.parse(body); } catch (e) { return null; }
   if (!j || typeof j !== 'object' || !j.nodes || typeof j.nodes !== 'object') return null;
   let n = 0;
   for (const node of Object.values(j.nodes)) {
     if (!node || typeof node !== 'object') continue;
-    node.version = asString ? FAKE_VERSION : FAKE_VERSION_OBJ();
+    node.version = FAKE_VERSION;
     n++;
   }
   return n > 0 ? JSON.stringify(j) : null;
@@ -388,9 +390,35 @@ http.createServer((req, res) => {
             }
           }
 
-          // 节点信息里的版本改写（Kibana 的版本兼容检查读 /_nodes/info 里的字符串版本）
+          // 节点信息处理（所有 /_nodes* 端点）：
+          //   ① 节点集为空 / 没有 nodes 键 → 用 GET /_nodes 的结果回填
+          //      （EasySearch 对 _nodes/info?filter_path=... 直接返回 {}）
+          //   ② 每个节点的 version 改成字符串 —— Kibana 的兼容检查要字符串
           if (isNodes) {
-            const patched = fakeNodesVersion(outBody.toString('utf8'), isNodesInfo);
+            const rawText = outBody.toString('utf8');
+            let parsed = null;
+            try { parsed = JSON.parse(rawText); } catch (e) { parsed = null; }
+            const noNodes = !parsed || !parsed.nodes || Object.keys(parsed.nodes).length === 0;
+            if (noNodes) {
+              fetchNodes().then((fb) => {
+                if (fb) {
+                  const body = {
+                    _nodes: { total: Object.keys(fb.nodes).length, successful: Object.keys(fb.nodes).length, failed: 0 },
+                    cluster_name: (parsed && parsed.cluster_name) || '',
+                    nodes: fb.nodes,
+                  };
+                  outBody = Buffer.from(JSON.stringify(body));
+                  outHeaders['content-type'] = 'application/json; charset=UTF-8';
+                  outHeaders['content-length'] = String(outBody.length);
+                  delete outHeaders['content-encoding'];
+                  send('nodes_backfill', 200);
+                } else {
+                  send();
+                }
+              });
+              return;
+            }
+            const patched = fakeNodesVersion(rawText);
             if (patched) {
               outBody = Buffer.from(patched);
               outHeaders['content-type'] = 'application/json; charset=UTF-8';
