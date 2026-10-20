@@ -1,0 +1,30 @@
+# 仓库文本一律以 LF 存储与检出。
+#
+# 背景（2026-10-20 事故）：Windows 检出开了 core.autocrlf=true，会把 .sh 转成 CRLF。
+# 后果是部署到 Linux 后直接报
+#     /usr/bin/env: 'bash\r': No such file or directory
+# 而且 git archive 会跟着套用同样的转换 —— 用 git archive 做服务器同步时，
+# 同步过去的 .sh 全是 CRLF，把原本能跑的 run-bench.sh 弄坏了。
+#
+# 这里显式声明 eol=lf：检出、git archive、跨平台协作都统一 LF。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.conf text eol=lf
+*.js   text eol=lf
+*.txt  text eol=lf
+
+# 二进制资源不参与行尾转换
+# 注意：binary 宏会关掉 text 转换，因此 renormalize 也不会动它们；
+# 但工作区里若已被 autocrlf 改过，必须从 HEAD 还原，否则会被灌回索引。
+echarts.min.js binary
+*.min.js binary
+*.jar binary
+*.tar.gz binary
+*.zip binary
+*.hdf5 binary
