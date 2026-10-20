@@ -316,6 +316,7 @@ def main():
                 }
 
     envs, runs, metrics = {}, [], []
+    fid_track = {}          # fid → 归一化赛道名；monitors 补的 system 行靠它回填 track
     seen = set()
     unmatched = 0
     for d in load_store(args.races):
@@ -394,9 +395,12 @@ def main():
                   "jdk": jdk, "heap_gb": heap_gb,
                   "dims": dims, "lineage": lineage, "segment_form": segment_form,
                   "codec": codec_of(d, side),
-                  "track_raw": d.get("track"), "phase": phase, "round": rnd,
+                  # track 必须进 common：bench-metric 的指标行没有它就没法按赛道过滤，
+                  # 而按赛道拆看板要求每个指标行都带归一化后的赛道名
+                  "track": tr, "track_raw": d.get("track"), "phase": phase, "round": rnd,
                   "challenge": d.get("challenge"), "env_id": side.get("env", {}).get("env_id"),
                   "valid": (status == "VALID") if status else None, "status": status}
+        fid_track[fid] = tr
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
                      "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
                      "version": str(version) if version is not None else None, "build": build,
@@ -489,7 +493,7 @@ def main():
                     sysrows += 1
                     metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                     "@timestamp": None, "campaign": camp, "fid": fid, "node": node,
-                                    "phase": ph,
+                                    "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
                                     "value": None, "value_text": mv, "unit": "text",
                                     "value_original": None, "direction": "lower-better"})
@@ -497,7 +501,7 @@ def main():
                 sysrows += 1
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                 "@timestamp": None, "campaign": camp, "fid": fid, "node": node,
-                                "phase": ph,
+                                "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
                                 "value": (mv / 100.0 if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util")) else mv),
                                 "unit": ("ratio" if mk.startswith(("cpu_steal", "cpu_iowait", "foreign", "disk_util"))
