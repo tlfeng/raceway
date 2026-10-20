@@ -74,6 +74,9 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 - 实验变量 `dims` / `lineage` 从 user-tags 提升为 typed 列，可 range/排序
 - **bench-metric 带 `track` 列**（归一化赛道名）：按赛道拆看板的前提 —— 指标行没有
   track 就没法按赛道过滤
+- **monitors 补的 system 行按场次回填 `@timestamp` / `valid` / `arm`**：这行是按场次
+  采集的摘要，本身没有时间戳也没有臂名 —— 不回填的话 CPU steal 这类数据可信度指标
+  既画不出折线（x 轴无值），也会被 dashboard 的 `valid: true` 整体过滤掉
 - 引擎身份 `engine`（easysearch/elasticsearch）从**包名**推导，不信 sidecar 的 `name` 字段
 - 幂等：文档 `_id` 固定（`race_id` / `race_id|task|family|stat`），重复执行是覆盖不是翻倍
 - 改了 index template 必须 `--drop` 重建索引，旧 mapping 不会自动更新
@@ -83,6 +86,11 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 `bench-ds-*`），不同赛道的指标不混在一张图里 —— 赛道之间语料、维度、task 集都不同，
 量纲不可比。赛道内再按 workload（term 检索 / country 聚合 / sort / KNN k 值…）分图，
 组内才是同量纲可比的。总览页 `bench-overview` 是导航入口（环境说明 + 赛道导航表）。
+
+每个赛道看板四段：**① 写入**（吞吐/总耗时/Merge·Refresh·Flush 分解/限流/活动次数）、
+**② 查询**（每 workload 的吞吐 + 延迟分位 p50·p90·p99·p999 + 处理时间分位）、
+**③ 资源与存储**（存储/段数/GC 耗时与次数）、**④ 环境健康度**（CPU steal / iowait /
+外来进程 CPU / 负载 / 磁盘利用率 / swap —— 数据可信度，只有带 monitor 采集的赛道有）。
 
 赛道清单不硬编码，从 ES 实算；新增一场新赛道的压测后重跑 `make_dashboard.py` 就自动
 多一个看板。入口：左侧栏 ☰ → Analytics → Dashboard（`/app/dashboards/list`）。

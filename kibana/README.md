@@ -42,7 +42,7 @@ python3 make_dashboard.py --import \
 
 ## 产出
 
-`kibana-objects.ndjson` —— **167 个 saved object**（仅 python3 标准库）：
+`kibana-objects.ndjson` —— **270 个 saved object**（仅 python3 标准库）：
 
 - 3 个 **index-pattern**：bench-metric / bench-run / bench-env（字段从 ES mapping 实时读）
 - **10 个 dashboard**：
@@ -50,10 +50,13 @@ python3 make_dashboard.py --import \
   - `bench-<track>` **每个 esrally track 一个独立看板**，当前 9 个：
     `geo`（geonames 文本检索）/ `hnsw`（HNSW 96 维）/ `nested`（嵌套文档）/
     `ds-j512` `ds-j768` `ds-g960` `ds-j1024` `ds-g1920` `ds-j2048`（向量维度扫描）
-- **124 个 TSVB 面板**：按「赛道 × workload」动态生成（写入吞吐/索引总耗时/
-  各 workload 的吞吐与延迟 p90/服务时间 p99/错误率/存储/段数/GC）
+- **218 个 TSVB 面板**：按「赛道 × workload」动态生成，分四段：
+  - **① 写入**：写入吞吐、索引总耗时、Merge/Refresh/Flush 耗时、索引限流时长、索引活动次数
+  - **② 查询**：每 workload 一组 —— 吞吐 + **延迟分位 p50/p90/p99/p999** + **处理时间分位 p50/p90/p99**；外加错误率
+  - **③ 资源与存储**：存储体积、段数、GC 耗时与次数（young/old）
+  - **④ 环境健康度**（仅带 monitor 采集的赛道）：CPU steal、iowait、外来进程 CPU、负载 load1、磁盘利用率、换入次数
 - 3 个 **markdown**：环境说明（环境台账 + 场次体检）、**赛道导航**、看图指南
-- 27 个 **markdown 段标题**：每赛道 3 个（① 写入 ② 查询 ③ 资源与存储）
+- 36 个 **markdown 段标题**：每赛道 4 个（① 写入 ② 查询 ③ 资源与存储 ④ 环境健康度）
 
 ### 为什么按赛道拆看板
 
@@ -86,20 +89,35 @@ Vectorsearch-* 各自独立页面，**不同 track 不混在一张图里**。我
   `{"language": "lucene", "query": "..."}` —— 传纯字符串会被服务端静默丢弃（面板不报错但数据混图）。
 - **每个面板都带 `track:<赛道>` 约束**，外加该 workload 的 task 列表：
   `track:geo AND family:throughput AND unit:"ops/s" AND stat:median AND (task:term OR task:phrase)`。
-- **family 取值来自 `bench-export.py` 的 `RESULT_METRICS`**：`segment_count` / `store_size` 属
-  `disk`，`total_time` 属 `indexing_time`，`young_gc_time` 属 `gc`。写错 family 面板恒空。
+- **family 取值来自 `bench-export.py` 的 `RESULT_METRICS`**，且**不是按名字归一的**：
+  `merge_count` 属 `merge`、`merge_time` 属 `merge_time`、`merge_throttle_time` /
+  `refresh_time` / `flush_time` 各是独立 family。写错 family 面板恒空。
 - **仪表盘级过滤放顶部 KQL 查询框**（`searchSourceJSON.query`，默认 `valid: true`），
   用户可直接改成 `arm:es819` / `valid:false` / `campaign:ds3-20261015-233223`。
+  注意 system 指标行的 `valid` 是**按场次回填**的（见下），否则会被这个过滤整体清空。
 - **时间窗按数据实际范围自动计算**（`data_window(track)`），不设 `timeRestore` 会退回
   "最近 15 分钟"导致历史场次一片空白。每个看板各按自己赛道的批次走。
 - **桶粒度按该赛道的跨度定**（`pick_interval()`：跨天用 1d、半天内用 2h）：
   固定 1d 会让只跑了几小时的赛道（向量维度扫描整场 campaign 只跨 12 小时）全部数据
   落进一个桶 = 一个数据点，折线只有一个顶点画不出来。
-- **没有数据的指标不出图**（`group_has_metric()`）：例如 `scroll` 是分页操作，只有
-  latency 没有 throughput，硬出图就是一个恒空的 "No results found" 面板。
+- **没有数据的指标不出图**（`group_has_metric()` / `system_metric_exists()`）：例如
+  `scroll` 是分页操作，只有 latency 没有 throughput，硬出图就是一个恒空的
+  "No results found" 面板。同理 `memory_*` 六个分量实测全为 0（rally 报告未填充）、
+  `translog_size` 赛末已清空（≈0），都不出图。
+- **`service_time` 不单独出图**：无排队等待时它与 `latency` 逐点相等（rally 的
+  `latency = service_time + queue`），单独画一图全是与延迟重复的线。
 - **导入前会清理旧对象**（`prune_stale()`）：Kibana 的导入只覆盖同名对象、不会删旧文件，
   改了面板结构后旧面板会变成孤儿留在 Kibana 里。
 - 索引 schema 变化后（如新增维度）重跑 `make_dashboard.py` 刷新面板过滤条件。
+
+### 校验看板有没有真出数
+
+光看"文档数 > 0"不够 —— **terms 分组拿不到 series 时前端是空图，但 count 仍大于 0**。
+校验要同时带上 dashboard 级 KQL 和面板 filter，并确认分组聚合的 buckets 非空：
+
+```bash
+# 每个面板: (dashboard 的 KQL) AND (面板 filter) → terms 分组 → buckets 非空
+```
 
 ## es-proxy.py — 诊断工具
 
