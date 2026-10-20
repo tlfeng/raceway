@@ -292,20 +292,47 @@ def load_campaign_meta(camp_dir):
     return m
 
 
-def task_quality(om):
+# 写入阶段的 degraded 阈值（2026-10-21 定）
+#
+# degraded 的原始动机：error_rate=1.0（该 task 全部请求失败）时，
+# rally 吐出的时延量的是"失败响应有多快"（实测 nested p99 只有 0.22s），
+# 混进延迟曲线会把引擎显得比实际更快 —— 所以这类行不能进图。
+#
+# 但"error_rate > 0"一刀切过严：实测 GIST 系向量赛道（ds-g1920 / ds-g960）
+# 的 index-append error_rate 稳定在 0.0017~0.0023（约 0.2%，
+# 100 万条里丢 2000 条），ds3 与本轮复测（2.5.0-3015）都复现 ——
+# 是**可复现的血统特性**，不是测量事故。这种量级的 bulk 偶发失败不影响
+# 吞吐/时延的量级（rally 按成功处理量计吞吐），检索质量也没塌
+# （实测 recall k=10 0.9643 / k=100 0.996），却会让这两个赛道的写入数据
+# 整批被 quality 闸门挡在看板外。
+#
+# 所以：写入阶段 error_rate > 1% 才降级；查询侧维持 > 0 即降级
+# ——查询 task 全失败的时延污染才是主要风险，查询侧不放松。
+WRITE_DEGRADED_ERROR_RATE = 0.01
+
+
+def is_write_task(task):
+    """写阶段 task（index-*）。与场次级 write_degraded 判定同口径。"""
+    return str(task or "").startswith("index")
+
+
+def task_quality(om, task=None):
     """单个 operation 的可信度。
 
-    ok       = error_rate == 0，该 task 的时延/吞吐是成功请求的
-    degraded = error_rate > 0（rally 记的是 0~1 比例，1.0 = 该 task 全部请求失败）
+    ok       = error_rate 在阈值以下，该 task 的时延/吞吐是成功请求的
+    degraded = 超过阈值（写阶段 > 1%，查询阶段 > 0；
+                rally 记的是 0~1 比例，1.0 = 该 task 全部请求失败）
     unknown  = rally 没给 error_rate
     """
     er = om.get("error_rate")
     if er is None:
         return "unknown"
     try:
-        return "degraded" if float(er) > 0 else "ok"
+        er = float(er)
     except (TypeError, ValueError):
         return "unknown"
+    thr = WRITE_DEGRADED_ERROR_RATE if is_write_task(task) else 0.0
+    return "degraded" if er > thr else "ok"
 
 
 def _blk_mean(blk, stats=("mean", "p50", "median", "50_0")):
@@ -356,7 +383,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
     gt_modes = ((side or {}).get("run_params") or {}).get("latency_modes") or {}
     for om in res.get("op_metrics") or []:
         task = om.get("task") or om.get("operation") or "?"
-        q = (quality_of or task_quality)(om)
+        q = quality_of(om) if quality_of is not None else task_quality(om, task)
         lat_blk = om.get("latency") or {}
         svc_blk = om.get("service_time") or {}
         mode, backlog, lsrc = latency_semantics(lat_blk, svc_blk, gt_modes.get(task))
@@ -526,12 +553,14 @@ def validate_payload(runs, metrics):
             problems.append("同一 (场次, task) 的行 quality 不一致: %s/%s (%s vs %s)"
                             % (k[0], t, tq[k], q))
         tq.setdefault(k, q)
-    # error_rate>0 的 task 整块必须 degraded
+    # error_rate **超阈值**的 task 整块必须 degraded
+    # （写阶段 1% 阈值、查询侧 > 0 —— 与 task_quality 同口径，见 WRITE_DEGRADED_ERROR_RATE）
     for m in metrics:
         if m.get("family") == "error_rate" and (m.get("value") or 0) > 0:
             k = (m.get("race_id"), m.get("task"))
-            if tq.get(k) != "degraded":
-                problems.append("error_rate>0 的 (场次, task) 未标 degraded: %s/%s" % k)
+            thr = WRITE_DEGRADED_ERROR_RATE if is_write_task(m.get("task")) else 0.0
+            if (m.get("value") or 0) > thr and tq.get(k) != "degraded":
+                problems.append("error_rate 超阈值的 (场次, task) 未标 degraded: %s/%s" % k)
     # closed_loop 的 task 不应出现积压（口径与实测矛盾）
     for m in metrics:
         if m.get("family") == "latency" and m.get("latency_mode") == "closed_loop":
@@ -709,7 +738,7 @@ def main():
         task_quality_map = {}
         for om in op_metrics:
             t = om.get("task") or om.get("operation") or "?"
-            task_quality_map[t] = task_quality(om)
+            task_quality_map[t] = task_quality(om, t)
         degraded_tasks = sorted(t for t, q in task_quality_map.items() if q == "degraded")
         if degraded_tasks:
             race_quality = "degraded"
@@ -720,7 +749,7 @@ def main():
         # 赛级指标（store_size / segment_count / GC / merge…）量的是**写阶段**的状态，
         # 一个查询 task 失败不该把它们一起降级 —— 否则 15 场 nested 的磁盘与 GC 数据
         # 会因为一个查询 task 挂了而从看板上消失。只有写阶段自己失败才降级。
-        write_degraded = any(t.startswith("index") for t in degraded_tasks)
+        write_degraded = any(is_write_task(t) for t in degraded_tasks)
         race_row_quality = "degraded" if write_degraded else "ok"
 
         common = {"race_id": race_id, "campaign": camp, "arm": arm, "engine": engine,
@@ -917,8 +946,9 @@ def main():
                        "unit": {"type": "keyword"}, "valid": {"type": "boolean"},
                        # ---- 口径契约（2026-10-20 复审新增）----
                        # quality: 这行数据可不可信（ok / degraded / unknown）
-                       #   degraded = 该 task 的 error_rate>0，其时延量的是"失败响应有多快"，
-                       #   混进延迟曲线会把引擎显得更快 —— 看板上必须按 quality 过滤。
+                       #   degraded = 该 task 的 error_rate 超阈值（写阶段 > 1%，查询侧 > 0），
+                       #   其时延量的是"失败响应有多快"，混进延迟曲线会把引擎显得更快
+                       #   —— 看板上必须按 quality 过滤。
                        # latency_mode: latency 的口径（open_loop 含发压机积压 / closed_loop / unknown）
                        # backlog_ratio: (latency_mean - service_time_mean)/latency_mean，发压机积压占比
                        "quality": {"type": "keyword"},
