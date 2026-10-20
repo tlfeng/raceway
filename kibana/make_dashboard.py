@@ -438,7 +438,8 @@ IDX_PHASE_SPECS = [
 def track_panel_specs(track, groups, interval):
     """某赛道的面板规格：[(key, 标题, lucene 过滤, 数字格式, 分组字段, 指标类型, 桶粒度)]"""
     # quality:ok 是所有测量类面板的默认闸门 ——
-    #   degraded = 该 task 的 error_rate>0（该 task 全部请求失败），它吐出的时延量的是
+    #   degraded = 该 task 的 error_rate 超阈值（写阶段 > 1%，查询侧 > 0，
+    #   即该 task 全部请求失败），它吐出的时延量的是
     #   "失败响应有多快"（实测 p99 只有 0.22s），混进延迟曲线会把引擎显得比实际更快。
     #   15 场 nested 就是这样在 valid:true 过滤下混进曲线的。
     # 唯一不放行 degraded 的是错误率面板 —— 它就是要显示失败场次。
@@ -648,8 +649,9 @@ USAGE_MD = '''**看图指南**
   - `valid`（看板级，管所有面板）= 场次跑完了、且 RACES.md 记为 VALID。没记账的批次
     （早期 one-off 场次）没有这个标记，**默认不出图** —— 它们不可信，不能和正式批次同图比较。
   - `quality`（面板级，每个测量类面板自带 `quality:ok`）= 这行数据能不能用。
-    degraded = 该 task 的 error_rate>0（全部请求失败），它吐出的时延量的是"失败响应有多快"，
-    混进来会把引擎显得更快。**错误率面板是唯一的例外**，它刻意不带 quality 闸门 ——
+    degraded = 该 task 的 error_rate 超阈值（写阶段 > 1%，查询侧 > 0），
+    它吐出的时延量的是"失败响应有多快"，混进来会把引擎显得更快。
+    **错误率面板是唯一的例外**，它刻意不带 quality 闸门 ——
     它就是要显示失败场次。
 - 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定实验臂: `arm:es819`；限定批次: `campaign:ds3-20261015-233223`
 - **时延三兄弟，别混用**：
