@@ -38,11 +38,13 @@ arm-env-table.py             三臂×多赛道"性能×环境"联合表（race.j
 codec-compare.py             codec 五组合臂三件套（写入/赛末体积/查询）
 bench-sidecar.py             每场环境/身份元数据 sidecar 生成
 bench-export.py / bench-apply.py / bench-report.py   入库载荷 → ES 导入 → 单文件 HTML 报告
+build-race-store.py          campaign 目录 → rally race store 布局（软链，可重建）
 campaign-configs.example.conf      配置文件模板
 campaign-thresholds.example.conf   断言阈值模板
 echarts.min.js               报告内联用（Apache-2.0，见credits）
 docs/                        GUIDE 使用手册 / RUNBOOK 触发手册 / METHODOLOGY 方法学 / hv1024-track 赛道制作
-kibana/                      本地 ES+Kibana 建板环境（docker-compose + TSVB saved objects 生成）
+kibana/                      Kibana 建板（make_dashboard.py 生成 saved objects；es-proxy.py 诊断代理；
+                              docker-compose.yml 是备用的 7.10 OSS 环境，本机已有 ES/Kibana 时不需要）
 ```
 
 ## 环境要求
@@ -50,6 +52,41 @@ kibana/                      本地 ES+Kibana 建板环境（docker-compose + TS
 - 驱动宿主机：python3、esrally ≥2.12、ssh 免密到三台被测虚机；部署层依赖 [ibs](https://github.com/tlfeng/ibs) CLI
 - N 台被测虚机（如 32 vCPU/32G）：root 免密、systemd、可解压 bundle；驱动器与集群节点规划在 ibs `ip.txt`（esrally 行=驱动器，其余=集群节点）
 - 赛道语料：geonames / hnsw2m / hv1024（jina 1M×1024d）/ nested 任选，放置路径见 `vm-bench.env.example`
+- 结果入库与看板：ES 8.1.3 + Kibana 8.1.3（仅本地汇总用，不在压测机上）
+
+## 入库
+
+把 rally race 结果灌进 ES（三索引）并在 Kibana 建看板：
+
+```bash
+python3 build-race-store.py --campaigns campaigns --out race-store   # 软链农场（幂等）
+python3 bench-export.py --out exports/<tag> --races race-store --campaigns campaigns
+python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--insecure] [--drop]
+python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
+```
+
+三索引：`bench-env`（环境台账）/ `bench-run`（一场一条主维度表）/ `bench-metric`(一指标一行长表，单位归一)。
+
+口径要点：
+
+- **error_rate 按 rally 语义 0~1 原样入库**（`1.0` = 该 task 请求全失败），不按百分比再折算
+- 实验变量 `dims` / `lineage` 从 user-tags 提升为 typed 列，可 range/排序
+- 引擎身份 `engine`（easysearch/elasticsearch）从**包名**推导，不信 sidecar 的 `name` 字段
+- 幂等：文档 `_id` 固定（`race_id` / `race_id|task|family|stat`），重复执行是覆盖不是翻倍
+- 改了 index template 必须 `--drop` 重建索引，旧 mapping 不会自动更新
+
+看板 `bench-overview`（对照 opensearch.org/benchmarks）：顶部 KQL 查询框默认 `valid: true`，
+时间窗按数据实际范围自动计算，每图一个指标族、series 按 `arm`（向量面板按 `dims`）。
+
+面板出问题时用 `kibana/es-proxy.py` 代理 Kibana→ES 看 ES 实际收到的查询（需改 kibana.yml
+的 elasticsearch.hosts，排查完记得改回）。
+
+单文件 HTML 报告（不依赖 ES）：
+
+```bash
+python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out 报告.html
+```
+
 
 ## 快速开始
 
@@ -83,16 +120,6 @@ ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ARM_LABEL=es819
 ```
 
 `--assert`：CSV 阈值（`track,task,metric,>=|<=,value`），对象为 B 配置的逐轮中位，任一 FAIL 退出码 1——可直接接 CI 做发版回归。
-
-## 入库
-
-```bash
-python3 bench-export.py --out exports/<tag>        # race store + campaign → 三索引载荷
-python3 bench-apply.py --dir exports/<tag> --es <url> --auth user:pass --insecure
-python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out 报告.html
-```
-
-三索引：`bench-env`（环境台账）/ `bench-run`（一场一条主维度表）/ `bench-metric`(一指标一行长表，单位归一)。
 
 ## 安全
 
