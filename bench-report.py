@@ -352,7 +352,7 @@ const tracks2=[...new Set(gpts.map(p=>p.track))];
 const camps=[...new Set(gpts.map(p=>p.campaign))].sort();
 mk(box, {tooltip:{trigger:'axis',formatter:ps=>ps.filter(p=>p.data).map(p=>`${p.seriesName} ${num(p.value)}（${p.data.campaign}，n=${p.data.n}${p.data.warn?'，⚠口径警告':''}）`).join('<br>')},
  legend:{top:0,type:'scroll'},grid:{top:40,bottom:60},
- xAxis:{type:'category',data:camps,axisLabel:{rotate:30,fontSize:10,formatter:v=>v.replace(/^(jdk3|vm3|esrm|ds3)-/,'$1 ').replace(/-(\d{6})$/,'-$1')}},
+ xAxis:{type:'category',data:camps,axisLabel:{rotate:30,fontSize:10,formatter:v=>v.replace(/^([a-z0-9]+)-/,'$1 ').replace(/-(\d{6})$/,'-$1')}},
  yAxis:{type:'value',name:'docs/s'},
  series:tracks2.map(t=>[...new Set(gpts.filter(p=>p.track===t).map(p=>p.key))].map(k=>({
    name:k,type:'line',smooth:false,symbolSize:6,connectNulls:false,
