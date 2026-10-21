@@ -253,6 +253,16 @@ http.createServer((req, res) => {
 
     let fixedNote = null;
 
+    // Kibana 轮询 GET /_async_search/status/{id}（ES 7.17 端点），
+    // EasySearch 2.5.0 只实现了 GET /_async_search/{id}，直通用会 400
+    // 「Invalid index name [_async_search]」。这里把路径改写过去，
+    // 响应再转回 ES 7.17 的 status 形态（见下面的 transform）。
+    const isAsyncStatus = req.method === 'GET' && /^\/_async_search\/status\//.test(req.url);
+    if (isAsyncStatus) {
+      req.url = req.url.replace('/_async_search/status/', '/_async_search/');
+      fixedNote = 'async_status_path_rewrite';
+    }
+
     if (req.url.includes('enable_fields_emulation')) {
       const u = new URL(req.url, 'http://x');
       u.searchParams.delete('enable_fields_emulation');
@@ -312,6 +322,34 @@ http.createServer((req, res) => {
             res.writeHead(statusOverride || proxyRes.statusCode, outHeaders);
             res.end(outBody);
           };
+
+          // _async_search/status 的响应形态转换（EasySearch → ES 7.17）
+          if (isAsyncStatus) {
+            try {
+              const j = JSON.parse(outBody.toString('utf8'));
+              const inner = j.response || {};
+              const status = {
+                id: j.id,
+                is_partial: false,
+                is_running: false,
+                is_stored: j.state === 'STORE_RESIDENT' || j.state === 'STORED',
+                is_kept_alive: true,
+                completion_status: {
+                  status: 'succeeded',
+                  took: inner.took || 0,
+                  num_reduce_phases: 0,
+                  num_phases: 1,
+                  total_reduce_phases: 0,
+                  total_phases: 1,
+                },
+                response: inner,
+              };
+              outBody = Buffer.from(JSON.stringify(status));
+              outHeaders['content-type'] = 'application/json; charset=UTF-8';
+              outHeaders['content-length'] = String(outBody.length);
+              delete outHeaders['content-encoding'];
+            } catch (e) { /* 不是 JSON 就保持原样 */ }
+          }
 
           const isRoot = req.method === 'GET' && /^\/?(\?|$)/.test(req.url);
           const isNodes = req.method === 'GET' && /^\/_nodes(\/|\?|$)/.test(req.url);
