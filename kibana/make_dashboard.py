@@ -583,9 +583,10 @@ def env_markdown():
     md = ['**Benchmark 结果总览** · 数据源 `bench-run` / `bench-metric`'
           '（raceway bench-export.py 离线入库，源 = rally race.json + sidecar）',
           '',
-          '每点 = 一场 race；曲线 = 实验臂(arm)，图例标签 = `引擎@版本@build@JDK`（如 ez@2.5.0@3015@graalvm25，'
-          'arm_label 字段）；同臂跨引擎 build 会自动拆成多条线（如 jdk26@3009 / jdk26@3015），'
-          '因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
+          '每点 = 一场压测；一条线 = 一套固定配置（引擎 + 版本 + build + JDK），'
+          '图例写成 `引擎@版本@build@JDK`（如 ez@2.5.0@3015@graalvm25）。'
+          '同一套配置换了引擎 build 会自动拆成多条线（如 ez@2.5.0@3009@openjdk26 / ez@2.5.0@3015@openjdk26），'
+          '因为不同 build 的绝对值不能直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
     try:
         r = es_get('/bench-env/_search?size=10')
         for hit in r['hits']['hits']:
@@ -628,16 +629,16 @@ def env_markdown():
                          if b['key'] not in truthy)
         md.append('')
         md.append('**场次体检** — 共 %d 场（VALID %d / 非 VALID %d）' % (total, n_valid, n_invalid))
-        md.append('实验臂: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
+        md.append('被测配置（代号）: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                          for b in aggs['arms']['buckets']))
-        # 臂名 → 图例标签对照（同一臂可能对应多个标签：跨 build 采集时各 build 一条线）
+        # 配置代号 → 图例标签对照（同一代号可能对应多个标签：换了引擎 build 就各画一条线）
         pairs = []
         for b in aggs['arms']['buckets']:
             labs = b.get('labels', {}).get('buckets') or []
             for lb in labs:
                 pairs.append('%s → %s（%d 场）' % (b['key'], lb['key'], lb['doc_count']))
         if pairs:
-            md.append('臂名 → 图例标签: ' + ' · '.join(pairs))
+            md.append('配置代号 → 图例标签: ' + ' · '.join(pairs))
         md.append('赛道: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                         for b in aggs['by_track']['buckets']))
     except Exception as e:                                   # noqa: BLE001
