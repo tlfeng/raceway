@@ -245,6 +245,20 @@ def load_campaign_meta(camp_dir):
     pp = os.path.join(camp_dir, "PACKAGES.txt")
     if os.path.isfile(pp):
         m["packages"] = open(pp, encoding="utf-8", errors="replace").read()
+    # 本 campaign 自证的引擎包名（从 PACKAGES.txt 的 sha256+包名行解析）：
+    #   没有 sidecar 的历史 campaign（如 ds3-20261015）只能靠它，
+    #   否则会套用别的 campaign 实测到的臂身份，把 3009 的场次标成 3015。
+    for _mm in re.finditer(r"(easysearch|elasticsearch)-[0-9][^\s]*\.tar\.gz", m.get("packages") or ""):
+        m.setdefault("pkg_own", {}).setdefault(_mm.group(1), _mm.group(0))
+    # 受污染场次清单（每行一个 fid）：给该场 bench-run 文档打 caliber_warnings 标注。
+    # 为什么单独存文件而不是写进 RACES.md：RACES.md 的状态列直接决定 valid，
+    # 写成 CONTAMINATED 会让 valid=false，看板闸门 valid:true 会把这一场整个滤掉
+    # （ds-j2048 只有 jdk25 臂有数据，一滤就空面板）。状态保持 VALID，
+    # 污染事实走这个清单 + 文档 caliber_warnings 双通道留痕。
+    cf = os.path.join(camp_dir, "CONTAMINATED.txt")
+    if os.path.isfile(cf):
+        m["contaminated"] = [x.strip() for x in open(cf, encoding="utf-8", errors="replace")
+                             if x.strip() and not x.strip().startswith("#")]
     for p in glob.glob(os.path.join(camp_dir, "results", "*-sidecar.json")):
         try:
             s = json.load(open(p, encoding="utf-8"))
@@ -651,6 +665,8 @@ def main():
     fid_quality = {}        # fid → 场次级 quality；system 行同样要带 quality，
                             #   否则看板上 quality:ok 的闸门会把整个环境健康度段落过滤空
     fid_arm = {}            # fid → 实验臂；system 行靠它回填 arm（否则按 arm 分线的面板拿不到 series）
+    fid_arm_build = {}      # fid → 臂@build；system 行同样要回填，否则按 arm_build 分线的
+                            # system 类面板（外来进程 CPU / 换入次数…）会分不出桶 → 空面板
     seen = set()
     unmatched = 0
     skipped_no_campaign = 0
@@ -688,6 +704,10 @@ def main():
         rate_b = (DOCS.get(d.get("track"), 0) / dur) if dur and DOCS.get(d.get("track")) else None
         warn = []
         eng_tag = ut.get("engine") or ""
+        for _cf in (meta.get("contaminated") or []):
+            if _cf == fid:
+                warn.append("受宿主旁路负载污染：该场写赛窗口内落过宿主侧全量导出，吞吐可能偏低，结论以重跑为准")
+                break
         if camp.startswith("ds3-") and eng_tag != "es819":
             warn.append("heap 声明不实：user_tags heap:16g 但 ds3 campaign 的 easysearch 臂实测 -Xmx1g（2026-10-16 事故），绝对值不可与他批比较")
         if not side:
@@ -700,7 +720,11 @@ def main():
         sj = side.get("jdk") or {}
         srp = side.get("run_params") or {}
         ident = arm_identity.get(arm) or {}
-        pkg = se.get("pkg") or ident.get("pkg")
+        pkg = se.get("pkg")
+        if not pkg:
+            # 没有 sidecar → 用本 campaign 自证的包（PACKAGES.txt），
+            # 而不是跨 campaign 借来的臂身份 —— 否则 ds3 的 3009 场次会被标成 3015。
+            pkg = (meta.get("pkg_own") or {}).get(ident.get("engine")) or ident.get("pkg")
         # 引擎名从包名推导（bench-sidecar.py 同规则）：旧 sidecar 曾把 es819 臂写成 name=easysearch
         base_pkg = os.path.basename(pkg or "")
         engine = ("elasticsearch" if base_pkg.startswith("elasticsearch")
@@ -718,6 +742,20 @@ def main():
         version = (vm[0] if vm else None) or se.get("version_from_pkg") \
             or ident.get("version") or (d.get("cluster") or {}).get("distribution-version")
         build = re.sub(r"-linux.*$", "", pkg or "") or None
+        # 构建号（3015 / 3009 …）：version 字段只有主次版本（如 2.5.0），无法区分
+        # 跨 build 的两批数据。ds3 首轮是 2.5.0-3009、ds2 是 2.5.0-3015，
+        # 臂标签相同（jdk25/jdk26/jdk27）时看板上会混成一条线，必须能按 build 过滤。
+        vfp = se.get("version_from_pkg") or ""
+        _mb = re.search(r"-(\d+)-linux", pkg or "")
+        build_no = _mb.group(1) if _mb else None
+        if not build_no:
+            build_no = (vfp.rsplit("-", 1)[-1] if "-" in vfp else None) or None
+        if not build_no:
+            _uv = ut.get("engine_ver") or ""
+            build_no = (_uv.rsplit("-", 1)[-1] if "-" in _uv else None) or None
+        # 复合分组键：同一臂的跨 build 场次（3009 与 3015）必须能分开画线，
+        # 否则看板上"jdk26"那条线里混着两个不同引擎 build 的点，结论会被误读。
+        arm_build = ("%s@%s" % (arm, build_no)) if (arm and build_no) else arm
         jdk_nodes = sj.get("measured_nodes") or []
         jdk = ",".join(sorted({str(x) for x in jdk_nodes})) or ut.get("jdk") or ident.get("jdk")
         heap_max = srp.get("heap_max_measured_mb") or []
@@ -754,6 +792,8 @@ def main():
 
         common = {"race_id": race_id, "campaign": camp, "arm": arm, "engine": engine,
                   "version": str(version) if version is not None else None,
+                  "engine_build": build_no,
+                  "arm_build": arm_build,
                   "jdk": jdk, "heap_gb": heap_gb,
                   "dims": dims, "lineage": lineage, "segment_form": segment_form,
                   "codec": codec_of(d, side),
@@ -774,9 +814,11 @@ def main():
         fid_valid.setdefault(fid, (status == "VALID") if status else None)
         fid_quality.setdefault(fid, race_row_quality)
         fid_arm.setdefault(fid, arm)
+        fid_arm_build.setdefault(fid, arm_build)
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
                      "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
                      "version": str(version) if version is not None else None, "build": build,
+                     "engine_build": build_no, "arm_build": arm_build,
                      "jdk": jdk, "heap_gb": heap_gb,
                      "dims": dims, "lineage": lineage, "segment_form": segment_form,
                      "track": tr, "track_raw": d.get("track"), "challenge": d.get("challenge"),
@@ -872,6 +914,7 @@ def main():
                     metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                     "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
+                                    "arm_build": fid_arm_build.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                     "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
@@ -882,6 +925,7 @@ def main():
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                 "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
+                                    "arm_build": fid_arm_build.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
@@ -938,6 +982,8 @@ def main():
                        "mem_gb": {"type": "double"},
                        "lineage": {"type": "keyword"}, "segment_form": {"type": "keyword"},
                        "engine": {"type": "keyword"}, "version": {"type": "keyword"},
+                       "engine_build": {"type": "keyword"},
+                       "arm_build": {"type": "keyword"},
                        "build": {"type": "keyword"}, "jdk": {"type": "keyword"},
                        "arm": {"type": "keyword"}, "env_id": {"type": "keyword"},
                        "track": {"type": "keyword"}, "campaign": {"type": "keyword"},
