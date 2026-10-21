@@ -547,8 +547,21 @@ def main(argv=None):
         if args.ssh:
             args.arms_file = posixpath.join(args.root, 'schedules', 'dimsweep-arms.conf')
         else:
+            # 本地模式的臂定义默认取仓库内 schedules/dimsweep-arms.conf。
+            # 该文件属内部资料，不随公共库公开（仓库里没有这个目录），
+            # 所以按「环境变量 → 仓库内默认 → 明确报错」三级回退，
+            # 免得直接抛一个看不懂的 FileNotFoundError。
             here = os.path.dirname(os.path.abspath(__file__))
-            args.arms_file = os.path.join(here, 'schedules', 'dimsweep-arms.conf')
+            args.arms_file = (os.environ.get('RACEWAY_ARMS_FILE')
+                               or os.path.join(here, 'schedules', 'dimsweep-arms.conf'))
+            if not os.path.isfile(args.arms_file):
+                raise SystemExit(
+                    '找不到臂定义文件: %s\n'
+                    '臂定义属内部资料，未随公共库公开 —— 用 --arms-file 指定路径，'
+                    '或设环境变量 RACEWAY_ARMS_FILE 指向它。\n'
+                    '远端模式（--ssh）不受影响：默认读远端 %s'
+                    % (args.arms_file,
+                       posixpath.join(args.root, 'schedules', 'dimsweep-arms.conf')))
 
     {'arms': cmd_arms, 'gen': cmd_gen, 'preview': cmd_preview,
      'start': cmd_start, 'serve': cmd_serve}[args.cmd](args)

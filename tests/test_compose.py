@@ -50,7 +50,14 @@ class TestParseArms(unittest.TestCase):
         self.assertIn('JDK_DIR=/opt/jdks/jdk-26', by['jdk26'].config)
 
     def test_real_dimsweep_arms_file(self):
-        with open(os.path.join(REPO, 'schedules', 'dimsweep-arms.conf'), encoding='utf-8') as f:
+        # 臂定义属内部资料，不随公共库公开：按与 bench-compose.py 相同的顺序找，
+        # 找不到就跳过（本地留存副本用 RACEWAY_ARMS_FILE 指过来即可跑）。
+        path = (os.environ.get('RACEWAY_ARMS_FILE')
+                or os.path.join(REPO, 'schedules', 'dimsweep-arms.conf'))
+        if not os.path.isfile(path):
+            self.skipTest('臂定义不在公共库里（%s），跳过；'
+                          '用 RACEWAY_ARMS_FILE 指向本地留存副本可跑' % path)
+        with open(path, encoding='utf-8') as f:
             arms = C.parse_arms(f.read())
         self.assertEqual(arm_names(arms), ['jdk25', 'jdk26', 'jdk27', 'es819'])
         self.assertFalse([m for s, m in C.validate_arms(arms) if s == 'error'])

@@ -42,7 +42,6 @@ build-race-store.py          campaign 目录 → rally race store 布局（软�
 campaign-configs.example.conf      配置文件模板
 campaign-thresholds.example.conf   断言阈值模板
 echarts.min.js               报告内联用（Apache-2.0，见credits）
-docs/                        GUIDE 使用手册 / RUNBOOK 触发手册 / METHODOLOGY 方法学 / hv1024-track 赛道制作
 kibana/                      Kibana 建板（make_dashboard.py 生成 saved objects：每个 esrally track
                               一个独立看板 + 总览导航页；es-proxy.py 诊断代理；
                               docker-compose.yml 是备用的 7.10 OSS 环境，本机已有 ES/Kibana 时不需要）
@@ -70,7 +69,9 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 > 失败 task 的行与成功 task 混流、closed_loop 任务出现积压等一律**非零退出、
 > 载荷不写出**（排查用 `--allow-fail` 放行）。覆盖率与一致性提示写进
 > `manifest.json` 的 `assertions` / `coverage` 段。
-> 口径详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md#口径契约导出自检)。
+> 完整口径文档（stat/unit 词表、自检规则、指标语义）属内部资料，未随本公共库公开；
+> 规则本身可直接看 `bench-export.py` 顶部的 `CANON_STATS` / `CANON_UNITS`
+> 与导出产物 `manifest.json` 的 `assertions` 段。
 >
 > **stat 归一后 `_id` 会变**（rally 的 `median`→`p50`、`99_99`→`p9999`），
 > 旧索引里的同一条会变成两条 —— 改词表后必须 `bench-apply.py --drop` 重建。
