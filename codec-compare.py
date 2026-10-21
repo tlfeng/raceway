@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""codec-compare.py —— geonames 存储压缩对比（5 组合臂）汇总（在压测机上跑）
+"""codec-compare.py —— geonames 存储压缩对比（5 组合车）汇总（在压测机上跑）
 
   ssh root@<压测机> 'python3 - <campaign 目录> [--detail]' < scripts/codec-compare.py
 
@@ -21,14 +21,14 @@ import statistics
 import sys
 
 DOCS = 11396503
-ARM_LABEL = {
+CAR_LABEL = {
     "jdk25-gdef": "ez-def (2.5.0@GraalVM25)",
     "jdk25-gzstd": "ez-zstd-sr (2.5.0@GraalVM25)",
     "kona25-gzstd": "ez-kona-zstd-sr (2.5.0@Kona25)",
     "es819-gdef": "es8-def (8.19.23)",
     "es819-gbc": "es8-bc (8.19.23)",
 }
-ARM_ORDER = ["jdk25-gdef", "jdk25-gzstd", "kona25-gzstd", "es819-gdef", "es819-gbc"]
+CAR_ORDER = ["jdk25-gdef", "jdk25-gzstd", "kona25-gzstd", "es819-gdef", "es819-gbc"]
 
 
 def j(p):
@@ -106,8 +106,8 @@ def collect(camp):
         fid = os.path.basename(p)[:-len("-w-race.json")]
         if keep is not None and fid not in keep:
             continue
-        key = "-".join(fid.split("-")[:2])          # arm + 变体（r 轮号在后头）
-        if key not in ARM_LABEL:
+        key = "-".join(fid.split("-")[:2])          # car + 变体（r 轮号在后头）
+        if key not in CAR_LABEL:
             continue
         d = j(p)
         if not d or d.get("challenge") != "write-only":
@@ -165,16 +165,16 @@ def main():
 
     print("=== ① 写入 + ② 落盘体积 ===")
     print("%-32s %s %2s %9s %7s %9s %8s %8s %8s %8s %8s %8s %8s" % (
-        "组合臂", "实测codec", "n", "口径B中位", "极差%", "口径A中位", "A-B%", "store GB(赛末)",
+        "组合车", "实测codec", "n", "口径B中位", "极差%", "口径A中位", "A-B%", "store GB(赛末)",
         "vs ez-def", "段数", "merge s", "GC y/o s", "err"))
     base_store = None
-    order = [k for k in ARM_ORDER if k in fields] + [k for k in sorted(fields) if k not in ARM_ORDER]
+    order = [k for k in CAR_ORDER if k in fields] + [k for k in sorted(fields) if k not in CAR_ORDER]
     if "jdk25-gdef" in fields:
         base_store = median([x["store"] for x in fields["jdk25-gdef"]["w"]])
     for k in order:
         w = fields[k]["w"]
         print("%-32s %-16s %2d %9.0f %7.1f %9s %8s %8.2f %8s %8s %8s %10s %8s" % (
-            ARM_LABEL.get(k, k), w[0]["codec"] or "?", len(w),
+            CAR_LABEL.get(k, k), w[0]["codec"] or "?", len(w),
             median([x["b"] for x in w]) or 0, rng_pct([x["b"] for x in w]),
             ("%.0f" % median([x["a"] for x in w])) if median([x["a"] for x in w]) else "NULL",
             ("%.1f" % ((median([x["a"] for x in w]) / median([x["b"] for x in w]) - 1) * 100))
@@ -193,13 +193,13 @@ def main():
         for k in order:
             for x in fields[k]["w"]:
                 print("%-20s %-3s %9.0f %6.1f %8.2f %5s %8.1f" % (
-                    ARM_LABEL.get(k, k)[:20], "r%s" % x["round"], x["b"] or 0, x["dur"], x["store"],
+                    CAR_LABEL.get(k, k)[:20], "r%s" % x["round"], x["b"] or 0, x["dur"], x["store"],
                     x["segs"], x["merge"]))
 
     ops = sorted({m["op"] for k in order for m in fields[k]["q"] if m["op"]}, key=str)
     if ops:
         print("\n=== ③ 查询延迟中位（ms，三场取中位）===")
-        print("%-42s %s" % ("操作", " ".join("%10s" % ARM_LABEL.get(k, k).split(" ")[0][:10] for k in order)))
+        print("%-42s %s" % ("操作", " ".join("%10s" % CAR_LABEL.get(k, k).split(" ")[0][:10] for k in order)))
         for op in ops:
             cells = []
             for k in order:
@@ -207,7 +207,7 @@ def main():
                 cells.append("%10s" % (("%.1f" % median(v)) if v and median(v) else "-"))
             print("%-42s %s" % (str(op)[:42], " ".join(cells)))
         print("\n=== ③b 查询吞吐中位（ops/s）===")
-        print("%-42s %s" % ("操作", " ".join("%10s" % ARM_LABEL.get(k, k).split(" ")[0][:10] for k in order)))
+        print("%-42s %s" % ("操作", " ".join("%10s" % CAR_LABEL.get(k, k).split(" ")[0][:10] for k in order)))
         for op in ops:
             cells = []
             for k in order:

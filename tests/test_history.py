@@ -25,11 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 H = importlib.import_module('bench-history')  # noqa: E402
 
 
-def row(campaign='c1', fid='jdk25-ds-j1024-r1', arm='jdk25', arm_build='jdk25@3015',
+def row(campaign='c1', fid='jdk25-ds-j1024-r1', car='jdk25', car_build='jdk25@3015',
         track='ds-j1024', rnd=1, status='VALID', quality='ok', phase='w',
         challenge=None, ts='2026-10-21T02:30:00Z', warnings=None):
     d = {
-        'campaign': campaign, 'fid': fid, 'arm': arm, 'arm_build': arm_build,
+        'campaign': campaign, 'fid': fid, 'car': car, 'car_build': car_build,
         'track': track, 'round': rnd, 'status': status, 'quality': quality,
         'phase': phase, '@timestamp': ts,
     }
@@ -81,10 +81,10 @@ class TestBuildIsolation(unittest.TestCase):
     def setUp(self):
         # 3009 上 SKIP（ds3 当时被窗底砍掉），3015 上后来跑成 VALID（ds2）
         rows = [
-            row(campaign='ds3', arm_build='jdk25@3009', status='SKIP', phase='w'),
-            row(campaign='ds3', arm_build='jdk25@3009', status='SKIP', phase='q'),
-            row(campaign='ds2', arm_build='jdk25@3015', phase='w'),
-            row(campaign='ds2', arm_build='jdk25@3015', phase='q'),
+            row(campaign='ds3', car_build='jdk25@3009', status='SKIP', phase='w'),
+            row(campaign='ds3', car_build='jdk25@3009', status='SKIP', phase='q'),
+            row(campaign='ds2', car_build='jdk25@3015', phase='w'),
+            row(campaign='ds2', car_build='jdk25@3015', phase='q'),
         ]
         self.cov = H.build_coverage(rows)
         self.cell = self.cov.get('jdk25', 'ds-j1024', 1)
@@ -114,16 +114,16 @@ class TestPlanCells(unittest.TestCase):
 
     def setUp(self):
         rows = [
-            row(campaign='ds2', arm='jdk25', arm_build='jdk25@3015', track='ds-j1024', rnd=1, phase='w'),
-            row(campaign='ds2', arm='jdk25', arm_build='jdk25@3015', track='ds-j1024', rnd=1, phase='q'),
-            row(campaign='ds3', arm='jdk25', arm_build='jdk25@3009', track='ds-j1024', rnd=2, phase='w', status='SKIP'),
-            row(campaign='ds3', arm='jdk25', arm_build='jdk25@3009', track='ds-j1024', rnd=2, phase='q', status='SKIP'),
+            row(campaign='ds2', car='jdk25', car_build='jdk25@3015', track='ds-j1024', rnd=1, phase='w'),
+            row(campaign='ds2', car='jdk25', car_build='jdk25@3015', track='ds-j1024', rnd=1, phase='q'),
+            row(campaign='ds3', car='jdk25', car_build='jdk25@3009', track='ds-j1024', rnd=2, phase='w', status='SKIP'),
+            row(campaign='ds3', car='jdk25', car_build='jdk25@3009', track='ds-j1024', rnd=2, phase='q', status='SKIP'),
         ]
         self.cov = H.build_coverage(rows)
-        self.arms = [{'name': 'jdk25', 'build': '3015'}]
+        self.cars = [{'name': 'jdk25', 'build': '3015'}]
 
     def plan(self, **kw):
-        return H.plan_cells(self.cov, self.arms, ['ds-j1024'], 2, **kw)
+        return H.plan_cells(self.cov, self.cars, ['ds-j1024'], 2, **kw)
 
     def test_covered_cell_is_skipped(self):
         p = self.plan()
@@ -144,30 +144,30 @@ class TestPlanCells(unittest.TestCase):
 
     def test_other_build_only_is_explained(self):
         """只被别的 build 跑过 → 仍要跑，且理由要说清是哪个 build。"""
-        arms = [{'name': 'jdk25', 'build': '3020'}]
-        p = H.plan_cells(self.cov, arms, ['ds-j1024'], 1)
+        cars = [{'name': 'jdk25', 'build': '3020'}]
+        p = H.plan_cells(self.cov, cars, ['ds-j1024'], 1)
         self.assertEqual(len(p['to_run']), 1)
         self.assertIn('别的 build', p['to_run'][0]['reason'])
 
     def test_missing_build_info_is_flagged(self):
-        """臂没有 build 信息 → 无从判断同 build，必须说出来而不是当成已跑过。"""
-        arms = [{'name': 'jdk25', 'build': ''}]
-        p = H.plan_cells(self.cov, arms, ['ds-j1024'], 1)
+        """车没有 build 信息 → 无从判断同 build，必须说出来而不是当成已跑过。"""
+        cars = [{'name': 'jdk25', 'build': ''}]
+        p = H.plan_cells(self.cov, cars, ['ds-j1024'], 1)
         self.assertEqual(len(p['to_run']), 1)
         self.assertIn('没有 build 信息', p['to_run'][0]['reason'])
 
-    def test_namedtuple_arms_do_not_mistake_label_for_build(self):
-        """Arm 命名元组的第 2 个字段是 label，不是 build —— 不能解包错。"""
+    def test_namedtuple_cars_do_not_mistake_label_for_build(self):
+        """Car 命名元组的第 2 个字段是 label，不是 build —— 不能解包错。"""
         from collections import namedtuple
-        Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
-        arm = Arm('jdk25', 'jdk25', 'easysearch', '3015', '', 'x')
-        p = H.plan_cells(self.cov, [arm], ['ds-j1024'], 1)
+        Car = namedtuple('Car', 'name label engine build jdk_dir config')
+        car = Car('jdk25', 'jdk25', 'easysearch', '3015', '', 'x')
+        p = H.plan_cells(self.cov, [car], ['ds-j1024'], 1)
         self.assertEqual(len(p['skipped']), 1)
 
     def test_unavailable_coverage_never_skips(self):
         """指标库不可用 → 一格都不剔除（空表不等于"什么都没跑过"）。"""
         cov = H.Coverage(available=False, error='连不上')
-        p = H.plan_cells(cov, self.arms, ['ds-j1024'], 2)
+        p = H.plan_cells(cov, self.cars, ['ds-j1024'], 2)
         self.assertEqual(len(p['skipped']), 0)
         self.assertEqual(len(p['to_run']), 2)
 
@@ -180,26 +180,26 @@ class TestPlanCells(unittest.TestCase):
 class TestCoverageTable(unittest.TestCase):
     def test_rows_fold_into_cells(self):
         rows = [row(phase='w'), row(phase='q'),
-                row(fid='jdk26-ds-j1024-r1', arm='jdk26', arm_build='jdk26@3015', phase='w'),
-                row(fid='jdk26-ds-j1024-r1', arm='jdk26', arm_build='jdk26@3015', phase='q')]
+                row(fid='jdk26-ds-j1024-r1', car='jdk26', car_build='jdk26@3015', phase='w'),
+                row(fid='jdk26-ds-j1024-r1', car='jdk26', car_build='jdk26@3015', phase='q')]
         cov = H.build_coverage(rows)
         self.assertEqual(len(cov.cells), 2)
         self.assertEqual(cov.campaigns, ['c1'])
         self.assertEqual(cov.tracks, ['ds-j1024'])
-        self.assertEqual(cov.arms, ['jdk25', 'jdk26'])
+        self.assertEqual(cov.cars, ['jdk25', 'jdk26'])
         self.assertEqual(cov.summary()['races'], 2)
 
-    def test_rows_without_arm_or_track_are_dropped(self):
-        cov = H.build_coverage([row(arm=''), row(track='')])
+    def test_rows_without_car_or_track_are_dropped(self):
+        cov = H.build_coverage([row(car=''), row(track='')])
         self.assertEqual(len(cov.cells), 0)
 
     def test_none_round_becomes_zero(self):
         cov = H.build_coverage([row(rnd=None, phase='w')])
         self.assertIn(('jdk25', 'ds-j1024', 0), cov.cells)
 
-    def test_expected_arm_build(self):
-        self.assertEqual(H.expected_arm_build('jdk25', '3015'), 'jdk25@3015')
-        self.assertEqual(H.expected_arm_build('es819', ''), 'es819')
+    def test_expected_car_build(self):
+        self.assertEqual(H.expected_car_build('jdk25', '3015'), 'jdk25@3015')
+        self.assertEqual(H.expected_car_build('es819', ''), 'es819')
 
 
 if __name__ == '__main__':

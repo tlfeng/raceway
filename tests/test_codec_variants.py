@@ -7,7 +7,7 @@
 | 实现 | 文件 | 谁用 |
 |---|---|---|
 | bash | `vm-bench-lib.sh` 的 track_canonical / track_base / track_compression / track_source_reuse / track_engines | runner（起跑前 fail-fast）、prepare 脚本 |
-| python | `bench-history.py` 的同名函数 | 编排台（臂×变体兼容矩阵）、入库/覆盖判定 |
+| python | `bench-history.py` 的同名函数 | 编排台（车×变体兼容矩阵）、入库/覆盖判定 |
 
 两边**必须**给出同样的答案，否则会出现"编排台说能跑、runner 跑不了"，
 或者"覆盖判定把变体认错"—— 后者在压测里就是**结论不可信**。
@@ -190,13 +190,13 @@ class TestDatasetLabels(unittest.TestCase):
 
 
 class TestComposeCompat(unittest.TestCase):
-    """编排台的臂 × 变体兼容检查。"""
+    """编排台的车 × 变体兼容检查。"""
 
-    def test_es_arm_cannot_use_easysearch_only_variants(self):
+    def test_es_car_cannot_use_easysearch_only_variants(self):
         from collections import namedtuple
-        Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
-        es = Arm('es819', 'es819', 'elasticsearch', '', '', 'x')
-        ez = Arm('jdk25', 'jdk25', 'easysearch', '3015', '', 'x')
+        Car = namedtuple('Car', 'name label engine build jdk_dir config')
+        es = Car('es819', 'es819', 'elasticsearch', '', '', 'x')
+        ez = Car('jdk25', 'jdk25', 'easysearch', '3015', '', 'x')
         rows = [('es819', 'geo-codec-zstd-sr', 1), ('es819', 'geo-codec-def', 1),
                 ('jdk25', 'geo-codec-zstd-sr', 1)]
         bad = C.compat_problems([es, ez], rows)
@@ -205,17 +205,17 @@ class TestComposeCompat(unittest.TestCase):
 
     def test_common_variants_allow_both_engines(self):
         from collections import namedtuple
-        Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
-        es = Arm('es819', 'es819', 'elasticsearch', '', '', 'x')
-        ez = Arm('jdk25', 'jdk25', 'easysearch', '3015', '', 'x')
+        Car = namedtuple('Car', 'name label engine build jdk_dir config')
+        es = Car('es819', 'es819', 'elasticsearch', '', '', 'x')
+        ez = Car('jdk25', 'jdk25', 'easysearch', '3015', '', 'x')
         rows = [('es819', 'geo-codec-def', 1), ('jdk25', 'geo-codec-def', 1),
                 ('es819', 'geo-codec-bc', 1), ('jdk25', 'geo-codec-bc', 1)]
         self.assertEqual(C.compat_problems([es, ez], rows), [])
 
     def test_non_variant_tracks_have_no_constraint(self):
         from collections import namedtuple
-        Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
-        es = Arm('es819', 'es819', 'elasticsearch', '', '', 'x')
+        Car = namedtuple('Car', 'name label engine build jdk_dir config')
+        es = Car('es819', 'es819', 'elasticsearch', '', '', 'x')
         rows = [('es819', 'ds-j1024', 1), ('es819', 'nested', 1), ('es819', 'geo', 1)]
         self.assertEqual(C.compat_problems([es], rows), [])
 
@@ -224,7 +224,7 @@ class TestHistoryVariantDimension(unittest.TestCase):
     """覆盖判定必须按变体区分（否则 6 个变体的历史混成一格）。"""
 
     def _row(self, **kw):
-        d = {'campaign': 'c1', 'fid': 'x', 'arm': 'jdk25', 'arm_build': 'jdk25@3015',
+        d = {'campaign': 'c1', 'fid': 'x', 'car': 'jdk25', 'car_build': 'jdk25@3015',
              'track': 'geo', 'round': 1, 'status': 'VALID', 'quality': 'ok',
              'phase': 'w', '@timestamp': '2026-10-21T02:30:00Z'}
         d.update(kw)

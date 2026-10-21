@@ -6,10 +6,10 @@
 #
 # 配置文件（第 3 参数或 CONF= 环境变量）：每行一个配置，轮内按行序右旋配对交错——
 #   例（3 种配置 × 3 轮 = 9 场，r1: A,B,C / r2: C,A,B / r3: B,C,A）：
-#     ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 ARM_LABEL=ez3015
-#     ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt/jdks/tencentkona-25.0.4 ARM_LABEL=kona25
-#     ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ARM_LABEL=es819
-#   允许的键：ENGINE_NAME ENGINE_VERSION ENGINE_BUILD JDK_DIR ARM_LABEL JDK_WANT（见下）；
+#     ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=ez3015
+#     ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt/jdks/tencentkona-25.0.4 CAR_LABEL=kona25
+#     ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819
+#   允许的键：ENGINE_NAME ENGINE_VERSION ENGINE_BUILD JDK_DIR CAR_LABEL JDK_WANT（见下）；
 #   不写配置文件 = 单配置模式，沿用下面的顶层环境旋钮。
 #   模板见 scripts/campaign-configs.example.conf；DRY=1 或首参 --dry-run 只打印排程不执行
 #   断点续跑：RACES.md 里已 VALID 的场自动跳过（FRESH=1 强制全重跑）
@@ -21,11 +21,11 @@
 #   ENGINE_BUILD    可选，easysearch 的 build 号（默认 3015），拼进包名与版本串；
 #                   elasticsearch 没有 build 号，设了直接报错
 #
-# JDK 旋钮（用户自管变体，框架不做臂管理）：
+# JDK 旋钮（用户自管变体，框架不做车管理）：
 #   JDK_DIR   可选。虚机上已解压好的 JDK 目录；设置后每场前整目录换入 /infini/easysearch/jdk
 #             （首次换装自动归档自带 JDK 为 jdk.bundled，之后按 stamp 幂等；JDK_DIR 清空重跑
 #             即自动回切自带）。elasticsearch 用自带 JDK，不支持 JDK_DIR。
-#   ARM_LABEL 元数据标签（进 user-tags / sidecar / 场次名），默认 = JDK_DIR basename 或
+#   CAR_LABEL 元数据标签（进 user-tags / sidecar / 场次名），默认 = JDK_DIR basename 或
 #             engine 名+版本（如 easysearch-2.5.0-3015）；多配置时标签必须互不相同
 #   JDK_WANT  可选期望身份 "major|vendor"（如 "25|OpenJDK"），仅作 sidecar 元数据，无硬性卡点；
 #             逐节点实测 java -version 由 sidecar 自动落档（results/<fid>-<ph>-sidecar.json）
@@ -64,14 +64,14 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 # ds-*（维度扫描）赛道超时：≥1536 维写入给 14400s，其余 10800s；查询统一 5400s
 : "${TIMEOUT_DS_W:=10800}"; : "${TIMEOUT_DS_W_HI:=14400}"; : "${TIMEOUT_DS_Q:=5400}"
 
-# ---- 排程模式（SCHEDULE_FILE + ARMS_FILE）--------------------------------------
-# 用途：维度扫描这类"高维优先 + 窗底守卫"的固定排程，逐行指定 (臂, 赛道, 轮次, recall, est分钟)。
-#   SCHEDULE_FILE 每行: <臂名> <赛道> <轮次> <recall|norecall> <est分钟>
-#   ARMS_FILE     每行: <臂名> <配置行...>   （配置行语法同 CONF_FILE）
+# ---- 排程模式（SCHEDULE_FILE + CARS_FILE）--------------------------------------
+# 用途：维度扫描这类"高维优先 + 窗底守卫"的固定排程，逐行指定 (车, 赛道, 轮次, recall, est分钟)。
+#   SCHEDULE_FILE 每行: <车名> <赛道> <轮次> <recall|norecall> <est分钟>
+#   CARS_FILE     每行: <车名> <配置行...>   （配置行语法同 CONF_FILE）
 #   DS_HOURS      >0 时启用窗底守卫：放不下下一场就 DEADLINE-SKIP 并继续后面更便宜的场
 #   CAMP_ID       显式指定可复用同一 campaign 目录 → STATE.txt 断点续跑
 SCHEDULE_FILE=${SCHEDULE_FILE:-}
-ARMS_FILE=${ARMS_FILE:-}
+CARS_FILE=${CARS_FILE:-${ARMS_FILE:-}}   # 旧名 ARMS_FILE 仍认（改名前的排程命令照抄能用）
 DS_HOURS=${DS_HOURS:-0}
 CUR_RECALL=0
 
@@ -95,8 +95,8 @@ if [ "$WHAT" = list ]; then
   echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested codec both all ds"
   echo "配置模板: $(ls "$LIB_DIR"/campaign-configs.example.conf 2>/dev/null || echo scripts/campaign-configs.example.conf)"
   echo "近期 campaign（RACES.md 的 VALID/总场）:"
-  # 不限 jdk3-* 前缀：campaign 前缀已随臂族分化（jdk3/vm3/esrm/ds3/ds2/es819…），
-  # 只列 jdk3-* 会把 es819 臂批次、维度扫描批次整批漏掉。
+  # 不限 jdk3-* 前缀：campaign 前缀已随车族分化（jdk3/vm3/esrm/ds3/ds2/es819…），
+  # 只列 jdk3-* 会把 es819 车批次、维度扫描批次整批漏掉。
   for d in $(ls -dt "$RESULTS_ROOT"/*/ 2>/dev/null | head -8); do
     [ -f "$d/RACES.md" ] || continue
     v=$(grep -c "| VALID |" "$d/RACES.md"); t=$(grep -c "^| " "$d/RACES.md")
@@ -114,7 +114,7 @@ case "$WHAT" in
   nested) TRACKS=(nested);;
   codec) TRACKS=(geo-codec-def geo-codec-def-sr geo-codec-zstd geo-codec-zstd-sr geo-codec-bc geo-codec-bc-sr);;
            # geonames 一族的压缩×source_reuse 全套 6 变体
-           # 不兼容的（臂引擎 × 变体）在起跑时留痕跳过
+           # 不兼容的（车引擎 × 变体）在起跑时留痕跳过
   both) TRACKS=(geo hnsw);;
   all) TRACKS=(geo hnsw nested);;
   ds) TRACKS=(ds-g1920 ds-j2048 ds-j1024 ds-g960 ds-j768 ds-j512 ds-j1536);;
@@ -127,7 +127,7 @@ esac
 EZ_DIR="$IBS_BASE/easysearch"
 ES_DIR="$IBS_BASE/elasticsearch"
 
-resolve_engine() { # 依据 ENGINE_NAME/VERSION/BUILD/JDK_DIR/ARM_LABEL/JDK_WANT 解析派生值并校验
+resolve_engine() { # 依据 ENGINE_NAME/VERSION/BUILD/JDK_DIR/CAR_LABEL/JDK_WANT 解析派生值并校验
   ENGINE_NAME=$(printf '%s' "$ENGINE_NAME" | tr 'A-Z' 'a-z')
   case "$ENGINE_NAME" in
     easysearch)
@@ -144,11 +144,11 @@ resolve_engine() { # 依据 ENGINE_NAME/VERSION/BUILD/JDK_DIR/ARM_LABEL/JDK_WANT
   [ -s "$ENGINE_PKG" ] || die "缺安装包: $ENGINE_PKG（ENGINE_NAME=$ENGINE_NAME VERSION=$ENGINE_VERSION BUILD=$ENGINE_BUILD）"
   [ "$IS_ES" = 1 ] && [ -n "$JDK_DIR" ] && die "elasticsearch 用自带 JDK，不支持 JDK_DIR"
   # 标签：默认 JDK_DIR basename / 引擎身份；非法字符折叠为 -（进场次名与文件名）
-  if [ -z "$ARM_LABEL" ]; then
-    if [ -n "$JDK_DIR" ]; then ARM_LABEL=$(basename "$JDK_DIR"); else ARM_LABEL="${ENGINE_NAME}-${FULL_VER}"; fi
+  if [ -z "$CAR_LABEL" ]; then
+    if [ -n "$JDK_DIR" ]; then CAR_LABEL=$(basename "$JDK_DIR"); else CAR_LABEL="${ENGINE_NAME}-${FULL_VER}"; fi
   fi
-  ARM_LABEL=$(printf '%s' "$ARM_LABEL" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
-  [ -n "$ARM_LABEL" ] || die "ARM_LABEL 为空"
+  CAR_LABEL=$(printf '%s' "$CAR_LABEL" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+  [ -n "$CAR_LABEL" ] || die "CAR_LABEL 为空"
   # sidecar jdk-want 规范化为 "major|vendor"（缺 vendor 补空）
   JDK_WANT_ARG=""
   case "$JDK_WANT" in *\|*) JDK_WANT_ARG="$JDK_WANT";; "") ;; *) JDK_WANT_ARG="$JDK_WANT|";; esac
@@ -158,7 +158,7 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
   local line="$1"
   [ -n "$line" ] || return 0
   ENGINE_NAME=easysearch; ENGINE_VERSION=2.5.0; ENGINE_BUILD=""
-  JDK_DIR=""; JDK_WANT=""; ARM_LABEL=""
+  JDK_DIR=""; JDK_WANT=""; CAR_LABEL=""
   local tok k v
   for tok in $line; do
     k=${tok%%=*}; v=${tok#*=}
@@ -168,9 +168,10 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
       ENGINE_VERSION) ENGINE_VERSION=$v;;
       ENGINE_BUILD)   ENGINE_BUILD=$v;;
       JDK_DIR)        JDK_DIR=$v;;
-      ARM_LABEL)      ARM_LABEL=$v;;
+      CAR_LABEL)      CAR_LABEL=$v;;
+      ARM_LABEL)      CAR_LABEL=$v;;    # 旧名兼容：改名前的配置行用 ARM_LABEL
       JDK_WANT)       JDK_WANT=$v;;
-      *) die "配置行未知键: $k（允许: ENGINE_NAME ENGINE_VERSION ENGINE_BUILD JDK_DIR ARM_LABEL JDK_WANT）";;
+      *) die "配置行未知键: $k（允许: ENGINE_NAME ENGINE_VERSION ENGINE_BUILD JDK_DIR CAR_LABEL JDK_WANT）";;
     esac
   done
   resolve_engine
@@ -179,8 +180,8 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
 # 逐配置预校验（pkg 存在/es 约束/标签查重），并落 CONF_LABELS/CONF_PKGS 供日志与指纹
 declare -a CONF_LABELS CONF_PKGS
 if [ -n "${SCHEDULE_FILE:-}" ]; then
-  # 排程模式：配置在排程推进时逐条注册（见主流程），此处只校验臂定义文件存在
-  [ -s "$ARMS_FILE" ] || die "排程模式需要臂定义文件: ARMS_FILE=$ARMS_FILE"
+  # 排程模式：配置在排程推进时逐条注册（见主流程），此处只校验车定义文件存在
+  [ -s "$CARS_FILE" ] || die "排程模式需要车定义文件: CARS_FILE=$CARS_FILE"
   # CONFIGS 也必须清空：上面 else 分支留的单配置哨兵 ("") 还在，
   # 而 CONF_LABELS 是空的 → 写 PACKAGES.txt 时 "${CONF_LABELS[0]}"
   # 在 set -u 下直接报 unbound variable（起跑即崩，DRY 走不到这行所以发现不了）。
@@ -189,13 +190,13 @@ elif [ -n "${CONFIGS[0]:-}" ]; then
   _seen="|"
   for _ln in "${CONFIGS[@]}"; do
     apply_config "$_ln"
-    case "|$_seen|" in *"|$ARM_LABEL|"*) die "ARM_LABEL 重复: $ARM_LABEL（多配置时标签必须互不相同，否则场次名冲突）";; esac
-    _seen="$_seen$ARM_LABEL|"
-    CONF_LABELS+=("$ARM_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
+    case "|$_seen|" in *"|$CAR_LABEL|"*) die "CAR_LABEL 重复: $CAR_LABEL（多配置时标签必须互不相同，否则场次名冲突）";; esac
+    _seen="$_seen$CAR_LABEL|"
+    CONF_LABELS+=("$CAR_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
   done
 else
   resolve_engine
-  CONF_LABELS=("$ARM_LABEL"); CONF_PKGS=("$ENGINE_PKG")
+  CONF_LABELS=("$CAR_LABEL"); CONF_PKGS=("$ENGINE_PKG")
 fi
 
 # 轮内右旋（对配置索引；r1 原序，之后每轮右移一位——配对交错，摊薄时序效应）
@@ -206,36 +207,36 @@ order_for_round() { # <round> → 输出索引序列
   for i in $(seq 0 $((n-1))); do echo $(( (i - off + n) % n )); done
 }
 
-# 臂名 → 配置行（排程模式用；臂定义文件每行 "<臂名> <配置行...>"）
-arm_config() { # <臂名>
+# 车名 → 配置行（排程模式用；车定义文件每行 "<车名> <配置行...>"）
+car_config() { # <车名>
   local want="$1" name line
-  [ -f "${ARMS_FILE:-}" ] || return 0
+  [ -f "${CARS_FILE:-}" ] || return 0
   while read -r name line; do
     [ -n "${name:-}" ] || continue
     case "$name" in '#'*) continue;; esac
     if [ "$name" = "$want" ]; then printf '%s' "$line"; return 0; fi
-  done < "$ARMS_FILE"
+  done < "$CARS_FILE"
   return 0
 }
 
 # 排程模式：这一轮会用到的**所有**安装包（引擎包 + 用户自管 JDK 包 + 修补版 agent）。
 # 排程是推进时逐条注册配置的，起跑那一刻还不知道将来用哪些包；
-# 但臂定义文件是静态的，按它把包全列出来才有可回溯性（对齐 ds3 的 PACKAGES.txt 口径）。
+# 但车定义文件是静态的，按它把包全列出来才有可回溯性（对齐 ds3 的 PACKAGES.txt 口径）。
 schedule_packages() {
-  local arm cfg
-  while read -r arm cfg; do
-    [ -n "${arm:-}" ] || continue
-    case "$arm" in '#'*) continue;; esac
+  local car cfg
+  while read -r car cfg; do
+    [ -n "${car:-}" ] || continue
+    case "$car" in '#'*) continue;; esac
     # 用子 shell 调 apply_config：复用真正的包名解析逻辑（resolve_engine），
-    # 又不污染当前进程的 ENGINE_*/ARM_LABEL
+    # 又不污染当前进程的 ENGINE_*/CAR_LABEL
     ( apply_config "$cfg" >/dev/null 2>&1
       [ -n "${ENGINE_PKG:-}" ] && printf '%s\n' "$ENGINE_PKG"
       case "${JDK_DIR:-}" in
         */jdk-26) printf '%s\n' "$PKG_DIR/openjdk-26_linux-x64_bin.tar.gz";;
         */jdk-27) printf '%s\n' "$PKG_DIR/openjdk-27_linux-x64_bin.tar.gz";;
       esac )
-  done < "$ARMS_FILE"
-  # 修补版 agent（JDK 26/27 臂会把它换进引擎目录）
+  done < "$CARS_FILE"
+  # 修补版 agent（JDK 26/27 车会把它换进引擎目录）
   [ -f "$ROOT/dsfix/agent-patched-1.18.15.jar" ] && printf '%s\n' "$ROOT/dsfix/agent-patched-1.18.15.jar"
   [ -f "$PKG_DIR/agent-patched-1.18.15.jar" ] && printf '%s\n' "$PKG_DIR/agent-patched-1.18.15.jar"
   return 0
@@ -249,24 +250,24 @@ schedule_lines() {
   sed 's/#.*//' "$SCHEDULE_FILE" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
 }
 
-# 臂定义行 → 引擎名（只读，不 apply_config，不改任何状态）
-arm_engine() { printf '%s' "$1" | grep -o 'ENGINE_NAME=[^ ]*' | cut -d= -f2 | tr 'A-Z' 'a-z'; }
+# 车定义行 → 引擎名（只读，不 apply_config，不改任何状态）
+car_engine() { printf '%s' "$1" | grep -o 'ENGINE_NAME=[^ ]*' | cut -d= -f2 | tr 'A-Z' 'a-z'; }
 
-# 排程起跑前复核「臂的引擎 × 变体」兼容性 —— fail-fast。
+# 排程起跑前复核「车的引擎 × 变体」兼容性 —— fail-fast。
 # 为什么要拦：ZSTD / index.source_reuse 是 Easysearch 专有设置，ES 上 create-index
 # 直接拒（unknown setting）。不拦的话要等建索引那一步才炸，白烧一台机器的建库时间。
 # 排程模式是用户**逐行写死**的组合 → 有不兼容就 die（在 campaign 起跑前）。
 check_track_engine_compat() {
-  local arm tk rnd dr est cfg eng allow bad=0
-  while read -r arm tk rnd dr est; do
-    [ -n "$arm" ] || continue
+  local car tk rnd dr est cfg eng allow bad=0
+  while read -r car tk rnd dr est; do
+    [ -n "$car" ] || continue
     allow=$(track_engines "$tk")
     [ -n "$allow" ] || continue
-    cfg=$(arm_config "$arm")
-    eng=$(arm_engine "$cfg")
+    cfg=$(car_config "$car")
+    eng=$(car_engine "$cfg")
     [ -n "$eng" ] || continue
     if [ "$eng" != "$allow" ]; then
-      echo "  不兼容: 臂 $arm（引擎 $eng）× 变体 $tk（该变体只支持 $allow）" >&2
+      echo "  不兼容: 车 $car（引擎 $eng）× 变体 $tk（该变体只支持 $allow）" >&2
       bad=1
     fi
   done < <(schedule_lines)
@@ -279,24 +280,24 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   echo "== DRY RUN 排程（不执行任何操作） =="
   if [ -n "${SCHEDULE_FILE:-}" ]; then
     echo "排程模式: SCHEDULE_FILE=$SCHEDULE_FILE"
-    echo "臂定义:   ARMS_FILE=$ARMS_FILE"
+    echo "车定义:   CARS_FILE=$CARS_FILE"
     [ "${DS_HOURS:-0}" -gt 0 ] && echo "窗底守卫: ${DS_HOURS}h（窗底留 20min 余量）"
     # 引擎 × 变体兼容性先查：ZSTD / source_reuse 是 Easysearch 专有，ES 上
     # create-index 会拒。dry-run 就报出来，别等真跑起来才炸。
     check_track_engine_compat
-    echo "| # | 臂 | 赛道 | 轮 | recall | est(min) | 引擎身份 |"
+    echo "| # | 车 | 赛道 | 轮 | recall | est(min) | 引擎身份 |"
     echo "|---|---|---|---|---|---|---|"
     n=0
-    while read -r arm tk rnd do_recall est; do
-      [ -n "$arm" ] || continue
+    while read -r car tk rnd do_recall est; do
+      [ -n "$car" ] || continue
       n=$((n+1))
-      _c=$(arm_config "$arm")
+      _c=$(car_config "$car")
       if [ -z "$_c" ]; then
-        printf "| %d | %s | %s | %s | %s | %s | **臂未定义** |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}"
+        printf "| %d | %s | %s | %s | %s | %s | **车未定义** |\n" "$n" "$car" "$tk" "$rnd" "$do_recall" "${est:-?}"
         continue
       fi
       apply_config "$_c"
-      printf "| %d | %s | %s | %s | %s | %s | %s %s (%s) |\n" "$n" "$arm" "$tk" "$rnd" "$do_recall" "${est:-?}" "$ENGINE_NAME" "$FULL_VER" "$ARM_LABEL"
+      printf "| %d | %s | %s | %s | %s | %s | %s %s (%s) |\n" "$n" "$car" "$tk" "$rnd" "$do_recall" "${est:-?}" "$ENGINE_NAME" "$FULL_VER" "$CAR_LABEL"
     done < <(schedule_lines)
     echo "共 $n 场。DRY=1/--dry-run 不会创建 campaign、不会触碰集群。"
     exit 0
@@ -310,7 +311,7 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
       for idx in $(order_for_round "$r"); do
         n=$((n+1))
         apply_config "${CONFIGS[$idx]}"
-        printf "| %d | %s | %s %s | %s | r%d |\n" "$n" "$ARM_LABEL" "$ENGINE_NAME" "$FULL_VER" "$tk" "$r"
+        printf "| %d | %s | %s %s | %s | r%d |\n" "$n" "$CAR_LABEL" "$ENGINE_NAME" "$FULL_VER" "$tk" "$r"
       done
     done
   done
@@ -319,7 +320,7 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
 fi
 
 # campaign 名前缀默认沿用 jdk3（历史惯例）；可用 CAMP_PREFIX 覆盖，
-# 让臂名进 campaign 维度——es819 的批次不该叫 jdk3-*（按批次过滤时看板上会认错臂）
+# 让车名进 campaign 维度——es819 的批次不该叫 jdk3-*（按批次过滤时看板上会认错车）
 # CAMP_ID 显式指定 = 复用同一 campaign 目录 → STATE.txt 断点续跑（排程模式用）
 CAMP_ID="${CAMP_ID:-${CAMP_PREFIX:-jdk3}-$(date +%Y%m%d-%H%M%S)}"
 CAMP_DIR="$RESULTS_ROOT/$CAMP_ID"
@@ -431,7 +432,7 @@ ensure_engine() { # <engine>
 # ---------- JDK 就位（用户自管：JDK_DIR=虚机上的目录；空=回 bundle 自带） --------
 # 首次换装自动把当前 JDK 归档为 jdk.bundled（旧版归档 jdk.bundled-25 复用）；按
 # jdk.path.stamp 幂等跳过；java -version 校验失败回退 jdk.old。不设硬性卡点——身份
-# 元数据 = ARM_LABEL + sidecar 逐节点实测 java -version（results/<fid>-<ph>-sidecar.json）。
+# 元数据 = CAR_LABEL + sidecar 逐节点实测 java -version（results/<fid>-<ph>-sidecar.json）。
 ensure_jdk() {
   local ip dir="$EZ_DIR" arch want
   [ "$IS_ES" = 1 ] && return 0                 # ES 用自带 JDK
@@ -701,7 +702,7 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
     "https://${VM_IPS[0]}:$HTTP_PORT/$sidx/_settings?flat_settings=true" > "$d/index-settings.txt" 2>&1 || true
   python3 "$LIB_DIR/bench-sidecar.py" --raw "$d" --out "$CAMP_DIR/results/$fid-$ph-sidecar.json" \
     --campaign "$CAMP_ID" --fid "$fid" --phase "$ph" --race-id "$LAST_RACE_ID" \
-    --arm "$ARM_LABEL" --track "$tk" --challenge "$ch" --round "$rnd" --attempt "$att" \
+    --car "$CAR_LABEL" --track "$tk" --challenge "$ch" --round "$rnd" --attempt "$att" \
     --track-dir "$tdir" --track-params "$tpar" --heap "$HEAP" --cores "${EXPECT_CPU_CORES:-}" \
     --pkg "$ENGINE_PKG" --jdk-want "$JDK_WANT_ARG" \
     --env-id "$ENV_ID" \
@@ -731,8 +732,8 @@ recall_probe() { # <fid> <track_dir> <track_key>
   done
 }
 
-# ---------- JDK 26/27 臂：场前无条件推送修补组合 + JDK 身份断言 -------------------
-# 为什么每场都要推：easysearch 重装/切臂会把 config/jvm.options 与 lib 下的
+# ---------- JDK 26/27 车：场前无条件推送修补组合 + JDK 身份断言 -------------------
+# 为什么每场都要推：easysearch 重装/切车会把 config/jvm.options 与 lib 下的
 # security agent 还原成发行版原版（原版 agent 1.18.8 不支持 Java 25+，
 # 原版 jvm.options 的 javaagent 作用域只到 21），不推就等于没修。
 #
@@ -748,11 +749,11 @@ recall_probe() { # <fid> <track_dir> <track_key>
 #   JVM 直接拒绝启动：
 #     "VM option 'UseJVMCICompiler' is experimental and must be enabled via
 #      -XX:+UnlockExperimentalVMOptions. The unlock option must precede 'UseJVMCICompiler'."
-#   （GraalVM 25 不把它当实验选项，jdk25 臂因此侥幸没炸，换 OpenJDK 26/27 就 3 节点全灭。）
+#   （GraalVM 25 不把它当实验选项，jdk25 车因此侥幸没炸，换 OpenJDK 26/27 就 3 节点全灭。）
 #   所以追加块必须自带完整三连：解锁 → 关 → 重新锁上。
 #   第二个坑：作用域必须止于 26。OpenJDK 27 已经移除了 UseJVMCICompiler 选项，
 #   作用域带上 27 会让 JDK 27 直接报 "Unrecognized VM option 'UseJVMCICompiler'"。
-#   JDK 27 里没有 JVMCI 这个概念，不去动它等价于「JVMCI 关」，三臂口径一致。
+#   JDK 27 里没有 JVMCI 这个概念，不去动它等价于「JVMCI 关」，三车口径一致。
 jdk_fix_apply() { # <目标 JDK 主版本号>
   local major="${1:-25}"
   [ "$ENGINE_NAME" = easysearch ] || return 0
@@ -763,7 +764,7 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
   # JVMCI 作用域固定止于 26（不跟随目标主版本）：OpenJDK 27 已移除 UseJVMCICompiler，
   #   作用域带上 27 会让 JDK 27 直接报 "Unrecognized VM option 'UseJVMCICompiler'"。
   #   JDK 27 里压根没有 JVMCI 这个概念，行为上与「JVMCI 关」等价，
-  #   所以三个臂（GraalVM25 / OpenJDK26 / OpenJDK27）的向量加速路径保持一致。
+  #   所以三个车（GraalVM25 / OpenJDK26 / OpenJDK27）的向量加速路径保持一致。
   local jci_hi=26
   local ip
   for ip in "${VM_IPS[@]}"; do
@@ -807,7 +808,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local idx="$1" tk="$2" rnd="$3" seq="$4" att="${5:-1}"
   apply_config "${CONFIGS[$idx]}"     # 换到本场的配置（引擎/JDK/标签）
   local eng="$ENGINE_NAME"
-  local fid="${ARM_LABEL}-${tk}-r${rnd}"
+  local fid="${CAR_LABEL}-${tk}-r${rnd}"
   [ "$att" -gt 1 ] && fid="${fid}-try${att}"
   local track; track=$(track_dir "$tk")
   local idx; idx=$(track_index "$tk")
@@ -842,7 +843,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     echo "| $fid | JDK-SWAP-FAIL | precheck=$PCTAG | $(( $(date +%s) - t0 ))s |" >> "$RACES"
     PROGSTEP "[$seq] $fid JDK-SWAP-FAIL"; return 1
   fi
-  # 2b) JDK 26/27 臂：场前推送修补组合（jvm.options 作用域 + 修补版 agent）并断言 JDK 身份。
+  # 2b) JDK 26/27 车：场前推送修补组合（jvm.options 作用域 + 修补版 agent）并断言 JDK 身份。
   #     放在 ensure_jdk 之后、ibs wipe 之前 —— wipe 会重启服务，配置必须先落盘。
   if [ "$eng" = easysearch ]; then
     local jmajor=25
@@ -881,7 +882,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   timeout "$(track_tmo_w "$tk")" "$RALLY" race --pipeline=benchmark-only \
     --target-hosts="$HOSTS" --track-path="$track" --challenge=write-only \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-    --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,arm:$ARM_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$ARM_LABEL${ctag}${cdc}" \
+    --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,arm:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
     --report-format=markdown --report-file="$wrep" > "$wlog" 2>&1 || rc=$?
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid write race FAILED rc=$rc（尾部: $(tail -2 "$wlog" | head -1)）"
   capture_race_json "$fid" w "$wlog"
@@ -904,7 +905,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     timeout "$(track_tmo_q "$tk")" "$RALLY" race --pipeline=benchmark-only \
       --target-hosts="$HOSTS" --track-path="$track" --challenge=query-only \
       ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,arm:$ARM_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$ARM_LABEL${ctag}${cdc}" \
+      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,arm:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
       --report-format=markdown --report-file="$qrep" > "$qlog" 2>&1 || rcq=$?
     [ $rcq -ne 0 ] && PROGSTEP "[$seq] $fid query race FAILED rc=$rcq"
     capture_race_json "$fid" q "$qlog"
@@ -987,9 +988,9 @@ PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_C
 {
   echo "campaign: $CAMP_ID"
   if [ -n "${SCHEDULE_FILE:-}" ]; then
-    # 排程模式：整份排程内联存档 + 所有臂的包指纹（ds3 的 PACKAGES.txt 就是这个口径）
+    # 排程模式：整份排程内联存档 + 所有车的包指纹（ds3 的 PACKAGES.txt 就是这个口径）
     echo "schedule: $(schedule_lines | tr '\n' ' ')"
-    echo "arms: $ARMS_FILE"
+    echo "cars: $CARS_FILE"
     schedule_packages | sort -u | while read -r _p; do
       [ -f "$_p" ] && sha256sum "$_p" 2>/dev/null
     done
@@ -1009,8 +1010,8 @@ env_fingerprint_raw    # bench-env 台账源（静态部分，每场 sidecar 引
 # 排程模式：赛道集合从排程文件里收集（prepare/校验按这个集合走）
 if [ -n "${SCHEDULE_FILE:-}" ]; then
   TRACKS=()
-  while read -r arm tk rnd do_recall est; do
-    [ -n "$arm" ] || continue
+  while read -r car tk rnd do_recall est; do
+    [ -n "$car" ] || continue
     case " ${TRACKS[*]} " in *" $tk "*) ;; *) TRACKS+=("$tk");; esac
   done < <(schedule_lines)
   PROGSTEP "排程赛道集合: ${TRACKS[*]}"
@@ -1060,46 +1061,46 @@ case " ${TRACKS[*]} " in *ds-*)
 
 total=0; okcnt=0; seqn=0
 if [ -n "${SCHEDULE_FILE:-}" ]; then
-  # ---- 排程模式：逐行 (臂, 赛道, 轮次, recall, est分钟)，高维优先 + 窗底守卫 ----
+  # ---- 排程模式：逐行 (车, 赛道, 轮次, recall, est分钟)，高维优先 + 窗底守卫 ----
   DEADLINE=0
   if [ "${DS_HOURS:-0}" -gt 0 ]; then
     DEADLINE=$(( $(date +%s) + DS_HOURS*3600 - 1200 ))   # 窗底留 20min 余量
     PROGSTEP "窗底守卫: ${DS_HOURS}h（截止 $(date -d "@$DEADLINE" '+%F %T') 之前放不下的场次 DEADLINE-SKIP）"
   fi
   [ -f "$STATE" ] || : > "$STATE"
-  PROGSTEP "排程模式: $SCHEDULE_FILE（臂定义 $ARMS_FILE）"
+  PROGSTEP "排程模式: $SCHEDULE_FILE（车定义 $CARS_FILE）"
   # ⚠️ 排程输入必须挂到**独立 FD**：循环体里的子命令（ssh / ibs / rally / tar …）
   # 全部继承 stdin，而 `while read ... done < <(schedule_lines)` 的 stdin 就是排程管道。
   # 任何一个子命令读一下 stdin，后面还没跑的排程行就被它吃干净了 ——
   # 实测 24 场只跑了第 1 场：跑完第 1 场后第 2 次 read 立刻 EOF，循环直接收尾。
   # 修法：排程从 FD 3 读，循环体用 read -u 3；子命令的 stdin 与排程彻底隔离。
   exec 3< <(schedule_lines)
-  while read -r -u 3 arm tk rnd do_recall est; do
-    [ -n "$arm" ] || continue
+  while read -r -u 3 car tk rnd do_recall est; do
+    [ -n "$car" ] || continue
     seqn=$((seqn+1))
     # 断点续跑：STATE 里已有 OK 的场次直接跳过
     if grep -qx "OK $seqn" "$STATE" 2>/dev/null; then
-      PROGSTEP "[$seqn] $arm-$tk-r$rnd 跳过（STATE 已有 OK $seqn）"
+      PROGSTEP "[$seqn] $car-$tk-r$rnd 跳过（STATE 已有 OK $seqn）"
       continue
     fi
     # 窗底守卫：这一场放不下就跳过，继续后面更便宜的场（保证高价值数据先落袋）
     if [ "$DEADLINE" -gt 0 ]; then
       _now=$(date +%s)
       if [ $(( _now + ${est:-0}*60 )) -gt "$DEADLINE" ]; then
-        PROGSTEP "[$seqn] $arm-$tk-r$rnd DEADLINE-SKIP（est=${est}min，距窗底放不下）"
+        PROGSTEP "[$seqn] $car-$tk-r$rnd DEADLINE-SKIP（est=${est}min，距窗底放不下）"
         echo "SKIP $seqn" >> "$STATE"
         continue
       fi
     fi
-    # 臂 → 配置行
-    _cfg=$(arm_config "$arm")
-    [ -n "$_cfg" ] || die "排程里的臂未在 $ARMS_FILE 定义: $arm"
+    # 车 → 配置行
+    _cfg=$(car_config "$car")
+    [ -n "$_cfg" ] || die "排程里的车未在 $CARS_FILE 定义: $car"
     _ci=${#CONFIGS[@]}
     CONFIGS+=("$_cfg")
     apply_config "$_cfg"
-    CONF_LABELS+=("$ARM_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
+    CONF_LABELS+=("$CAR_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
     CUR_RECALL=0; [ "$do_recall" = "recall" ] && CUR_RECALL=1
-    PROGSTEP "[$seqn] 排程: $arm → $tk r$rnd（臂标签 $ARM_LABEL，recall=$do_recall，est=${est}min）"
+    PROGSTEP "[$seqn] 排程: $car → $tk r$rnd（车标签 $CAR_LABEL，recall=$do_recall，est=${est}min）"
     if run_field_with_retry "$_ci" "$tk" "$rnd" "$seqn"; then
       okcnt=$((okcnt+1)); echo "OK $seqn" >> "$STATE"
     else
@@ -1117,7 +1118,7 @@ else
         # 不计入 total，不白跑一场再失败）。排程模式是逐行写死的，那里直接 die。
         _allow=$(track_engines "$tk")
         if [ -n "$_allow" ]; then
-          _eng=$(arm_engine "${CONFIGS[$idx]:-}")
+          _eng=$(car_engine "${CONFIGS[$idx]:-}")
           if [ -n "$_eng" ] && [ "$_eng" != "$_allow" ]; then
             PROGSTEP "[$seqn] ${CONF_LABELS[$idx]:-?}-$tk-r$r 跳过（引擎 $_eng 不支持该变体，该变体只支持 $_allow）"
             continue

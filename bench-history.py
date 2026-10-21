@@ -5,20 +5,20 @@
 为什么需要它
 ------------
 编排台（bench-compose）只会排新活：矩阵勾什么就排什么，**不知道哪些格已经跑过**。
-指标库里躺着几百行 bench-run（三十多个 campaign、上百个 臂×赛道×轮次 组合），
+指标库里躺着几百行 bench-run（三十多个 campaign、上百个 车×赛道×轮次 组合），
 用户却要在编排界面里凭记忆避开已做过的组合 —— 结果要么重复跑已经跑过的场次
 （白烧几小时机器，还把轮间时序摊薄的前提搞脏），要么漏掉没跑的那一格。
 
 本模块把指标库 bench-run 索引读成一张**覆盖表**：
 
-    一格 = (臂 arm, 赛道 track, 轮次 round)
+    一格 = (车 car, 赛道 track, 轮次 round)
 
 每格记着：跑过几遍、什么判定、哪个 build、来自哪个 campaign、什么时候。
 
 三个必须守住的口径
 ------------------
 1. **build 隔离**：jdk25@3009 跑过 ≠ jdk25@3015 跑过。跨 build 混线会让结论被
-   误读（make_dashboard 就是为此按 arm_build 分线的）。覆盖判定必须带 build，
+   误读（make_dashboard 就是为此按 car_build 分线的）。覆盖判定必须带 build，
    否则"已跑过"会把不同引擎版本的数据当成同一格。
 2. **一场次两行**：写赛/查赛各一行（phase=w / q）。一场次要算"跑过"，两个相位
    都得判 VALID；只有写赛 VALID 而查赛没跑的，是**半场**，仍需重跑。
@@ -36,7 +36,7 @@ basic auth 的口令走 **stdin**（curl --config -），不出现在任何进�
     from bench_history import fetch_coverage, plan_cells
     cov = fetch_coverage(ssh='root@203.0.113.10', auth='admin:xxx')
     cov.cells[('jdk25', 'ds-j1024', 1)].verdict     # 'VALID'
-    plan_cells(cov, arms, tracks, rounds)           # 编排矩阵里哪些格该排
+    plan_cells(cov, cars, tracks, rounds)           # 编排矩阵里哪些格该排
 """
 import base64
 import json
@@ -45,6 +45,18 @@ import ssl
 import subprocess
 import urllib.request
 from dataclasses import dataclass, field, asdict
+
+import importlib
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    car_label_mod = importlib.import_module('car_label')
+except ImportError:                                                    # 从别处 import 本文件时
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    car_label_mod = importlib.import_module('car_label')
+car_of = car_label_mod.car_of      # 文档里的车身份（兼容改名前的文档）
 
 INDEX = 'bench-run'
 DEFAULT_ES_URL = 'https://127.0.0.1:9237'
@@ -57,7 +69,7 @@ PAGE_SIZE = 2000
 #   track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
 #   codec 相同，靠 codec 分不出，只能靠目录名）
 #   codec / source_reuse = 压缩与复用的两个独立维度
-_SOURCE_FIELDS = ['campaign', 'fid', 'arm', 'arm_build', 'engine', 'engine_build',
+_SOURCE_FIELDS = ['campaign', 'fid', 'car', 'arm', 'car_build', 'engine', 'engine_build',
                   'build', 'track', 'track_raw', 'round', 'status', 'quality', 'phase',
                   '@timestamp', 'caliber_warnings', 'jdk', 'dims', 'pkg',
                   'challenge', 'codec', 'source_reuse']
@@ -98,7 +110,7 @@ class HistoryUnavailable(Exception):
 #     gzstd 实为 geo-codec-zstd-sr —— 历史名不改，免得旧 campaign 场次名漂移
 #
 # 为什么覆盖判定必须带变体：库里 track 字段是**基础赛道**（"geo"/"hnsw"/…），
-# 压缩与 source_reuse 是另外两个维度。若覆盖键只用 (臂, 赛道, 轮次)，6 个变体的
+# 压缩与 source_reuse 是另外两个维度。若覆盖键只用 (车, 赛道, 轮次)，6 个变体的
 # 历史会混成一格 —— "ZSTD+sr 跑过"会被当成"default 也跑过"，把没跑的格误判成已覆盖。
 CODEC_TOKEN = {'default': 'def', 'ZSTD': 'zstd', 'best_compression': 'bc'}
 TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
@@ -314,7 +326,7 @@ def _verdict_of(rows):
 
 @dataclass
 class Cell:
-    """一个 (臂, **变体**, 轮次) 格的覆盖情况。
+    """一个 (车, **变体**, 轮次) 格的覆盖情况。
 
     变体 id = <基础赛道>-codec-<压缩>[-sr]；没有压缩的场次就是基础赛道本身。
     （库里 track 字段是基础赛道，压缩与 source_reuse 是另外两个维度 ——
@@ -325,7 +337,7 @@ class Cell:
     对 3015 而言这一格是"跑过"，对 3009 而言是"没跑过"。把两个 build 的行
     混在一起取最坏判定，会把后来成功的重跑也一起抹掉。
     """
-    arm: str
+    car: str
     track: str
     round: int
     rows: list = field(default_factory=list)
@@ -357,7 +369,7 @@ class Cell:
 
     @property
     def key(self):
-        return (self.arm, self.track, self.round)
+        return (self.car, self.track, self.round)
 
     @property
     def base(self):
@@ -366,23 +378,23 @@ class Cell:
 
     @property
     def builds(self):
-        return sorted({(r.get('arm_build') or r.get('arm') or '') for r in self.rows})
+        return sorted({(r.get('car_build') or car_of(r) or '') for r in self.rows})
 
-    def rows_for(self, arm_build):
-        """某个 build 上的行。没有 build 号的臂按臂名匹配。"""
+    def rows_for(self, car_build):
+        """某个 build 上的行。没有 build 号的车按车名匹配。"""
         return [r for r in self.rows
-                if (r.get('arm_build') or r.get('arm') or '') == arm_build]
+                if (r.get('car_build') or car_of(r) or '') == car_build]
 
-    def verdict_for(self, arm_build):
+    def verdict_for(self, car_build):
         """该 build 上的判定（最坏）。"""
-        rows = self.rows_for(arm_build)
+        rows = self.rows_for(car_build)
         if not rows:
             return VERDICT_UNKNOWN
         return _verdict_of(rows)
 
-    def covered_for(self, arm_build):
+    def covered_for(self, car_build):
         """该 build 上能不能算"已经跑过、结论可用"。"""
-        return self.verdict_for(arm_build) in (VERDICT_VALID, VERDICT_DEGRADED)
+        return self.verdict_for(car_build) in (VERDICT_VALID, VERDICT_DEGRADED)
 
     @property
     def verdict(self):
@@ -450,16 +462,16 @@ class Cell:
 @dataclass
 class Coverage:
     """覆盖表。"""
-    cells: dict = field(default_factory=dict)       # (arm, track, round) -> Cell
+    cells: dict = field(default_factory=dict)       # (car, track, round) -> Cell
     total_rows: int = 0
     campaigns: list = field(default_factory=list)
     tracks: list = field(default_factory=list)
-    arms: list = field(default_factory=list)
+    cars: list = field(default_factory=list)
     available: bool = True
     error: str = ''
 
-    def get(self, arm, track, rnd):
-        return self.cells.get((arm, track, rnd))
+    def get(self, car, track, rnd):
+        return self.cells.get((car, track, rnd))
 
     def summary(self):
         by_verdict = {}
@@ -470,7 +482,7 @@ class Coverage:
             'races': len(self.cells),
             'campaigns': len(self.campaigns),
             'tracks': len(self.tracks),
-            'arms': len(self.arms),
+            'cars': len(self.cars),
             'by_verdict': by_verdict,
         }
 
@@ -481,7 +493,7 @@ class Coverage:
             'summary': self.summary(),
             'campaigns': self.campaigns,
             'tracks': self.tracks,
-            'arms': self.arms,
+            'cars': self.cars,
             'cells': {'|'.join(str(x) for x in k): c.to_dict()
                       for k, c in self.cells.items()},
         }
@@ -490,9 +502,9 @@ class Coverage:
 def build_coverage(rows, total=None):
     """把 bench-run 的行折叠成覆盖表。"""
     cov = Coverage(total_rows=total if total is not None else len(rows))
-    camps, tracks, arms = set(), set(), set()
+    camps, tracks, cars = set(), set(), set()
     for r in rows:
-        arm = r.get('arm') or ''
+        car = r.get('car') or ''
         track = r.get('track') or ''
         rnd = r.get('round')
         if rnd is None:
@@ -501,23 +513,23 @@ def build_coverage(rows, total=None):
             rnd = int(rnd)
         except (TypeError, ValueError):
             rnd = 0
-        if not arm or not track:
+        if not car or not track:
             continue
         # 变体身份按 track_raw（目录名）判定；压缩/sr 是另外两个维度
         vid = variant_id_of(r)
         comp, sr = split_codec(r.get('codec'), r.get('source_reuse'))
-        key = (arm, vid, rnd)
+        key = (car, vid, rnd)
         cell = cov.cells.get(key)
         if cell is None:
-            cell = Cell(arm=arm, track=vid, round=rnd)
+            cell = Cell(car=car, track=vid, round=rnd)
             cov.cells[key] = cell
         cell.add(r)
         camps.add(r.get('campaign') or '')
         tracks.add(track)
-        arms.add(arm)
+        cars.add(car)
     cov.campaigns = sorted(c for c in camps if c)
     cov.tracks = sorted(tracks)
-    cov.arms = sorted(arms)
+    cov.cars = sorted(cars)
     return cov
 
 
@@ -539,49 +551,49 @@ def fetch_coverage(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
 
 
 # ------------------------------------------------------------------ 编排用
-def expected_arm_build(arm, build):
-    """该臂在当前 build 下的 arm_build 标识。
+def expected_car_build(car, build):
+    """该车在当前 build 下的 car_build 标识。
 
-    easysearch 臂的 arm_build 是 `arm@build`（如 jdk25@3015）；
-    elasticsearch 臂没有 build 号，arm_build 就是臂名本身（如 es819）。
+    easysearch 车的 car_build 是 `car@build`（如 jdk25@3015）；
+    elasticsearch 车没有 build 号，car_build 就是车名本身（如 es819）。
     """
     if not build:
-        return arm
-    return '%s@%s' % (arm, build)
+        return car
+    return '%s@%s' % (car, build)
 
 
-def plan_cells(coverage, arms, tracks, rounds, build_of=None, include_covered=False):
+def plan_cells(coverage, cars, tracks, rounds, build_of=None, include_covered=False):
     """算出编排矩阵里每一格该不该排。
 
-    arms: [{'name':..., 'build':...}, ...] 或 [(name, build), ...]
-    build_of: {臂名: build}，缺省视为不区分 build
+    cars: [{'name':..., 'build':...}, ...] 或 [(name, build), ...]
+    build_of: {车名: build}，缺省视为不区分 build
     include_covered=True 时不做任何剔除（用户明确要重跑）
 
     返回 {'cells': [...], 'to_run': [...], 'skipped': [...], 'notes': [...]}
-    每格：{arm, track, round, covered, same_build, verdict, builds, campaigns,
+    每格：{car, track, round, covered, same_build, verdict, builds, campaigns,
            reason}
     """
     build_of = build_of or {}
     cells = []
-    for arm_spec in arms:
-        # 臂的描述有三种形态：dict、Arm 命名元组、(name, build) 二元组。
+    for car_spec in cars:
+        # 车的描述有三种形态：dict、Car 命名元组、(name, build) 二元组。
         # 注意别把命名元组当二元组解包 —— 第二个字段是 label，不是 build。
-        if isinstance(arm_spec, dict):
-            aname = arm_spec.get('name') or ''
-            build = arm_spec.get('build') or ''
-        elif hasattr(arm_spec, 'build'):
-            aname = getattr(arm_spec, 'name', '')
-            build = getattr(arm_spec, 'build', '') or ''
+        if isinstance(car_spec, dict):
+            aname = car_spec.get('name') or ''
+            build = car_spec.get('build') or ''
+        elif hasattr(car_spec, 'build'):
+            aname = getattr(car_spec, 'name', '')
+            build = getattr(car_spec, 'build', '') or ''
         else:
-            aname = arm_spec[0]
-            build = arm_spec[1] if len(arm_spec) > 1 else ''
+            aname = car_spec[0]
+            build = car_spec[1] if len(car_spec) > 1 else ''
         build = build or build_of.get(aname) or ''
-        want = expected_arm_build(aname, build)
+        want = expected_car_build(aname, build)
         for tk in tracks:
             for rnd in range(1, int(rounds) + 1):
                 cell = coverage.get(aname, tk, rnd) if coverage.available else None
                 info = {
-                    'arm': aname, 'track': tk, 'round': rnd,
+                    'car': aname, 'track': tk, 'round': rnd,
                     'covered': False, 'same_build': False,
                     'verdict': '', 'verdict_same_build': '',
                     'builds': [], 'campaigns': [], 'runs': 0,
@@ -614,9 +626,9 @@ def plan_cells(coverage, arms, tracks, rounds, build_of=None, include_covered=Fa
                     detail = '，'.join('%s=%s' % (b, per[b]['verdict'])
                                        for b in info['builds'])
                     if not build:
-                        # 臂没带 build 信息 → 无从判断是否同 build。这种情况
+                        # 车没带 build 信息 → 无从判断是否同 build。这种情况
                         # 必须说出来，不能当成"已跑过"也不能当成"没跑过"。
-                        info['reason'] = ('有记录（%s）但该臂没有 build 信息，'
+                        info['reason'] = ('有记录（%s）但该车没有 build 信息，'
                                           '无法判定是否同一 build → 需人工确认' % detail)
                     else:
                         info['reason'] = '只有别的 build 跑过（%s），当前 build %s 仍需跑' % (
@@ -638,8 +650,8 @@ def plan_cells(coverage, arms, tracks, rounds, build_of=None, include_covered=Fa
 
 
 def filter_rows(plan, rows):
-    """按编排计划剔除已覆盖的格。rows 是 (臂, 赛道, 轮次) 序列。"""
-    skip = set((c['arm'], c['track'], c['round']) for c in plan['skipped'])
+    """按编排计划剔除已覆盖的格。rows 是 (车, 赛道, 轮次) 序列。"""
+    skip = set((c['car'], c['track'], c['round']) for c in plan['skipped'])
     return [r for r in rows if (r[0], r[1], r[2]) not in skip]
 
 

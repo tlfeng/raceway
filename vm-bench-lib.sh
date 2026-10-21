@@ -244,10 +244,10 @@ cpu_affinity_clear() { # 移除 drop-in（服务下次启动恢复全部核）
 
 # 实际堆断言（2026-10-16 新增）：归位重装/工件推送会把 bundle 原版 1g 堆带回来，
 # user-tags 声明的 heap 与实际 -Xmx 可能不一致（10/15 ds3 事故：声明 16g 实际 1g，ez 全部场 -13%）。
-# 必须在引擎冷启动后调用（集群卡点之后）。全臂硬断言——堆由 ibs 部署时 configure_jvm_heap
+# 必须在引擎冷启动后调用（集群卡点之后）。全车硬断言——堆由 ibs 部署时 configure_jvm_heap
 # 统一设定（easysearch 走 jvm.options 堆行、ES 走 jvm.options.d/heap.options，均为内存/2=16g）。
-heap_assert() { # <arm> <expected:16g> [dir] [svc] → 任一节点实际 -Xmx ≠ 声明则 rc=1
-  local arm="$1" want="${2:-16g}" dir="${3:-$IBS_BASE/easysearch}" svc="${4:-easysearch}"
+heap_assert() { # <car> <expected:16g> [dir] [svc] → 任一节点实际 -Xmx ≠ 声明则 rc=1
+  local car="$1" want="${2:-16g}" dir="${3:-$IBS_BASE/easysearch}" svc="${4:-easysearch}"
   local wg num unit gb ip pid xmx bad=0
   wg=$(echo "$want" | tr 'G' 'g'); wg=${wg%g}
   for ip in "${VM_IPS[@]}"; do

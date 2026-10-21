@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""arm-env-table.py —— 三臂×多赛道的"性能 × 环境"联合表（在压测机上跑）
+"""car-env-table.py —— 三车×多赛道的"性能 × 环境"联合表（在压测机上跑）
 
-  ssh root@<压测机> 'python3 - <campaign 目录> [--detail]' < scripts/arm-env-table.py
+  ssh root@<压测机> 'python3 - <campaign 目录> [--detail]' < scripts/car-env-table.py
 
 数据源（都是编排每场落的）：
   results/<fid>-{w,q}-race.json      → 口径A(rally Median Throughput) 与 口径B(语料÷duration)
@@ -74,7 +74,7 @@ def main():
             dur = (om[0].get("duration") or 0) / 1000.0
             b = DOCS[tr] / dur if dur else None
             env = summary_of(camp, fid)
-            rows.append({"fid": fid, "arm": fid.split("-")[0], "track": NAME.get(tr, tr),
+            rows.append({"fid": fid, "car": fid.split("-")[0], "track": NAME.get(tr, tr),
                          "round": d["user-tags"].get("round"), "camp": os.path.basename(camp),
                          "a": a, "b": b, "dur": dur, "win": dur - WARMUP.get(tr, 0), "env": env,
                          "p99": (om[0].get("service_time") or {}).get("99_0"),
@@ -85,20 +85,20 @@ def main():
 
     if detail:
         print("%-20s %-7s %-4s %9s %9s %6s %6s %8s %8s %s" % (
-            "场", "臂", "轮", "口径A", "口径B", "任务s", "窗口s", "steal峰", "foreign峰", "判定"))
+            "场", "车", "轮", "口径A", "口径B", "任务s", "窗口s", "steal峰", "foreign峰", "判定"))
         for r in sorted(rows, key=lambda x: (x["track"], x["camp"], x["fid"])):
             e = r["env"]
             print("%-20s %-7s %-4s %9s %9.0f %6.1f %6.1f %8.2f %8.2f %s" % (
-                r["fid"][:20], r["arm"], "r%s" % r["round"], ("%.0f" % r["a"]) if r["a"] else "NULL",
+                r["fid"][:20], r["car"], "r%s" % r["round"], ("%.0f" % r["a"]) if r["a"] else "NULL",
                 r["b"] or 0, r["dur"], r["win"], e["steal_max"], e["foreign_max"], e["verdict"]))
 
-    print("\n=== 按 臂 × 赛道：性能 × 环境 ===")
+    print("\n=== 按 车 × 赛道：性能 × 环境 ===")
     print("%-7s %-7s %3s %9s %8s %8s %9s %8s %8s %8s %s" % (
-        "臂", "赛道", "n", "口径B 中位", "极差%", "A-B偏移%", "bulk p99", "p100", "steal峰", "foreign峰", "判定"))
+        "车", "赛道", "n", "口径B 中位", "极差%", "A-B偏移%", "bulk p99", "p100", "steal峰", "foreign峰", "判定"))
     grp = {}
     for r in rows:
-        grp.setdefault((r["arm"], r["track"]), []).append(r)
-    for (arm, track), v in sorted(grp.items(), key=lambda x: (x[0][1], -statistics.median([y["b"] or 0 for y in x[1]]))):
+        grp.setdefault((r["car"], r["track"]), []).append(r)
+    for (car, track), v in sorted(grp.items(), key=lambda x: (x[0][1], -statistics.median([y["b"] or 0 for y in x[1]]))):
         bs = [y["b"] for y in v if y["b"]]
         ab = [(y["a"] / y["b"] - 1) * 100 for y in v if y["a"] and y["b"]]
         p99 = [y["p99"] for y in v if y["p99"]]
@@ -107,7 +107,7 @@ def main():
         fo = max((y["env"]["foreign_max"] for y in v), default=0)
         verd = " / ".join(sorted({y["env"]["verdict"] for y in v}))
         print("%-7s %-7s %3d %9.0f %8.1f %8.2f %8s %8s %8.2f %8.2f %s" % (
-            arm, track, len(v), statistics.median(bs) if bs else 0,
+            car, track, len(v), statistics.median(bs) if bs else 0,
             (max(bs) / min(bs) - 1) * 100 if bs and min(bs) else 0,
             statistics.mean(ab) if ab else 0,
             ("%.0f" % statistics.median(p99)) if p99 else "-",
