@@ -435,6 +435,27 @@ IDX_PHASE_SPECS = [
 ]
 
 
+def track_mixed_builds(track):
+    """该赛道是否存在「同一臂跨多个引擎 build」的场次。
+
+    ds3 首轮是 easysearch 2.5.0-3009、ds2 是 2.5.0-3015，臂标签却都是
+    jdk25/jdk26/jdk27 —— 画在同一条线上就是跨 build 混线，结论会被误读。
+    真有混线的赛道，面板改按 arm_build 分组（jdk26@3009 / jdk26@3015 两条线）。
+    """
+    try:
+        r = es_post('/bench-run/_search', {
+            "size": 0,
+            "query": {"term": {"track": track}},
+            "aggs": {"a": {"terms": {"field": "arm", "size": 30},
+                           "aggs": {"b": {"terms": {"field": "engine_build", "size": 10}}}}}})
+    except Exception:                                       # noqa: BLE001
+        return False
+    for b in (r.get("aggregations", {}).get("a", {}).get("buckets") or []):
+        if len(b.get("b", {}).get("buckets") or []) > 1:
+            return True
+    return False
+
+
 def track_panel_specs(track, groups, interval):
     """某赛道的面板规格：[(key, 标题, lucene 过滤, 数字格式, 分组字段, 指标类型, 桶粒度)]"""
     # quality:ok 是所有测量类面板的默认闸门 ——
@@ -443,19 +464,21 @@ def track_panel_specs(track, groups, interval):
     #   "失败响应有多快"（实测 p99 只有 0.22s），混进延迟曲线会把引擎显得比实际更快。
     #   15 场 nested 就是这样在 valid:true 过滤下混进曲线的。
     # 唯一不放行 degraded 的是错误率面板 —— 它就是要显示失败场次。
+    # 跨 build 混线的赛道改按 arm_build 分线（jdk26@3009 / jdk26@3015）
+    split = 'arm_build' if track_mixed_builds(track) else 'arm'
     t = 'track:%s AND quality:ok' % track
     tq = 'track:%s' % track
     specs = [
         ('wthr', '写入吞吐 · p50 docs/s',
          '%s AND family:throughput AND unit:"docs/s" AND stat:p50' % t,
-         '0.0a', 'arm', 'avg', interval),
+         '0.0a', split, 'avg', interval),
         ('idx', '索引总耗时 (s)',
          '%s AND family:indexing_time AND metric:total_time AND stat:value' % t,
-         '0.0[0]', 'arm', 'avg', interval),
+         '0.0[0]', split, 'avg', interval),
     ]
     # 索引阶段分解：merge / refresh / flush / 限流 的耗时，看索引慢在哪一段
     for key, title, f, fmt in IDX_PHASE_SPECS:
-        specs.append((key, title, '%s AND %s' % (t, f), fmt, 'arm', 'avg', interval))
+        specs.append((key, title, '%s AND %s' % (t, f), fmt, split, 'avg', interval))
     # 索引活动次数：merge/refresh/flush 各多少次，同量纲（次数）→ 一图多线
     specs.append(('idx-events', '索引活动次数 (merge/refresh/flush)',
                   '%s AND family:(merge OR refresh OR flush) AND stat:value '
@@ -467,7 +490,7 @@ def track_panel_specs(track, groups, interval):
         if group_has_metric(track, tasks, 'throughput', 'ops/s'):
             specs.append(('qthr-' + gid, '%s · 吞吐 (ops/s)' % label,
                           '%s AND family:throughput AND unit:"ops/s" AND stat:p50 AND %s' % (t, tt),
-                          '0.0a', 'arm', 'avg', interval))
+                          '0.0a', split, 'avg', interval))
         # ---- 时延三兄弟（2026-10-20 复审重做）----
         # rally 的 latency 有两种口径，取决于该 operation 有没有 target-throughput：
         #   闭环（无 target-throughput）: latency ≡ service_time，量单次请求耗时
@@ -493,15 +516,15 @@ def track_panel_specs(track, groups, interval):
 
     specs.append(('err', '错误率 (0-1)',
                   '%s AND family:error_rate AND stat:value' % tq,
-                  '0.000', 'arm', 'avg', interval))
+                  '0.000', split, 'avg', interval))
 
     # ---- 资源与存储 ----
     specs.append(('disk', '存储占用 (GB)',
                   '%s AND family:disk AND metric:store_size AND stat:value' % t,
-                  '0.0', 'arm', 'avg', interval))
+                  '0.0', split, 'avg', interval))
     specs.append(('seg', '段数量',
                   '%s AND family:disk AND metric:segment_count AND stat:value' % t,
-                  '0.0a', 'arm', 'avg', interval))
+                  '0.0a', split, 'avg', interval))
     # memory_* 六个分量与 translog_size 实测全为 0（rally 报告未填充 / 赛末已清空），
     # 画出来是六条零线，没有信息量 —— 不出图。
     # GC：耗时与次数各一图（分 young/old 两代，同量纲）
@@ -528,7 +551,7 @@ def track_panel_specs(track, groups, interval):
         if group_has_metric(track, [], 'system') and system_metric_exists(track, metric):
             specs.append((key, title,
                           '%s AND family:system AND metric:(%s) AND stat:value' % (t, metric),
-                          fmt, 'metric' if ' OR ' in metric else 'arm', 'avg', interval))
+                          fmt, 'metric' if ' OR ' in metric else split, 'avg', interval))
     return specs
 
 
@@ -554,7 +577,7 @@ def env_markdown():
     md = ['**Benchmark 结果总览** · 数据源 `bench-run` / `bench-metric`'
           '（raceway bench-export.py 离线入库，源 = rally race.json + sidecar）',
           '',
-          '每点 = 一场 race；曲线 = 实验臂(arm)。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
+          '每点 = 一场 race；曲线 = 实验臂(arm)；同臂跨引擎 build 时自动拆成「臂@build」多条线（如 jdk26@3009 / jdk26@3015），因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
     try:
         r = es_get('/bench-env/_search?size=10')
         for hit in r['hits']['hits']:
@@ -644,7 +667,7 @@ USAGE_MD = '''**看图指南**
   量纲不可比，所以不放在同一张图里对比 —— 对照 opensearch.org/benchmarks 的分页口径。
 - 看板内再按 **workload 分图**：同一赛道内不同 task（term 检索 / country 聚合 / sort /
   decay / KNN k 值）的吞吐与延迟量纲不同，混在一张图里同样是误读。
-- 每点 = 一场 race；曲线 = 实验臂(arm)。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
+- 每点 = 一场 race；曲线 = 实验臂(arm)；同臂跨引擎 build 时自动拆成「臂@build」多条线（如 jdk26@3009 / jdk26@3015），因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
 - **两层闸门，各管各的**：
   - `valid`（看板级，管所有面板）= 场次跑完了、且 RACES.md 记为 VALID。没记账的批次
     （早期 one-off 场次）没有这个标记，**默认不出图** —— 它们不可信，不能和正式批次同图比较。
