@@ -36,6 +36,11 @@ QUIET_FREE_GB=${QUIET_FREE_GB:-20}         # 磁盘可用 GB
 # 逃生阀：HOST_QUIET_PORTS="" 可关掉这条检查（vm-bench.env 里设）。
 HOST_QUIET_PORTS=${HOST_QUIET_PORTS:-"9202 9237 5601"}
 
+# 另查指标库的**开机自启**状态：端口查不到 ≠ 窗口期不会被拉回来。
+# 压测机 = 虚机 hypervisor，窗口期内一旦重启，enabled 的指标库会被 systemd
+# 拉起来重新监听 9237 —— 污染当场、事后极难察觉。
+# 逃生阀：HOST_QUIET_AUTOSTART="" 可关掉这条检查（vm-bench.env 里设）。
+
 host_busy_ports() { # 列出宿主上正在监听的旁路端口（空格分隔）
   local p out=""
   for p in $HOST_QUIET_PORTS; do
@@ -84,8 +89,24 @@ quiet_check() {
     log "FAIL 压测机: 端口${busy} 有服务在听（指标库 9237 / 适配层 9202 / Kibana 5601）"
     log "      它们与被测引擎抢 hypervisor 的 CPU，压测期间必须停着"
     log "      停法: systemctl stop easysearch-metric-store.service"
+    log "            systemctl disable easysearch-metric-store.service   # 关开机自启"
     log "            bash /testing/raceway-next/kibana/deploy-kibana.sh stop"
     fail=1
+  fi
+  # 自启状态卡点：端口查不到 ≠ 窗口期不会被拉回来。
+  # 压测机 = 虚机 hypervisor，窗口期内一旦重启，enabled 的指标库会被 systemd
+  # 拉起来重新监听 9237 —— 污染当场、事后极难察觉（比 steal 偏差更难归因）。
+  # 注意：压测后用 systemctl start 看数**不会**改变 enable 状态，只有显式
+  # enable 才会；所以这里只在"显式 enable 过"时拦。
+  # 逃生阀：HOST_QUIET_AUTOSTART="" 可关掉这条检查（vm-bench.env 里设）。
+  if [ -n "${HOST_QUIET_AUTOSTART:-on}" ]; then
+    local ms_enabled; ms_enabled=$(systemctl is-enabled easysearch-metric-store.service 2>/dev/null || echo "")
+    if [ "$ms_enabled" = "enabled" ]; then
+      log "FAIL 压测机: 指标库开机自启还开着（easysearch-metric-store.service = enabled）"
+      log "      窗口期内一旦重启，指标库会被 systemd 拉回来抢 hypervisor 的 CPU"
+      log "      修法: systemctl disable easysearch-metric-store.service"
+      fail=1
+    fi
   fi
 
   [ "$fail" = 0 ] && { log "静默卡点通过 ✔（三虚机安静）"; return 0; } || { log "静默卡点未通过 ✘"; return 1; }
