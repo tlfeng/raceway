@@ -175,20 +175,29 @@ def render_arms(arms, tag):
 # est 取各 campaign 的 RACES.md 实测耗时上界 + 余量（窗底守卫靠它算"这场塞不塞
 # 得进剩余窗口"，估小了会把排得下的场次误判成 DEADLINE-SKIP）。
 # ds-* 用现成排程 dimsweep-24.conf 里的值 —— 那是在用口径，别另起一套。
+# 名字 → (展示名, est 默认分钟, 数据集标注)
+#
+# ds-* 族有**两套不同的数据集**（赛道名里的血统字母，见 prepare-dimsweep-track.sh
+# "ds-<血统><维度>；j=jina 系，g=GIST 系"）：
+#   jina 系：ds-j512 / ds-j768 / ds-j1024 / ds-j1536 / ds-j2048
+#   GIST 系：ds-g960 / ds-g1920
+# 两套都是 1M docs、float、dot_product HNSW，差的是**向量数据集本身** ——
+# 分布不同，召回与吞吐的绝对值不能跨数据集直接比。编排时必须看得见是哪一套。
 BASE_TRACKS = {
-    'geo':      ('geonames', 30),
-    'hnsw':     ('hnsw 2m', 25),
-    'hv1024':   ('hv 1024 维', 30),
-    'nested':   ('nested', 35),
-    'ds-g1920': ('1920 维', 56),
-    'ds-j2048': ('2048 维', 49),
-    'ds-j1024': ('1024 维', 35),
-    'ds-g960':  ('960 维', 30),
-    'ds-j768':  ('768 维', 26),
-    'ds-j512':  ('512 维', 21),
-    'ds-j1536': ('1536 维', 44),
+    'geo':      ('geonames', 30, None),
+    'hnsw':     ('hnsw 2m', 25, None),
+    'hv1024':   ('hv 1024 维', 30, None),
+    'nested':   ('nested', 35, None),
+    'ds-g1920': ('1920 维', 56, 'GIST'),
+    'ds-j2048': ('2048 维', 49, 'jina'),
+    'ds-j1024': ('1024 维', 35, 'jina'),
+    'ds-g960':  ('960 维', 30, 'GIST'),
+    'ds-j768':  ('768 维', 26, 'jina'),
+    'ds-j512':  ('512 维', 21, 'jina'),
+    'ds-j1536': ('1536 维', 44, 'jina'),
 }
-TRACK_GROUPS = [('ds', '维度扫描 ds-*'), ('geo', 'geonames'),
+TRACK_GROUPS = [('ds', '维度扫描 ds-*（两套数据集：jina 系 / GIST 系）'),
+                ('geo', 'geonames'),
                 ('vector', '向量 hnsw / hv1024'), ('nested', 'nested')]
 BASE_GROUP = {'geo': 'geo', 'hnsw': 'vector', 'hv1024': 'vector', 'nested': 'nested'}
 # 压缩 token（与 vm-bench-lib.sh 的 track_compression 同一套）
@@ -213,11 +222,12 @@ def build_catalog():
     返回 {id: {name, label, est, group, base, compression, source_reuse, engines}}
     """
     cat = {}
-    for base, (label, est) in BASE_TRACKS.items():
+    for base, (label, est, dataset) in BASE_TRACKS.items():
         grp = BASE_GROUP.get(base, 'ds' if base.startswith('ds-') else 'geo')
         cat[base] = {'name': base, 'label': label, 'est': est, 'group': grp,
                      'base': base, 'compression': None, 'source_reuse': None,
-                     'engines': H.engines_of(base), 'variant': False}
+                     'engines': H.engines_of(base), 'variant': False,
+                     'dataset': dataset}
         for tok in CODEC_TOKENS:
             for sr in (False, True):
                 vid = '%s-codec-%s%s' % (base, tok, '-sr' if sr else '')
@@ -228,6 +238,7 @@ def build_catalog():
                     'group': grp, 'base': base,
                     'compression': TOKEN_CODEC[tok], 'source_reuse': sr,
                     'engines': H.engines_of(vid), 'variant': True,
+                    'dataset': dataset,
                 }
     return cat
 
@@ -636,7 +647,8 @@ async function boot(){
     h+='<div style="margin:8px 0"><b style="font-size:12px;color:#555">'+esc(g[1])+'</b></div>';
     bases.forEach(function(b){
       h+='<div style="margin:6px 0 10px 8px">';
-      h+='<label title="'+esc(b.name)+' · 基座（不带压缩变体）· ~'+b.est+'min"><input type="checkbox" class="tkck" value="'+b.name+'" checked> <b>'+esc(b.label)+'</b> <small style="color:#888">('+b.name+', ~'+b.est+'min)</small></label>';
+      const dsTxt = b.dataset ? ' · <span style="color:#0a7">'+esc(b.dataset)+' 语料</span>' : '';
+      h+='<label title="'+esc(b.name+(b.dataset?(' · '+b.dataset+' 语料'):''))+' · 基座（不带压缩变体）· ~'+b.est+'min"><input type="checkbox" class="tkck" value="'+b.name+'" checked> <b>'+esc(b.label)+'</b> <small style="color:#888">('+b.name+', ~'+b.est+'min)</small>'+dsTxt+'</label>';
       // 该基础赛道的变体网格：行=压缩，列=source_reuse
       // **默认折叠** —— 11 个基础赛道 × 6 变体平铺出来没法看，展开才看细节
       const vs=TRACKS.filter(t=>t.base===b.name && t.variant);
@@ -751,8 +763,12 @@ function paintMatrix(){
   const arms=HIST.arms||[], tracks=HIST.tracks||[];
   let h='<table class="hmatrix"><tr><th>臂 \\ 赛道</th>';
   tracks.forEach(function(t){
+    const info=TRACKS.find(function(x){return x.name===t;});
     const runnable = TRACKS.some(function(x){return x.name===t;});
-    h+='<th class="'+(selTracks.has(t)?'cur':'dim')+'">'+esc(t)+
+    // ds-* 族有两套数据集（jina 系 / GIST 系）—— 跨数据集的绝对值不能直接比，
+    // 列头标出来，避免把两套数据的点看成一条线上的。
+    const dsTxt = (info && info.dataset) ? '<br><small style="font-weight:400;color:#0a7">'+esc(info.dataset)+' 语料</small>' : '';
+    h+='<th class="'+(selTracks.has(t)?'cur':'dim')+'" title="'+esc(t)+'">'+esc(t)+dsTxt+
        (runnable?'':'<br><small style="font-weight:400">仅历史</small>')+'</th>';
   });
   h+='</tr>';
