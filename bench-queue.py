@@ -11,7 +11,7 @@ raceway 的"队列"现在散在四个文件里，没有统一形态：
 | `PROGRESS.txt`   | 追加文本，逐场时间线（含 write/query 分相位） | runner |
 | `RACES.md`       | 判定表，一场一行；**重试会追加多行**（`-try2`/`-try3`） | runner |
 | `STATE.txt`      | 排程模式断点续跑状态：`OK/FAIL/SKIP <行号>` | runner |
-| `<排程文件>`      | 待跑清单：`<臂> <赛道> <轮次> <recall|norecall> <est分钟>` | 人 |
+| `<排程文件>`      | 待跑清单：`<车> <赛道> <轮次> <recall|norecall> <est分钟>` | 人 |
 
 后果是"还剩哪些场次"在非排程模式下**根本不存在**（只在 `run-bench.sh` 的嵌套
 for 循环里），起跑后外部无法知道队列全貌；排程模式下也只有"已跑过的"，没有
@@ -204,7 +204,7 @@ class Source:
 class Field:
     seq: int = 0
     fid: str = ''
-    arm: str = ''
+    car: str = ''
     track: str = ''
     rnd: int = 0
     status: str = STATUS_PENDING
@@ -224,12 +224,12 @@ class Campaign:
     root: str = ''
     started_at: str = ''
     runner_started_at: str = ''
-    arms: list = field(default_factory=list)
+    cars: list = field(default_factory=list)
     tracks: list = field(default_factory=list)
     rounds: int = 0
     mode: str = ''                 # schedule | legacy | unknown
     schedule_file: str = ''
-    arms_file: str = ''
+    cars_file: str = ''
     deadline: str = ''
     deadlines: list = field(default_factory=list)
     sched_total: int = 0
@@ -311,13 +311,13 @@ class Campaign:
 RE_TS = re.compile(r'^\[([\d\-: ]+)\]')
 # tracks 是多词列表（"geo hnsw nested" / "ds-g1920 ds-j2048 ..."），
 # 必须用非贪婪 .+? 匹配到 rounds= 之前 —— 用 \S+ 会抓不到多赛道 campaign。
-# 第 2 组 configs/arms 是**版本判据**：10-19 之前的旧版 runner 写 arms=，
+# 第 2 组 configs/cars 是**版本判据**：10-19 之前的旧版 runner 写 cars=，
 # 之后的版本写 configs= 并带「轮内右旋配对交错」标记。
 RE_HEADER = re.compile(
-    r'campaign\s+(\S+)\s+启动:\s*(configs|arms)=\[([^\]]*)\]\s+tracks=(.+?)\s+rounds=(\d+)')
+    r'campaign\s+(\S+)\s+启动:\s*(configs|cars)=\[([^\]]*)\]\s+tracks=(.+?)\s+rounds=(\d+)')
 # 旧版 runner 的排程模式起跑头：schedule=24 场, 窗口 12h, deadline ...
 RE_SCHED_OLD = re.compile(r'campaign\s+(\S+)\s+启动:\s*schedule=(\d+)\s*场')
-RE_SCHED_MODE = re.compile(r'排程模式:\s*(\S+)\s*（臂定义\s*(\S+?)\s*）')
+RE_SCHED_MODE = re.compile(r'排程模式:\s*(\S+)\s*（车定义\s*(\S+?)\s*）')
 RE_DEADLINE = re.compile(r'窗底守卫:\s*(\S+?)h（截止\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
 RE_FIELD_START = re.compile(r'^\[([\d\-: ]+)\]\s+=====\s+\[(\d+)\]\s+(\S+)\s+开始\s+=====')
 RE_FIELD_DONE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+完成:\s*(\S+?)（(.*?)）')
@@ -347,10 +347,10 @@ def base_fid(fid):
     return re.sub(r'-try\d+$', '', fid)
 
 
-def split_fid(fid, arms, tracks):
-    """把 fid 拆成 (臂, 赛道, 轮次, 尝试号)。
+def split_fid(fid, cars, tracks):
+    """把 fid 拆成 (车, 赛道, 轮次, 尝试号)。
 
-    fid 形如 `<ARM_LABEL>-<track>-r<round>`，臂名和赛道名都可能带 '-'，
+    fid 形如 `<CAR_LABEL>-<track>-r<round>`，车名和赛道名都可能带 '-'，
     所以按已知词表做最长前缀/后缀匹配，而不是按 '-' 硬切。
     """
     m = re.search(r'-r(\d+)(-try(\d+))?$', fid)
@@ -358,24 +358,24 @@ def split_fid(fid, arms, tracks):
     attempt = int(m.group(3)) if (m and m.group(3)) else 0
     core = re.sub(r'-r\d+(-try\d+)?$', '', fid)
 
-    arm = ''
-    for a in sorted(arms, key=len, reverse=True):
+    car = ''
+    for a in sorted(cars, key=len, reverse=True):
         if core.startswith(a + '-'):
-            arm = a
+            car = a
             break
-    track = core[len(arm) + 1:] if arm else core
+    track = core[len(car) + 1:] if car else core
     for t in sorted(tracks, key=len, reverse=True):
         if core.endswith('-' + t) or core == t:
             track = t
             break
-    return arm, track, rnd, attempt
+    return car, track, rnd, attempt
 
 
 def parse_progress(text):
     """从 PROGRESS.txt 抽：起跑头、排程模式、时间线事件。"""
     out = {
-        'cid': '', 'arms': [], 'tracks': [], 'rounds': 0,
-        'schedule_file': '', 'arms_file': '', 'deadline': '', 'deadlines': [],
+        'cid': '', 'cars': [], 'tracks': [], 'rounds': 0,
+        'schedule_file': '', 'cars_file': '', 'deadline': '', 'deadlines': [],
         'started_at': '', 'runner_started_at': '',
         'racer': 'unknown', 'sched_total': 0,
         'events': [], 'ended': False, 'end_valid': 0, 'end_total': 0,
@@ -389,7 +389,7 @@ def parse_progress(text):
         if m:
             out['cid'] = m.group(1)
             out['racer'] = 'new' if m.group(2) == 'configs' else 'old'
-            out['arms'] = [x for x in m.group(3).split() if x]
+            out['cars'] = [x for x in m.group(3).split() if x]
             out['tracks'] = m.group(4).split()
             out['rounds'] = int(m.group(5))
             ts = RE_TS.match(line)
@@ -417,7 +417,7 @@ def parse_progress(text):
         m = RE_SCHED_MODE.search(line)
         if m:
             out['schedule_file'] = m.group(1)
-            out['arms_file'] = m.group(2)
+            out['cars_file'] = m.group(2)
             continue
         m = RE_DEADLINE.search(line)
         if m:
@@ -475,7 +475,7 @@ def parse_state(text):
 
 
 def parse_schedule(text):
-    """解析排程文件：每行 `<臂> <赛道> <轮次> <recall|norecall> <est分钟>`。"""
+    """解析排程文件：每行 `<车> <赛道> <轮次> <recall|norecall> <est分钟>`。"""
     rows = []
     if not text:
         return rows
@@ -486,7 +486,7 @@ def parse_schedule(text):
         parts = line.split()
         if len(parts) < 3:
             continue
-        arm, track, rnd = parts[0], parts[1], parts[2]
+        car, track, rnd = parts[0], parts[1], parts[2]
         recall = parts[3] if len(parts) > 3 else ''
         est = 0
         if len(parts) > 4:
@@ -494,7 +494,7 @@ def parse_schedule(text):
                 est = int(parts[4])
             except ValueError:
                 est = 0
-        rows.append({'arm': arm, 'track': track,
+        rows.append({'car': car, 'track': track,
                      'rnd': int(rnd) if rnd.isdigit() else 0,
                      'recall': recall, 'est': est})
     return rows
@@ -508,11 +508,11 @@ def build_campaign(src, cid, schedule_override=None):
     state = parse_state(src.read(cid, 'STATE.txt'))
 
     c = Campaign(cid=cid, root=src.root)
-    c.arms = prog['arms']
+    c.cars = prog['cars']
     c.tracks = prog['tracks']
     c.rounds = prog['rounds']
     c.schedule_file = prog['schedule_file']
-    c.arms_file = prog['arms_file']
+    c.cars_file = prog['cars_file']
     c.deadline = prog['deadline']
     c.deadlines = prog['deadlines']
     c.started_at = prog['started_at']
@@ -522,7 +522,7 @@ def build_campaign(src, cid, schedule_override=None):
     # ---- 1) 排程清单（待跑队列的来源）
     # 实际执行顺序：时间线里每场的「开始」，按基础 fid 归并。
     # 归并规则是**首次出现去重**，不是折叠连续重复 —— 重跑是同一场的又一次尝试，
-    # 会把同一个 fid 再次插回时间线（实测 ds2：jdk26/jdk27 臂先 COLD-START-FAIL，
+    # 会把同一个 fid 再次插回时间线（实测 ds2：jdk26/jdk27 车先 COLD-START-FAIL，
     # 修好 JVMCI 后重跑）。按连续折叠会把这些重跑当成"别处插进来的新场次"，
     # 顺序比对必然对不上，于是把本来正确的排程误判成"推导不可信"。
     observed = []
@@ -545,29 +545,29 @@ def build_campaign(src, cid, schedule_override=None):
         c.schedule_file = resolved
         c.mode = 'schedule' if plan_rows else 'schedule?'
     if not plan_rows:
-        c.mode = 'legacy' if (c.tracks and c.rounds and c.arms) else 'unknown'
+        c.mode = 'legacy' if (c.tracks and c.rounds and c.cars) else 'unknown'
 
     if plan_rows:
         # 排程文件是权威源：清单直接照它来
         c.plan_known = True
         for i, r in enumerate(plan_rows, 1):
-            c.fields.append(Field(seq=i, fid='%s-%s-r%d' % (r['arm'], r['track'], r['rnd']),
-                                  arm=r['arm'], track=r['track'], rnd=r['rnd'],
+            c.fields.append(Field(seq=i, fid='%s-%s-r%d' % (r['car'], r['track'], r['rnd']),
+                                  car=r['car'], track=r['track'], rnd=r['rnd'],
                                   recall=r['recall'], est=r['est']))
     elif c.mode == 'legacy':
         # 非排程模式：按 run-bench.sh:1067-1075 的展平规则推导
-        #（赛道外层 → 轮次 → 臂右旋），但**推导必须自校验**：
+        #（赛道外层 → 轮次 → 车右旋），但**推导必须自校验**：
         # 对不上实际执行顺序就说明这条规则不适用于这个 campaign
         #（10-19 之前的旧版 runner 规则不同，或排程在运行期间被改过）。
         seq = 0
         plan = []
         for tk in c.tracks:
             for r in range(1, c.rounds + 1):
-                for idx in order_for_round(r, len(c.arms)):
-                    arm = c.arms[idx]
+                for idx in order_for_round(r, len(c.cars)):
+                    car = c.cars[idx]
                     seq += 1
-                    plan.append(Field(seq=seq, fid='%s-%s-r%d' % (arm, tk, r),
-                                      arm=arm, track=tk, rnd=r))
+                    plan.append(Field(seq=seq, fid='%s-%s-r%d' % (car, tk, r),
+                                      car=car, track=tk, rnd=r))
         derived = [f.fid for f in plan]
         n = min(len(observed), len(derived))
         consistent = (not observed) or derived[:n] == observed[:n]
@@ -601,9 +601,9 @@ def build_campaign(src, cid, schedule_override=None):
         b = base_fid(fid)
         f = by_base.get(b)
         if f is None:
-            arm, track, rnd, _ = split_fid(b, c.arms, c.tracks)
+            car, track, rnd, _ = split_fid(b, c.cars, c.tracks)
             # 计划外的场次：用时间线里的序号顶上（runner 自己打的 [n]）
-            f = Field(seq=seq_hint, fid=b, arm=arm, track=track, rnd=rnd)
+            f = Field(seq=seq_hint, fid=b, car=car, track=track, rnd=rnd)
             by_base[b] = f
             c.fields.append(f)
         return f
@@ -747,8 +747,8 @@ def build_campaign(src, cid, schedule_override=None):
         if not (c.tracks and c.rounds):
             c.warnings.append('起跑头里没有赛道/轮次信息（很可能是旧版 runner 产物）'
                               '—— 待跑清单未知，只显示已跑过的场次')
-        elif not c.arms:
-            c.warnings.append('起跑头里没有臂列表 —— 待跑清单未知，只显示已跑过的场次')
+        elif not c.cars:
+            c.warnings.append('起跑头里没有车列表 —— 待跑清单未知，只显示已跑过的场次')
         else:
             c.warnings.append('待跑清单未知 —— 只显示已跑过的场次')
     return c
@@ -828,7 +828,7 @@ def campaign_json(c):
         'started_at': c.started_at,
         'runner_started_at': c.runner_started_at,
         'ended': c.ended,
-        'arms': c.arms,
+        'cars': c.cars,
         'tracks': c.tracks,
         'rounds': c.rounds,
         'schedule_file': c.schedule_file,

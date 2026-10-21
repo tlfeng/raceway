@@ -8,7 +8,7 @@
 
 - **配置文件排程**：每行一个被测配置（引擎三元组 + JDK 目录 + 标签），轮内右旋配对交错摊薄时序效应
 - **卡点链**：赛前静默负载卡点 → 集群卡点（可达/green/节点数/版本/节点名/**端口属主**）→ 堆断言 → 绑核断言 → 段数卡点 → 指标非空断言；环境脏数据进不了结论
-- **无臂机制**：变体用户自管（`ENGINE_NAME/ENGINE_VERSION/ENGINE_BUILD` + `JDK_DIR`），实测身份（逐节点 java -version、索引 settings）由 sidecar 自动落档
+- **无车机制**：变体用户自管（`ENGINE_NAME/ENGINE_VERSION/ENGINE_BUILD` + `JDK_DIR`），实测身份（逐节点 java -version、索引 settings）由 sidecar 自动落档
 - **运维全托管**：部署/冷启动/卡点/卸载统一走 [ibs](https://github.com/tlfeng/ibs) CLI；堆由部署统一设定（内存/2）
 - **拓扑单事实源**：节点列表/数量/部署范围全部从 ibs `ip.txt` 派生（集群节点=主机名非 esrally 行），2~N 节点免改代码
 - **省心件**：`--dry-run` 排程预览 · 断点续跑（已 VALID 场自动跳过）· `list` 子命令 · 收尾 webhook 通知
@@ -33,9 +33,9 @@ precheck.sh                  赛前静默负载卡点
 load-monitor.sh              虚机侧零依赖采样器（纯 /proc，5s；按 w/m/q 相位分 tag）
 cpu-affinity.sh              引擎绑核（模拟小规格招标环境）
 prepare-{codec,hv1024,nested}-track.sh   赛道变体生成（幂等）
-arm-compare.py               两配置对比 + --assert 阈值断言（FAIL 退出码 1）
-arm-env-table.py             三臂×多赛道"性能×环境"联合表（race.json+sidecar+monitors）
-codec-compare.py             codec 五组合臂三件套（写入/赛末体积/查询）
+car-compare.py               两配置对比 + --assert 阈值断言（FAIL 退出码 1）
+car-env-table.py             三车×多赛道"性能×环境"联合表（race.json+sidecar+monitors）
+codec-compare.py             codec 五组合车三件套（写入/赛末体积/查询）
 bench-sidecar.py             每场环境/身份元数据 sidecar 生成
 bench-export.py / bench-apply.py / bench-report.py   入库载荷 → ES 导入 → 单文件 HTML 报告
 build-race-store.py          campaign 目录 → rally race store 布局（软链，可重建）
@@ -84,8 +84,8 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 - 实验变量 `dims` / `lineage` 从 user-tags 提升为 typed 列，可 range/排序
 - **bench-metric 带 `track` 列**（归一化赛道名）：按赛道拆看板的前提 —— 指标行没有
   track 就没法按赛道过滤
-- **monitors 补的 system 行按场次回填 `@timestamp` / `valid` / `arm`**：这行是按场次
-  采集的摘要，本身没有时间戳也没有臂名 —— 不回填的话 CPU steal 这类数据可信度指标
+- **monitors 补的 system 行按场次回填 `@timestamp` / `valid` / `car`**：这行是按场次
+  采集的摘要，本身没有时间戳也没有车名 —— 不回填的话 CPU steal 这类数据可信度指标
   既画不出折线（x 轴无值），也会被 dashboard 的 `valid: true` 整体过滤掉
 - 引擎身份 `engine`（easysearch/elasticsearch）从**包名**推导，不信 sidecar 的 `name` 字段
 - 幂等：文档 `_id` 固定（`race_id` / `race_id|task|family|stat`），重复执行是覆盖不是翻倍
@@ -164,7 +164,7 @@ python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out �
 | 工具 | 干什么 |
 |---|---|
 | `bench-queue.py` | **队列观测台**（纯读）：把 campaign 目录里的 `PROGRESS.txt` / `RACES.md` / `STATE.txt` / 排程文件推导成队列视图，实时页 + 四类告警（判定矛盾 / STATE 行号错位 / 排程运行期被改 / 窗底漂移） |
-| `bench-history.py` | **已入库历史覆盖**（纯读）：把指标库 `bench-run` 索引读成「臂×赛道×轮次」覆盖表，回答"哪些格已经跑过、什么判定、哪个 build" |
+| `bench-history.py` | **已入库历史覆盖**（纯读）：把指标库 `bench-run` 索引读成「车×赛道×轮次」覆盖表，回答"哪些格已经跑过、什么判定、哪个 build" |
 | `bench-compose.py` | **排程编排台**：矩阵勾选 → 生成排程 → dry-run 预览 → 互斥预检后起跑；**默认自动剔除指标库里已跑过的格** |
 
 ```bash
@@ -206,9 +206,9 @@ setsid nohup ./run-bench.sh all 3 > run.log 2>&1 &        # 全量（夜间窗�
 多配置文件每行一个配置（模板见 `campaign-configs.example.conf`）：
 
 ```
-ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 ARM_LABEL=ez3015
-ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt/jdks/kona25 ARM_LABEL=kona25
-ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ARM_LABEL=es819
+ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=ez3015
+ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt/jdks/kona25 CAR_LABEL=kona25
+ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819
 ```
 
 3 配置 × 3 轮 = 9 场，场序 r1 [A,B,C] / r2 [C,A,B] / r3 [B,C,A]。
@@ -216,8 +216,8 @@ ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ARM_LABEL=es819
 ## 结果对比与断言
 
 ```bash
-./arm-compare.py campaigns/<A> campaigns/<B> --a 标签A --b 标签B
-./arm-compare.py campaigns/<A> campaigns/<B> --a 基线 --b 候选 --assert campaign-thresholds.example.conf
+./car-compare.py campaigns/<A> campaigns/<B> --a 标签A --b 标签B
+./car-compare.py campaigns/<A> campaigns/<B> --a 基线 --b 候选 --assert campaign-thresholds.example.conf
 ```
 
 `--assert`：CSV 阈值（`track,task,metric,>=|<=,value`），对象为 B 配置的逐轮中位，任一 FAIL 退出码 1——可直接接 CI 做发版回归。

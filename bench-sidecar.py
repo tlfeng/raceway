@@ -4,7 +4,7 @@
 
 用法（由 run-bench-jdk.sh 每场调用一次）:
   bench-sidecar.py --raw DIR --out FILE --campaign C --fid F --phase w|q --race-id ID \
-      --arm A --track TK --challenge CH --round N --attempt K --track-dir D --track-params "..." \
+      --car A --track TK --challenge CH --round N --attempt K --track-dir D --track-params "..." \
       --heap 16g --cores 32 --pkg PATH --jdk-want "25|TencentKonaJDK" --env-id bench-3node-32c32g
 
 raw 目录里是编排抓好的原始探针（缺失项记 null，不猜值）:
@@ -346,9 +346,11 @@ def jdk_per_node(raw, ips):
 
 def main():
     a = argparse.ArgumentParser()
-    for k in ("raw", "out", "campaign", "fid", "phase", "race_id", "arm", "track", "challenge",
+    for k in ("raw", "out", "campaign", "fid", "phase", "race_id", "car", "track", "challenge",
               "heap", "cores", "pkg", "jdk_want", "env_id", "track_dir"):
-        a.add_argument("--" + k.replace("_", "-"), required=k in ("raw", "out", "campaign", "fid"))
+        # --arm 是 --car 的旧名：改名前的调用方（含远端旧脚本）仍可用
+        names = ("--car", "--arm") if k == "car" else ("--" + k.replace("_", "-"),)
+        a.add_argument(*names, dest=k, required=k in ("raw", "out", "campaign", "fid"))
     a.add_argument("--round", type=int, default=None)
     a.add_argument("--attempt", type=int, default=1)
     a.add_argument("--track-params", default="")
@@ -422,11 +424,11 @@ def main():
         "captured_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         "run": {
             "campaign": args.campaign, "fid": args.fid, "phase": args.phase,
-            "race_id": args.race_id or None, "arm": args.arm, "track": args.track,
+            "race_id": args.race_id or None, "car": args.car, "track": args.track,
             "challenge": args.challenge, "round": args.round, "attempt": args.attempt,
         },
         "engine": {
-            # 从包名推导，不能写死 easysearch：es819 臂的 sidecar 曾经 name=easysearch 而 pkg/version=8.19.23 自相矛盾
+            # 从包名推导，不能写死 easysearch：es819 车的 sidecar 曾经 name=easysearch 而 pkg/version=8.19.23 自相矛盾
             "name": engine_name(args.pkg),
             "pkg": os.path.basename(args.pkg) if args.pkg else None,
             "pkg_sha256": sha,
@@ -434,7 +436,7 @@ def main():
             "version_measured_nodes": sorted({m["version_measured"] for m in measured if m["version_measured"]}) or None,
         },
         "jdk": {
-            "declared_arm": args.arm,
+            "declared_car": args.car,
             "want": {"major": jdk_want_major or None, "vendor": jdk_want_vendor or None},
             "measured_nodes": [m["jdk_version_measured"] for m in measured] or None,
             "measured_vm_versions": [m["jvm_vm_version_measured"] for m in measured] or None,
@@ -513,7 +515,7 @@ def index_settings(text):
 
 
 def engine_name(pkg):
-    """包名 → 引擎名（es819 臂不能再记成 easysearch）"""
+    """包名 → 引擎名（es819 车不能再记成 easysearch）"""
     b = os.path.basename(pkg or "")
     if b.startswith("elasticsearch"):
         return "elasticsearch"

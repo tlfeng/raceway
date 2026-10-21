@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""bench-relabel.py —— 给既有载荷补看板图例标签（arm_label）
+"""bench-relabel.py —— 给既有载荷补看板图例标签（car_label）
 
   python3 bench-relabel.py --dir exports/<tag> [--out exports/<tag>-relabel]
 
-做什么：把 bench-metric.jsonl / bench-run.jsonl 每条文档补一个 arm_label
-（引擎@版本@build@JDK，见 arm_label.py），其余字段原样保留。
+做什么：把 bench-metric.jsonl / bench-run.jsonl 每条文档补一个 car_label
+（引擎@版本@build@JDK，见 car_label.py），其余字段原样保留。
 
 为什么需要它：完整载荷（402 场）是在服务器侧导出的，本机的 campaigns-local
 只是部分镜像（36/47 个 campaign），本机重跑 bench-export.py 只能导出一半场次。
 要补标签又不能重导，就给既有载荷打补丁 —— 标签口径与 bench-export.py 完全同一份
-（arm_label.py），两条路径已在 55157 条指标上逐条比对为 0 差异。
+（car_label.py），两条路径已在 55157 条指标上逐条比对为 0 差异。
 
-幂等：已带 arm_label 的文档会按同一口径重算（值相同则原样保留）。
+幂等：已带 car_label 的文档会按同一口径重算（值相同则原样保留）。
 只改本地文件，不连 ES —— 入库用 bench-apply.py 另跑。
 """
 import argparse
@@ -31,7 +31,7 @@ def main():
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    AL = importlib.import_module('arm_label')
+    AL = importlib.import_module('car_label')
 
     src = os.path.abspath(args.dir)
     dst = os.path.abspath(args.out) if args.out else src + "-relabel"
@@ -48,7 +48,7 @@ def main():
         if os.path.isfile(p) and name not in rewritten:
             shutil.copy2(p, os.path.join(dst, name))
 
-    # templates.json 要跟上：arm_label 是新列，得在模板里显式声明成 keyword，
+    # templates.json 要跟上：car_label 是新列，得在模板里显式声明成 keyword，
     # 否则目标索引靠 dynamic_templates 兜底（能跑，但映射口径不显式）。
     tpl_path = os.path.join(dst, "templates.json")
     if os.path.isfile(tpl_path):
@@ -57,13 +57,13 @@ def main():
         touched = []
         for name, t in tpl.items():
             props = ((t.get("template") or {}).get("mappings") or {}).get("properties")
-            if isinstance(props, dict) and "arm_label" not in props:
-                props["arm_label"] = {"type": "keyword"}
+            if isinstance(props, dict) and "car_label" not in props:
+                props["car_label"] = {"type": "keyword"}
                 touched.append(name)
         if touched:
             with open(tpl_path, "w", encoding="utf-8") as f:
                 json.dump(tpl, f, ensure_ascii=False, indent=1)
-        print("templates.json: arm_label 声明补齐 → %s" % (", ".join(touched) or "无需改动"))
+        print("templates.json: car_label 声明补齐 → %s" % (", ".join(touched) or "无需改动"))
 
     for idx in want:
         path = os.path.join(src, idx + ".jsonl")
@@ -78,9 +78,9 @@ def main():
                 if not line:
                     continue
                 doc = json.loads(line)
-                label = AL.arm_label_from_doc(doc)
-                if doc.get("arm_label") != label:
-                    doc["arm_label"] = label
+                label = AL.car_label_from_doc(doc)
+                if doc.get("car_label") != label:
+                    doc["car_label"] = label
                     changed += 1
                 g.write(json.dumps(doc, ensure_ascii=False) + "\n")
                 n += 1
@@ -92,7 +92,7 @@ def main():
     with open(path, encoding="utf-8") as f:
         for line in f:
             d = json.loads(line)
-            k = d.get("arm_label") or "(缺)"
+            k = d.get("car_label") or "(缺)"
             dist[k] = dist.get(k, 0) + 1
     print("标签分布:")
     for k, v in sorted(dist.items(), key=lambda x: -x[1]):

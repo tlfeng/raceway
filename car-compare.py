@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""arm-compare.py —— 两臂配对对比（读 rally markdown 报告，支持多 campaign 合池）
+"""car-compare.py —— 两车配对对比（读 rally markdown 报告，支持多 campaign 合池）
 
 用法（无本地 python，在压测机上跑）:
-  ssh root@<压测机> 'python3 - <campaigns 目录>' < scripts/arm-compare.py < campaign 目录... --a kona25 --b jdk25
+  ssh root@<压测机> 'python3 - <campaigns 目录>' < scripts/car-compare.py < campaign 目录... --a kona25 --b jdk25
 
-说明: A 臂（--a）与 B 臂（--b）按 campaign×track 分组，给出逐轮实测、中位、差百分比，
-      并附每臂轮间极差（dispersion）——本环境 5.5 倍超分，极差是判"差异是否可信"的第一道证据。
+说明: A 车（--a）与 B 车（--b）按 campaign×track 分组，给出逐轮实测、中位、差百分比，
+      并附每车轮间极差（dispersion）——本环境 5.5 倍超分，极差是判"差异是否可信"的第一道证据。
 """
 import glob
 import json
@@ -50,7 +50,7 @@ def parse_md(path):
 
 
 def load(camps):
-    """→ {(arm, track): {轮标签: {'w': metrics, 'q': metrics, 'camp': name}}}
+    """→ {(car, track): {轮标签: {'w': metrics, 'q': metrics, 'camp': name}}}
        轮标签含 campaign 短名，避免多 campaign 合池时同名轮号互相覆盖。"""
     out = {}
     for camp in camps:
@@ -59,10 +59,10 @@ def load(camps):
             m = FID.match(os.path.basename(p))
             if not m:
                 continue
-            arm, track, rnd, side = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+            car, track, rnd, side = m.group(1), m.group(2), int(m.group(3)), m.group(4)
             tm = re.search(r"try(\d+)", os.path.basename(p))
             key = "%s-r%d%s" % (short, rnd, ("-try" + tm.group(1)) if tm else "")
-            slot = out.setdefault((arm, track), {}).setdefault(key, {"camp": os.path.basename(camp)})
+            slot = out.setdefault((car, track), {}).setdefault(key, {"camp": os.path.basename(camp)})
             if side in slot and "-try" not in os.path.basename(p):
                 continue
             slot[side] = parse_md(p)
@@ -164,7 +164,7 @@ def load_thresholds(path):
 
 
 def run_asserts(data, b, rules):
-    """对 B 臂逐规则判中位；返回失败数。吞吐越高越好(>=)，延迟越低越好(<=)。"""
+    """对 B 车逐规则判中位；返回失败数。吞吐越高越好(>=)，延迟越低越好(<=)。"""
     fails = 0
     print(f"\n## 断言（对象 B={b} 的中位）")
     for track, task, metric, cmp_op, thr in rules:
@@ -193,17 +193,17 @@ def main():
     thr_path = take("--assert")
     camps = args
     if not camps:
-        print("用法: arm-compare.py <campaign 目录...> --a ARM --b ARM [--assert thresholds.conf]")
+        print("用法: car-compare.py <campaign 目录...> --a CAR --b CAR [--assert thresholds.conf]")
         return 1
     data = load(camps)
     print(f"对比: A={a}  B={b}  campaign={', '.join(os.path.basename(c) for c in camps)}")
     for track in sorted({t for (_, t) in data}):
         write_table(data, a, b, track, "+".join(os.path.basename(c)[-15:] for c in camps))
         query_table(data, a, b, track)
-    # 合池提示：同一臂在多 campaign 的轮数
-    for (arm, track), rounds in sorted(data.items()):
+    # 合池提示：同一车在多 campaign 的轮数
+    for (car, track), rounds in sorted(data.items()):
         ws = [r for r in rounds if "w" in rounds[r]]
-        print(f"  池: arm={arm} track={track} 有效轮={len(ws)} 来自 {[rounds[r]['camp'] for r in sorted(ws)]}")
+        print(f"  池: car={car} track={track} 有效轮={len(ws)} 来自 {[rounds[r]['camp'] for r in sorted(ws)]}")
     if thr_path:
         rules = load_thresholds(thr_path)
         if rules:

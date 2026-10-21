@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""bench-report.py —— 三臂 × 三赛道单文件 HTML 报告（离线可看，echarts 内联）
+"""bench-report.py —— 三车 × 三赛道单文件 HTML 报告（离线可看，echarts 内联）
 
   python3 bench-report.py --export <exports/20261018-a> --campaign <campaigns/jdk3-20261017-155312> \
       --echarts echarts.min.js --out 报告.html
@@ -12,9 +12,20 @@ import json
 import os
 import statistics
 
+import importlib
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    car_label_mod = importlib.import_module('car_label')
+except ImportError:                                                    # 从别处 import 本文件时
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    car_label_mod = importlib.import_module('car_label')
+car_of = car_label_mod.car_of      # 文档里的车身份（兼容改名前的文档）
+
 DETAIL_CAMP = None   # 由 --campaign 推断
 KEEP_STAT = {"median", "min", "max", "p50", "p90", "p99", "p100", "value"}
-TREND_ARMS = {"kona25", "jdk25", "ez240", "ez250", "es819", "ez3003"}
+TREND_CARS = {"kona25", "jdk25", "ez240", "ez250", "es819", "ez3003"}
 
 
 def med(v):
@@ -43,22 +54,24 @@ def load_detail_metrics(path, camp):
                 continue
             if d.get("stat") not in KEEP_STAT:
                 continue
-            rows.append({k: d.get(k) for k in ("race_id", "fid", "campaign", "arm", "engine", "track", "track_raw",
+            rows.append({k: d.get(k) for k in ("race_id", "fid", "campaign", "engine", "track", "track_raw",
                                                "codec", "valid", "round",
                                                "phase", "task", "family", "stat", "value", "unit")})
+            # 车身份统一口径（兼容改名前的文档：那时 car 存的是 Rally 插件列表）
+            rows[-1]["car"] = car_of(d)
     return rows
 
 
 def build(runs, detail, sysrows, camp):
     W = [r for r in runs if r.get("phase") == "w"]
-    # 1) 明细 campaign：按 (arm, track) 汇总逐轮
+    # 1) 明细 campaign：按 (car, track) 汇总逐轮
     byat = {}
     for r in W:
         if r["campaign"] != camp:
             continue
-        byat.setdefault((r["arm"], r["track"]), []).append(r)
+        byat.setdefault((r["car"], r["track"]), []).append(r)
     detail_card = []
-    for (arm, track), rs in sorted(byat.items()):
+    for (car, track), rs in sorted(byat.items()):
         rs.sort(key=lambda x: x.get("round") or 0)
         env = {}
         for s in sysrows:
@@ -69,7 +82,7 @@ def build(runs, detail, sysrows, camp):
                 if s.get("metric") == k and s.get("value_original") is not None:
                     e[k] = max(e[k], s["value_original"])
         detail_card.append({
-            "arm": arm, "track": track, "campaign": camp,
+            "car": car, "track": track, "campaign": camp,
             "rounds": [{"round": x.get("round"), "fid": x["fid"], "race_id": x["race_id"],
                         "b": x.get("throughput_docs_per_s_whole"), "dur": x.get("write_task_duration_s"),
                         "status": x.get("status"), "valid": x.get("valid"),
@@ -79,74 +92,74 @@ def build(runs, detail, sysrows, camp):
             "spread": (lambda v: (max(v) / min(v) - 1) * 100 if v and min(v) else None)(
                 [x.get("throughput_docs_per_s_whole") for x in rs if x.get("throughput_docs_per_s_whole")]),
             "p99": None, "p100": None})
-    # 每臂每赛道的 bulk p99/p100（来自明细指标）
+    # 每车每赛道的 bulk p99/p100（来自明细指标）
     tails = {}
     for m in detail:
         if m["task"] == "index-append" and m["family"] == "service_time" and m["phase"] == "w":
-            tails.setdefault((m["arm"], m["track"]), {}).setdefault(m["stat"], []).append(m["value"])
+            tails.setdefault((m["car"], m["track"]), {}).setdefault(m["stat"], []).append(m["value"])
     for card in detail_card:
-        t = tails.get((card["arm"], card["track"]), {})
+        t = tails.get((card["car"], card["track"]), {})
         card["p99"] = med(t.get("p99"))
         card["p100"] = med(t.get("p100"))
-    # 2) 查询延迟/吞吐分臂聚合（bench-metric 逐场逐操作，3 轮取中位）
+    # 2) 查询延迟/吞吐分车聚合（bench-metric 逐场逐操作，3 轮取中位）
     acc = {}
     for m in detail:
         if m.get("phase") != "q":
             continue
-        acc.setdefault((m.get("track"), m.get("task"), m.get("arm")), {}).setdefault(m.get("stat"), {}) \
+        acc.setdefault((m.get("track"), m.get("task"), m.get("car")), {}).setdefault(m.get("stat"), {}) \
             .setdefault(m.get("family"), []).append(m.get("value"))
     def pick(cell, stat, family):
         v = (cell or {}).get(stat, {}).get(family) or []
         return med(v)
     qops = {}
-    for (track, task, arm), cell in acc.items():
-        qops.setdefault(track, {}).setdefault(task, {})[arm] = {
+    for (track, task, car), cell in acc.items():
+        qops.setdefault(track, {}).setdefault(task, {})[car] = {
             "p50": pick(cell, "p50", "latency"), "p90": pick(cell, "p90", "latency"),
             "p99": pick(cell, "p99", "latency"), "p100": pick(cell, "p100", "latency"),
             "sp50": pick(cell, "p50", "service_time"), "sp99": pick(cell, "p99", "service_time"),
             "rtp": pick(cell, "median", "throughput"), "err": pick(cell, "value", "error_rate")}
-    qrows = [{"track": tr, "task": tk, "vals": {a: (v.get("p50")) for a, v in armsv.items()}}
-             for tr, tmap in qops.items() for tk, armsv in tmap.items()]
-    # bulk 写入尾部分臂（同赛道内比臂，不跨赛道）
+    qrows = [{"track": tr, "task": tk, "vals": {a: (v.get("p50")) for a, v in carsv.items()}}
+             for tr, tmap in qops.items() for tk, carsv in tmap.items()]
+    # bulk 写入尾部分车（同赛道内比车，不跨赛道）
     bulk = {}
     for m in detail:
         if m.get("phase") != "w" or m.get("task") != "index-append" or m.get("family") != "service_time":
             continue
-        bulk.setdefault((m.get("arm"), m.get("track")), {}).setdefault(m.get("stat"), []).append(m.get("value"))
-    bulk_card = [{"arm": a, "track": t,
+        bulk.setdefault((m.get("car"), m.get("track")), {}).setdefault(m.get("stat"), []).append(m.get("value"))
+    bulk_card = [{"car": a, "track": t,
                   "p50": med(v.get("p50")), "p90": med(v.get("p90")), "p99": med(v.get("p99")),
                   "p100": med(v.get("p100")), "median": med(v.get("median"))}
                  for (a, t), v in sorted(bulk.items())]
-    # 3) 历史趋势：按 campaign 时间的各臂口径B 中位（geo/hnsw/nested）
+    # 3) 历史趋势：按 campaign 时间的各车口径B 中位（geo/hnsw/nested）
     #    ⚠ 两个必须过滤的混淆：① codec campaign 的场 track 也归一成 geo，若不分 codec，
     #    同一个 x 点会把 default 与 ZSTD/bc 的场平均成一个数；② 作废 attempt 的写赛也有吞吐，
     #    不能混进来（valid is False 的行直接跳过，valid 未知的保留并在 ⚠ 里体现）。
     tl = {}
     for r in W:
-        if r["arm"] not in TREND_ARMS or not r.get("throughput_docs_per_s_whole"):
+        if r["car"] not in TREND_CARS or not r.get("throughput_docs_per_s_whole"):
             continue
         if r.get("track") not in ("geo", "hnsw", "nested"):
             continue
         if r.get("valid") is False:
             continue
-        key = (r["arm"], r["track"], r.get("codec") or "")
+        key = (r["car"], r["track"], r.get("codec") or "")
         tl.setdefault(key, {}).setdefault(r["campaign"], []).append(
             r["throughput_docs_per_s_whole"])
     trend = {}
-    for (arm, track, codec), camps in tl.items():
+    for (car, track, codec), camps in tl.items():
         pts = []
         for campname, vs in camps.items():
-            same = [r for r in W if r["campaign"] == campname and r["arm"] == arm]
+            same = [r for r in W if r["campaign"] == campname and r["car"] == car]
             warn = any("heap 声明不实" in " ".join(r.get("caliber_warnings") or []) for r in same)
             # es819 在 10-18 之前没有 es_heap_pin：ES 出厂 jvm.options 无 -Xms/-Xmx，实际走
             # JVM 默认（物理内存 1/4 = 8g），与 16g 点不可同线比较
-            if arm == "es819" and same and all(r.get("heap_max_measured_mb") is None for r in same):
+            if car == "es819" and same and all(r.get("heap_max_measured_mb") is None for r in same):
                 warn = True
             pts.append({"campaign": campname, "codec": codec or None, "n": len(vs),
                         "ts": min((r.get("@timestamp") or "" for r in same), default=""),
                         "med": med(vs), "warn": warn})
         pts.sort(key=lambda x: x["ts"])
-        trend.setdefault(track, []).append({"arm": arm, "codec": codec or None, "points": pts})
+        trend.setdefault(track, []).append({"car": car, "codec": codec or None, "points": pts})
     # 4) 环境序列
     envseries = {}
     for s in sysrows:
@@ -159,9 +172,9 @@ def build(runs, detail, sysrows, camp):
 
 
 def build_codec(runs, detail, camp):
-    """geonames 存储压缩对比（5 组 arm×track 组合臂）专用汇总。
-    codec 是索引设置维度、不是引擎维度，所以分组键是 engine|track_raw，不能用 arm|track。"""
-    ARM_LABEL = {("jdk25", "geo-codec-def"): "ez-def", ("jdk25", "geo-codec-zstd-sr"): "ez-zstd-sr",
+    """geonames 存储压缩对比（5 组 car×track 组合车）专用汇总。
+    codec 是索引设置维度、不是引擎维度，所以分组键是 engine|track_raw，不能用 car|track。"""
+    CAR_LABEL = {("jdk25", "geo-codec-def"): "ez-def", ("jdk25", "geo-codec-zstd-sr"): "ez-zstd-sr",
                  ("kona25", "geo-codec-zstd-sr"): "ez-kona-zstd-sr",
                  ("es819", "geo-codec-def"): "es8-def", ("es819", "geo-codec-bc"): "es8-bc"}
     rows = [r for r in runs if r.get("campaign") == camp and r.get("valid") and r.get("fid")]
@@ -169,7 +182,7 @@ def build_codec(runs, detail, camp):
         return None
     grp = {}
     for r in rows:
-        key = ARM_LABEL.get((r.get("engine"), r.get("track_raw"))) or \
+        key = CAR_LABEL.get((r.get("engine"), r.get("track_raw"))) or \
             "%s-%s" % (r.get("engine"), r.get("track_raw"))
         grp.setdefault(key, {"w": [], "q": []})["w" if r.get("phase") == "w" else "q"].append(r)
 
@@ -187,10 +200,10 @@ def build_codec(runs, detail, camp):
                 out.append(v)
         return out
 
-    arms = []
+    cars = []
     for key, v in grp.items():
         ws, bs = v["w"], [x.get("throughput_docs_per_s_whole") for x in v["w"]]
-        arms.append({"key": key, "engine": (ws[0].get("engine") if ws else None),
+        cars.append({"key": key, "engine": (ws[0].get("engine") if ws else None),
                     "track_raw": (ws[0].get("track_raw") if ws else None),
                     "codec": (ws[0].get("codec") if ws else None),
                     "n": len(v["w"]), "med_b": med(bs), "spread": spread(bs),
@@ -208,12 +221,12 @@ def build_codec(runs, detail, camp):
                     "rounds": [{"round": x.get("round"), "fid": x["fid"], "b": x.get("throughput_docs_per_s_whole"),
                                 "dur": x.get("write_task_duration_s"), "store": x.get("store_size_gb_post_merge"),
                                 "status": x.get("status")} for x in sorted(v["w"], key=lambda y: y.get("round") or 0)]})
-    base = med([a["store"] for a in arms if a["key"] == "ez-def"] or [None])
-    for a in arms:
+    base = med([a["store"] for a in cars if a["key"] == "ez-def"] or [None])
+    for a in cars:
         a["store_delta"] = (a["store"] / base - 1) * 100 if (a["store"] and base) else None
     order = [k for k in ("ez-def", "ez-zstd-sr", "ez-kona-zstd-sr", "es8-def", "es8-bc")
-             if k in [a["key"] for a in arms]]
-    arms.sort(key=lambda a: order.index(a["key"]) if a["key"] in order else 99)
+             if k in [a["key"] for a in cars]]
+    cars.sort(key=lambda a: order.index(a["key"]) if a["key"] in order else 99)
 
     # 逐操作查询延迟 p50（bench-metric 里 family=latency / stat=p50，已归一为秒）
     acc = {}
@@ -222,7 +235,7 @@ def build_codec(runs, detail, camp):
             continue
         if m.get("family") != "latency" or m.get("stat") != "p50":
             continue
-        key = ARM_LABEL.get((m.get("arm") or m.get("engine"), m.get("track_raw")))
+        key = CAR_LABEL.get((m.get("car") or m.get("engine"), m.get("track_raw")))
         if not key:
             continue
         acc.setdefault(m["task"], {}).setdefault(key, []).append(m["value"])
@@ -234,7 +247,7 @@ def build_codec(runs, detail, camp):
                       if vals.get("ez-zstd-sr") and vals.get("ez-def") else None,
                       "d_es": (vals.get("es8-bc") / vals["es8-def"] - 1) * 100
                       if vals.get("es8-bc") and vals.get("es8-def") else None})
-    return {"camp": camp, "arms": arms, "keys": order, "qrows": qrows,
+    return {"camp": camp, "cars": cars, "keys": order, "qrows": qrows,
             "docs": (rows[0].get("corpus") or {}).get("docs")}
 
 
@@ -273,38 +286,38 @@ const cls=v=>v==null?'mute':(v>0?'bad':(v<0?'good':'mute'));
 document.getElementById('hd').innerHTML=D.head.map(x=>x).join('　·　');
 
 /* 1 写入总览 */
-let c=card('① 写入吞吐（口径B＝语料条数 ÷ index-append 任务时长；与 rally 的 warmup 设置无关）','geo/nested 各 3 轮、hnsw 3 轮，三臂在同一 campaign 内按轮右旋交错配对；柱上点为逐轮实测');
+let c=card('① 写入吞吐（口径B＝语料条数 ÷ index-append 任务时长；与 rally 的 warmup 设置无关）','geo/nested 各 3 轮、hnsw 3 轮，三车在同一 campaign 内按轮右旋交错配对；柱上点为逐轮实测');
 let box=el('div','chart');c.appendChild(box);
-let tr=[...new Set(D.cards.map(x=>x.track))],arms=[...new Set(D.cards.map(x=>x.arm))];
+let tr=[...new Set(D.cards.map(x=>x.track))],cars=[...new Set(D.cards.map(x=>x.car))];
 const colors={kona25:'#c0392b',jdk25:'#12355b',ez240:'#7f8c8d'};
 mk(box, {tooltip:{trigger:'axis'},legend:{top:0},grid:{top:36,bottom:30},
  xAxis:{type:'category',data:tr},yAxis:[{type:'value',name:'docs/s'}],
- series:arms.map(a=>({name:a,type:'bar',barMaxWidth:56,itemStyle:{color:colors[a]||'#999'},
+ series:cars.map(a=>({name:a,type:'bar',barMaxWidth:56,itemStyle:{color:colors[a]||'#999'},
    label:{show:true,position:'top',formatter:p=>num(p.value)},
-   data:tr.map(t=>{const x=D.cards.find(y=>y.arm===a&&y.track===t);return x?Math.round(x.med_b):null}),
+   data:tr.map(t=>{const x=D.cards.find(y=>y.car===a&&y.track===t);return x?Math.round(x.med_b):null}),
    markPoint:{symbol:'circle',symbolSize:7,itemStyle:{color:'#000'},
-     data:(()=>{let r=[];tr.forEach((t,i)=>{const x=D.cards.find(y=>y.arm===a&&y.track===t);(x?.rounds||[]).forEach(q=>{if(q.b!=null)r.push({coord:[i,q.b],value:''})})});return r})()}}))});
+     data:(()=>{let r=[];tr.forEach((t,i)=>{const x=D.cards.find(y=>y.car===a&&y.track===t);(x?.rounds||[]).forEach(q=>{if(q.b!=null)r.push({coord:[i,q.b],value:''})})});return r})()}}))});
 
-/* 2 写入尾部：同赛道内比臂（bulk service_time，3 轮中位） */
-c=card('② 写入尾部：bulk service_time 分臂对比（每个赛道一张，臂只在同赛道内可比）','跨赛道比绝对值没意义（bulk 尺寸/文档大小/建图成本都不同）；这里 x 轴是轮内分位，三条线分别是三个臂');
+/* 2 写入尾部：同赛道内比车（bulk service_time，3 轮中位） */
+c=card('② 写入尾部：bulk service_time 分车对比（每个赛道一张，车只在同赛道内可比）','跨赛道比绝对值没意义（bulk 尺寸/文档大小/建图成本都不同）；这里 x 轴是轮内分位，三条线分别是三个车');
 {const B=D.bulk||[],TS=[...new Set(B.map(x=>x.track))];
  const box=document.createElement('div');box.style.display='grid';box.style.gridTemplateColumns='repeat(auto-fit,minmax(340px,1fr))';box.style.gap='10px';c.appendChild(box);
  TS.forEach(t=>{const rows=B.filter(x=>x.track===t);const div=el('div','chart');box.appendChild(div);
   mk(div,{title:{text:t+' — bulk service_time（ms）',left:'center',textStyle:{fontSize:13}},
    tooltip:{trigger:'axis',valueFormatter:v=>num(v,1)+' ms'},legend:{bottom:0},grid:{top:40,bottom:34,left:60,right:16},
    xAxis:{type:'category',data:['p50','p90','p99','p100 最差']},yAxis:{type:'log',name:'ms'},
-   series:rows.map(x=>({name:x.arm,type:'line',symbol:'circle',symbolSize:7,lineStyle:{width:2.2,color:colors[x.arm]||'#999'},
-     itemStyle:{color:colors[x.arm]||'#999'},data:[x.p50,x.p90,x.p99,x.p100].map(v=>v==null?null:v*1000)}))});})}
+   series:rows.map(x=>({name:x.car,type:'line',symbol:'circle',symbolSize:7,lineStyle:{width:2.2,color:colors[x.car]||'#999'},
+     itemStyle:{color:colors[x.car]||'#999'},data:[x.p50,x.p90,x.p99,x.p100].map(v=>v==null?null:v*1000)}))});})}
 
 /* 3 逐轮明细 + 环境 */
 c=card('③ 逐场明细：吞吐、任务时长、环境实测','steal 来自每场分相位采样（w/m/q 三相位 × 三节点取最坏，5s 周期），只记录不参与判定；steal 全程 0 说明本环境宿主抢占不是波动主因');
-let tb=el('table');tb.innerHTML='<tr><th>场</th><th>臂</th><th>赛道</th><th>口径B docs/s</th><th>任务 s</th><th>steal 峰%</th><th>判定</th></tr>'+
- D.cards.flatMap(x=>x.rounds.map(q=>`<tr><td>${q.fid}</td><td class=mut>${x.arm}</td><td>${x.track}</td><td>${num(q.b)}</td><td>${num(q.dur,1)}</td><td>${num((q.env.cpu_steal_max||0),2)}</td><td>${q.status||'—'}</td></tr>`));
+let tb=el('table');tb.innerHTML='<tr><th>场</th><th>车</th><th>赛道</th><th>口径B docs/s</th><th>任务 s</th><th>steal 峰%</th><th>判定</th></tr>'+
+ D.cards.flatMap(x=>x.rounds.map(q=>`<tr><td>${q.fid}</td><td class=mut>${x.car}</td><td>${x.track}</td><td>${num(q.b)}</td><td>${num(q.dur,1)}</td><td>${num((q.env.cpu_steal_max||0),2)}</td><td>${q.status||'—'}</td></tr>`));
 c.appendChild(tb);
 
-/* 4 查询延迟分臂（每赛道一张，log 轴；下面附同数据表格） */
-c=card('④ 查询延迟 p50 分臂对比（3 轮中位，ms；对数轴）','只在同赛道内比臂。操作按 2.5.0-GraalVM(jdk25) 的 p50 降序；Δ 列表同下');
-{const Q=D.qops||{};const AT=[...new Set((D.cards||[]).map(x=>x.arm))];
+/* 4 查询延迟分车（每赛道一张，log 轴；下面附同数据表格） */
+c=card('④ 查询延迟 p50 分车对比（3 轮中位，ms；对数轴）','只在同赛道内比车。操作按 2.5.0-GraalVM(jdk25) 的 p50 降序；Δ 列表同下');
+{const Q=D.qops||{};const AT=[...new Set((D.cards||[]).map(x=>x.car))];
  Object.keys(Q).forEach(t=>{const tasks=Object.keys(Q[t]).sort((a,b)=>((Q[t][b].jdk25||{}).p50||0)-((Q[t][a].jdk25||{}).p50||0));
   const h=Math.max(300,26*tasks.length);const div=el('div','chart');div.style.height=h+'px';c.appendChild(div);
   mk(div,{title:{text:t+' — 各操作 p50（ms）',left:'center',textStyle:{fontSize:13}},
@@ -313,16 +326,16 @@ c=card('④ 查询延迟 p50 分臂对比（3 轮中位，ms；对数轴）','�
    xAxis:{type:'log',name:'ms'},yAxis:{type:'category',data:tasks,inverse:true,axisLabel:{fontSize:10}},
    series:AT.map(a=>({name:a,type:'bar',barMaxWidth:12,itemStyle:{color:colors[a]||'#999'},
      data:tasks.map(tk=>{const v=(Q[t][tk]||{})[a];return v&&v.p50!=null?+(v.p50*1000).toFixed(2):null})}))});});}
-let tbl=el('table');tbl.innerHTML='<tr><th>操作</th>'+arms.map(a=>`<th>${a}</th>`).join('')+`<th>Kona vs GraalVM</th><th>2.5.0 vs 2.4.0</th></tr>`+
+let tbl=el('table');tbl.innerHTML='<tr><th>操作</th>'+cars.map(a=>`<th>${a}</th>`).join('')+`<th>Kona vs GraalVM</th><th>2.5.0 vs 2.4.0</th></tr>`+
   D.qrows.map(x=>{const v=x.vals||{};const kg=(v.kona25&&v.jdk25)?(v.kona25/v.jdk25-1)*100:null;
    const gn=(v.jdk25&&v.ez240)?(v.jdk25/v.ez240-1)*100:null;
-   return `<tr><td>${x.track}·${x.task}</td>`+arms.map(a=>`<td>${ms(v[a],1)}</td>`).join('')+
+   return `<tr><td>${x.track}·${x.task}</td>`+cars.map(a=>`<td>${ms(v[a],1)}</td>`).join('')+
    `<td class="${cls(kg)}">${pct(kg)}</td><td class="${cls(gn)}">${pct(gn)}</td></tr>`}).join('');
 c.appendChild(tbl);
 
 /* 5 尾部放大比 p99/p50 */
-c=card('⑤ 尾部放大倍数 p99/p50（同臂同操作，无量纲）','比值大＝该操作在不同轮/不同请求间抖动剧烈；跨赛道可比，因为它已经把绝对延迟归一掉了');
-{const Q=D.qops||{};const AT=[...new Set((D.cards||[]).map(x=>x.arm))];const rows=[];
+c=card('⑤ 尾部放大倍数 p99/p50（同车同操作，无量纲）','比值大＝该操作在不同轮/不同请求间抖动剧烈；跨赛道可比，因为它已经把绝对延迟归一掉了');
+{const Q=D.qops||{};const AT=[...new Set((D.cards||[]).map(x=>x.car))];const rows=[];
  Object.keys(Q).forEach(t=>Object.keys(Q[t]).forEach(tk=>{const r={};AT.forEach(a=>{const v=(Q[t][tk]||{})[a];
    if(v&&v.p50&&v.p99!=null)r[a]=v.p99/v.p50});if(Object.keys(r).length)rows.push({label:t+'·'+tk,...r})}));
  rows.sort((x,y)=>(y.jdk25||0)-(x.jdk25||0));const top=rows.slice(0,18);
@@ -334,7 +347,7 @@ c=card('⑤ 尾部放大倍数 p99/p50（同臂同操作，无量纲）','比值
 
 /* 6 查询吞吐 ops/s */
 c=card('⑥ 查询吞吐（rally 实测 ops/s，3 轮中位）','target-throughput 限流的操作，吞吐差异即延迟差异；未限流的迭代型操作这里为 null');
-{const Q=D.qops||{};const AT=[...new Set((D.cards||[]).map(x=>x.arm))];const rows=[];
+{const Q=D.qops||{};const AT=[...new Set((D.cards||[]).map(x=>x.car))];const rows=[];
  Object.keys(Q).forEach(t=>Object.keys(Q[t]).forEach(tk=>{const v=Q[t][tk];const any=AT.some(a=>v[a]&&v[a].rtp);
    if(any)rows.push({label:t+'·'+tk,...Object.fromEntries(AT.map(a=>[a,v[a]?v[a].rtp:null]))})}));
  rows.sort((x,y)=>(y.jdk25||0)-(x.jdk25||0));const top=rows.slice(0,20);
@@ -345,9 +358,9 @@ c=card('⑥ 查询吞吐（rally 实测 ops/s，3 轮中位）','target-throughp
   series:AT.map(a=>({name:a,type:'bar',barMaxWidth:12,itemStyle:{color:colors[a]||'#999'},data:top.map(x=>x[a])}))});}
 
 /* 7 历史趋势 */
-c=card('⑦ 历史趋势：各臂口径B 中位（跨 campaign，实线=geo、虚线=hnsw/nested）','一条线＝同一个（臂×赛道×codec）在不同 campaign 的走势：纵向起伏=环境/窗口漂移，不是代码差异；**只有同一个 x（同一 campaign）上的不同线才是配对可比的**。⚠ = 该点口径有问题（ds3 的 ez 臂实际 1g 堆；es819 在 10-18 之前没钉堆、实际 8g）；跨 campaign 的绝对值只可看趋势，不可直接相减');
+c=card('⑦ 历史趋势：各车口径B 中位（跨 campaign，实线=geo、虚线=hnsw/nested）','一条线＝同一个（车×赛道×codec）在不同 campaign 的走势：纵向起伏=环境/窗口漂移，不是代码差异；**只有同一个 x（同一 campaign）上的不同线才是配对可比的**。⚠ = 该点口径有问题（ds3 的 ez 车实际 1g 堆；es819 在 10-18 之前没钉堆、实际 8g）；跨 campaign 的绝对值只可看趋势，不可直接相减');
 box=el('div','chart tall');c.appendChild(box);
-let gpts=[];for(const t in D.trend)D.trend[t].forEach(s=>s.points.forEach(p=>gpts.push({...p,track:t,arm:s.arm,key:s.arm+(s.codec?'｜'+s.codec:'')})));
+let gpts=[];for(const t in D.trend)D.trend[t].forEach(s=>s.points.forEach(p=>gpts.push({...p,track:t,car:s.car,key:s.car+(s.codec?'｜'+s.codec:'')})));
 const tracks2=[...new Set(gpts.map(p=>p.track))];
 const camps=[...new Set(gpts.map(p=>p.campaign))].sort();
 mk(box, {tooltip:{trigger:'axis',formatter:ps=>ps.filter(p=>p.data).map(p=>`${p.seriesName} ${num(p.value)}（${p.data.campaign}，n=${p.data.n}${p.data.warn?'，⚠口径警告':''}）`).join('<br>')},
@@ -357,7 +370,7 @@ mk(box, {tooltip:{trigger:'axis',formatter:ps=>ps.filter(p=>p.data).map(p=>`${p.
  series:tracks2.map(t=>[...new Set(gpts.filter(p=>p.track===t).map(p=>p.key))].map(k=>({
    name:k,type:'line',smooth:false,symbolSize:6,connectNulls:false,
    lineStyle:{width:t==='geo'?2.4:1.2,type:t==='geo'?'solid':'dashed'},
-   itemStyle:{color:(colors[gpts.find(p=>p.key===k).arm])||'#999'},
+   itemStyle:{color:(colors[gpts.find(p=>p.key===k).car])||'#999'},
    data:(()=>{let m={};gpts.filter(p=>p.track===t&&p.key===k).forEach(p=>m[p.campaign]=p);
      return camps.map(x=>m[x]?{value:Math.round(m[x].med),campaign:x,n:m[x].n,warn:m[x].warn}:null)})()}))).flat()});
 
@@ -378,10 +391,10 @@ c=card('⑨ 本轮结论（27 场，全部 VALID）');
 c.innerHTML+=`<div class=note>${D.concl.map(x=>'· '+x).join('<br>')}</div>`;
 /* 10-12 存储压缩对比（仅当载荷里有 codec campaign 时渲染） */
 if(D.codec){
- const A=D.codec.arms,KS=D.codec.keys;
+ const A=D.codec.cars,KS=D.codec.keys;
  const acol={'ez-def':'#12355b','ez-zstd-sr':'#0a7a3c','ez-kona-zstd-sr':'#c0392b','es8-def':'#7f8c8d','es8-bc':'#e08214'};
  c=card('⑩ geonames 存储压缩对比：赛末落盘体积（forcemerge 之后，三节点 store 之和）',
-   `组合臂＝引擎×索引 settings 变体。体积取 q 阶段 sidecar 的 _nodes/stats 三节点之和——race.json 的 store_size 是写赛结束快照，那时本场 forcemerge 还没跑，多段态会掩盖 codec 差异。每场压同一份 ${num(D.codec.docs)} 条语料、3 分片 0 副本、16g 堆 32 核。`);
+   `组合车＝引擎×索引 settings 变体。体积取 q 阶段 sidecar 的 _nodes/stats 三节点之和——race.json 的 store_size 是写赛结束快照，那时本场 forcemerge 还没跑，多段态会掩盖 codec 差异。每场压同一份 ${num(D.codec.docs)} 条语料、3 分片 0 副本、16g 堆 32 核。`);
  box=el('div','chart');c.appendChild(box);
  mk(box,{tooltip:{trigger:'axis',formatter:ps=>ps.map(p=>{const a=A.find(x=>x.key===p.name);return `${p.name}<br>store ${num(p.value,2)} GB（vs ez-def ${pct(a?a.store_delta:null)}）<br>实测 codec：${a?.codec||'—'}`}).join('<br>')},
   grid:{top:30,bottom:40},xAxis:{type:'category',data:KS,axisLabel:{interval:0,fontSize:11}},
@@ -389,7 +402,7 @@ if(D.codec){
   series:[{type:'bar',barMaxWidth:70,data:KS.map(k=>{const a=A.find(x=>x.key===k);return{value:a?a.store:null,name:k,itemStyle:{color:acol[k]||'#999'}}}),
    label:{show:true,position:'top',formatter:p=>{const a=A.find(x=>x.key===p.name);return num(p.value,2)+'\n'+pct(a?a.store_delta:null)}}}]});
 
- c=card('⑪ 同一批的写入吞吐（口径B，逐轮实测点）','codec 只改存储编码，不改查询；若体积换来的收益要付写入，就体现在这里。极差是同臂 3 轮的 max/min−1');
+ c=card('⑪ 同一批的写入吞吐（口径B，逐轮实测点）','codec 只改存储编码，不改查询；若体积换来的收益要付写入，就体现在这里。极差是同车 3 轮的 max/min−1');
  box=el('div','chart');c.appendChild(box);
  mk(box,{tooltip:{trigger:'axis'},grid:{top:30,bottom:40},xAxis:{type:'category',data:KS,axisLabel:{interval:0,fontSize:11}},
   yAxis:{type:'value',name:'docs/s'},
@@ -398,7 +411,7 @@ if(D.codec){
     label:{show:true,position:'top',formatter:p=>num(p.value)},
     markPoint:{symbol:'circle',symbolSize:7,itemStyle:{color:'#000'},
       data:(()=>{let r=[];KS.forEach((k,i)=>{(A.find(x=>x.key===k)?.rounds||[]).forEach(q=>{if(q.b!=null)r.push({coord:[i,Math.round(q.b)],value:''})})});return r})()}}]});
- let tb=el('table');tb.innerHTML='<tr><th>组合臂</th><th>实测 codec</th><th>引擎 / JDK</th><th>heap 实测</th><th>核数实测</th><th>n</th><th>口径B 中位</th><th>极差</th><th>赛末 GB</th><th>vs ez-def</th></tr>'+
+ let tb=el('table');tb.innerHTML='<tr><th>组合车</th><th>实测 codec</th><th>引擎 / JDK</th><th>heap 实测</th><th>核数实测</th><th>n</th><th>口径B 中位</th><th>极差</th><th>赛末 GB</th><th>vs ez-def</th></tr>'+
   A.map(a=>`<tr><td>${a.key}</td><td>${a.codec||'—'}</td><td>${a.engine||'—'} / ${(a.jdk||[]).join('/')||'—'}${(a.jdk_vendor||[]).length?' · '+a.jdk_vendor.join('/'):''}</td><td>${num(a.heap_mb)} MB</td><td>${num(a.cores)}</td><td>${a.n}</td><td>${num(a.med_b)}</td><td>${pct(a.spread)}</td><td>${num(a.store,2)}</td><td class="${cls(a.store_delta)}">${pct(a.store_delta)}</td></tr>`).join('');
  c.appendChild(tb);
 
@@ -407,8 +420,8 @@ if(D.codec){
   D.codec.qrows.map(x=>`<tr><td>${x.task}</td>`+KS.map(k=>`<td>${ms(x.vals[k],1)}</td>`).join('')+
    `<td class="${cls(x.d_ez)}">${pct(x.d_ez)}</td><td class="${cls(x.d_es)}">${pct(x.d_es)}</td></tr>`).join('');
  c.appendChild(qt);
- // ⑬ 逐操作 p50 分组柱（5 臂同图）+ ⑭ codec 代价排序（Δ% 对同引擎 baseline）
- c=card('⑬ 逐操作查询 p50 五臂同图（3 轮中位，对数轴 ms）','按操作名列，5 个组合臂并排；同一引擎的两根柱之差＝该引擎内部换 codec 的代价');
+ // ⑬ 逐操作 p50 分组柱（5 车同图）+ ⑭ codec 代价排序（Δ% 对同引擎 baseline）
+ c=card('⑬ 逐操作查询 p50 五车同图（3 轮中位，对数轴 ms）','按操作名列，5 个组合车并排；同一引擎的两根柱之差＝该引擎内部换 codec 的代价');
  let d1=el('div','chart');d1.style.height=Math.max(420,22*D.codec.qrows.length)+'px';c.appendChild(d1);
  mk(d1,{tooltip:{trigger:'axis',axisPointer:{type:'shadow'},valueFormatter:v=>v==null?'—':num(v,1)+' ms'},
   legend:{top:0},grid:{top:34,bottom:26,left:230,right:30},
@@ -459,27 +472,27 @@ def main():
         payload["codec"] = build_codec(runs, load_detail_metrics(
             os.path.join(args.export, "bench-metric.jsonl"), ccamp), ccamp)
     payload["head"] = [
-        "campaign %s：3 臂 × 3 赛道 × 3 轮 = 27 场，全 VALID、0 重试" % camp,
+        "campaign %s：3 车 × 3 赛道 × 3 轮 = 27 场，全 VALID、0 重试" % camp,
         "口径 16g 堆 / 32 vCPU 逐场实测断言；负载卡点仅起跑前一次，赛中分相位采样只记录",
         "写入暖机：geo 20s、nested 25s、hnsw 40s（原 geo 70s / nested 120s 会吃掉测量窗口）",
         "生成于导出载荷 bench-run/bench-metric（离线，未依赖 ES）",
     ]
     payload["concl"] = [
-        "Kona 25 与 Oracle GraalVM 25 在三赛道写入上全部持平：geo +0.6%、hnsw +1.9%、nested +2.2%，均小于同臂轮间极差（7.8~25.5%）。此前「Kona 快 14~17%」与「nested GraalVM 快 19%」均未复现，已撤回。",
+        "Kona 25 与 Oracle GraalVM 25 在三赛道写入上全部持平：geo +0.6%、hnsw +1.9%、nested +2.2%，均小于同车轮间极差（7.8~25.5%）。此前「Kona 快 14~17%」与「nested GraalVM 快 19%」均未复现，已撤回。",
         "2.5.0 相对 2.4.0 有实质收益：geonames 写入 +12.4%、hnsw 建库 +21.9%、knn 查询 p50 −15~19%、painless_dynamic −17%、bulk p100 5.6s→4.4s；nested 文档灌入 +0.7%（无收益）。",
-        "复现性最好的赛道是 hnsw（同臂极差 1.3~3.8%），最差是 nested（14.7~25.5%）；比较结论应取中位并要求 ≥3 轮同场配对。",
+        "复现性最好的赛道是 hnsw（同车极差 1.3~3.8%），最差是 nested（14.7~25.5%）；比较结论应取中位并要求 ≥3 轮同场配对。",
         "环境证据：27 场分相位采样显示 steal 全程 0.00%、iowait ≤2%、disk util 3~5%、load1 ≤6.6（32 核）、ENV-VERDICT 全 OK ⇒ 宿主抢占无法解释历史上 45% 的读数散布；跨 campaign 电平漂移（hnsw 三批 4828→4652→4199）需在集群内部（merge/页缓存/JIT 状态）继续找因。",
     ]
     if payload.get("codec"):
-        ca = {a["key"]: a for a in payload["codec"]["arms"]}
+        ca = {a["key"]: a for a in payload["codec"]["cars"]}
         ez, zst, bc, esd = ca.get("ez-def"), ca.get("ez-zstd-sr"), ca.get("es8-bc"), ca.get("es8-def")
         scroll = next((q for q in payload["codec"]["qrows"] if q["task"] == "scroll"), None)
-        payload["head"].append("⑩-⑭ 来自 codec campaign %s：5 组「引擎×索引 settings」组合臂 × 3 轮 = 15 场，全 VALID" % ccamp)
+        payload["head"].append("⑩-⑭ 来自 codec campaign %s：5 组「引擎×索引 settings」组合车 × 3 轮 = 15 场，全 VALID" % ccamp)
         if ez and zst and bc:
             payload["concl"] = [
                 "存储压缩主结论：Easysearch 2.5.0 开 `index.codec=ZSTD` + `index.source_reuse` 后，geonames 赛末落盘 %.2f GB（比默认 LZ4 的 %.2f GB 省 %.1f%%）；ES 8.19 开 best_compression 只到 %.2f GB（省 %.1f%%）。同语料、同 3 分片 0 副本、同 16g 堆 32 核，且两侧 codec 都从 sidecar 的 `_settings` 回读确认生效。" % (
                     zst["store"], ez["store"], -zst["store_delta"], bc["store"], -bc["store_delta"]),
-                "写入不赔：ez-zstd-sr 口径B %.0f docs/s vs ez-def %.0f（差 %.1f%%，远小于同臂轮间极差 %.1f%%/%.1f%%）。" % (
+                "写入不赔：ez-zstd-sr 口径B %.0f docs/s vs ez-def %.0f（差 %.1f%%，远小于同车轮间极差 %.1f%%/%.1f%%）。" % (
                     zst["med_b"], ez["med_b"], (zst["med_b"] / ez["med_b"] - 1) * 100,
                     ez["spread"] or 0, zst["spread"] or 0),
                 "代价在读 stored fields 的操作：%s。走 doc_values 的聚合/计数不动。" % (

@@ -33,14 +33,14 @@ def write(path, text):
         f.write(text)
 
 
-def make_legacy_campaign(root, cid, arms, tracks, rounds, fields):
+def make_legacy_campaign(root, cid, cars, tracks, rounds, fields):
     """造一个非排程模式的 campaign 目录。
 
     fields: [(fid, status, minutes)]，按实际顺序给。
     """
     d = os.path.join(root, cid)
-    prog = ['[%s] campaign %s 启动: arms=[%s] tracks=%s rounds=%d'
-            % ('2026-10-20 10:00:00', cid, ' '.join(arms), ' '.join(tracks), rounds)]
+    prog = ['[%s] campaign %s 启动: cars=[%s] tracks=%s rounds=%d'
+            % ('2026-10-20 10:00:00', cid, ' '.join(cars), ' '.join(tracks), rounds)]
     races = ['# RACES — %s' % cid, '| 场次 | 状态 | 赛前卡点 | 用时 |', '|---|---|---|---|']
     for i, (fid, status, mins) in enumerate(fields, 1):
         prog.append('[2026-10-20 10:%02d:00] ===== [%d] %s 开始 =====' % (i % 60, i, fid))
@@ -60,7 +60,7 @@ def make_legacy_campaign(root, cid, arms, tracks, rounds, fields):
 def make_schedule_campaign(root, cid, sched_rows, races_rows, progress_extra=None):
     """造一个排程模式的 campaign 目录。
 
-    sched_rows: [(arm, track, round, recall, est)]
+    sched_rows: [(car, track, round, recall, est)]
     races_rows: [(fid, status, dur)]
     progress_extra: 追加到 PROGRESS 的行
     """
@@ -75,7 +75,7 @@ def make_schedule_campaign(root, cid, sched_rows, races_rows, progress_extra=Non
     prog = ['[2026-10-20 02:11:51] campaign %s 启动: configs=[] tracks=%s rounds=1（轮内右旋配对交错）'
             % (cid, ' '.join(sorted({r[1] for r in sched_rows}))),
             '[2026-10-20 02:12:04] 窗底守卫: 12h（截止 2026-10-20 13:52:04 之前放不下的场次 DEADLINE-SKIP）',
-            '[2026-10-20 02:12:05] 排程模式: _sched/%s.conf（臂定义 _sched/%s-arms.conf）' % (cid, cid)]
+            '[2026-10-20 02:12:05] 排程模式: _sched/%s.conf（车定义 _sched/%s-cars.conf）' % (cid, cid)]
     if progress_extra:
         prog += progress_extra
     races = ['# RACES — %s' % cid, '| 场次 | 状态 | 赛前卡点 | 用时 |', '|---|---|---|---|']
@@ -97,11 +97,11 @@ class TestOrderForRound(unittest.TestCase):
         self.assertEqual(Q.order_for_round(3, n), [1, 2, 0])
         self.assertEqual(Q.order_for_round(4, n), [0, 1, 2])   # 轮次循环
 
-    def test_two_arms(self):
+    def test_two_cars(self):
         self.assertEqual(Q.order_for_round(1, 2), [0, 1])
         self.assertEqual(Q.order_for_round(2, 2), [1, 0])
 
-    def test_single_arm(self):
+    def test_single_car(self):
         self.assertEqual(Q.order_for_round(1, 1), [0])
         self.assertEqual(Q.order_for_round(9, 1), [0])
 
@@ -111,7 +111,7 @@ class TestParse(unittest.TestCase):
         text = "# 注释行\njdk25 ds-g1920 1 recall 52\n\n  es819 ds-j1024 1 norecall 42  \n"
         rows = Q.parse_schedule(text)
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0], {'arm': 'jdk25', 'track': 'ds-g1920', 'rnd': 1,
+        self.assertEqual(rows[0], {'car': 'jdk25', 'track': 'ds-g1920', 'rnd': 1,
                                    'recall': 'recall', 'est': 52})
         self.assertEqual(rows[1]['est'], 42)
 
@@ -121,12 +121,12 @@ class TestParse(unittest.TestCase):
         self.assertEqual(st[3], ['OK', 'FAIL'])      # 同一行两种结果都要留住
 
     def test_split_fid(self):
-        arms, tracks = ['es819', 'jdk25'], ['ds-g1920', 'ds-j1024', 'geo']
-        self.assertEqual(Q.split_fid('jdk25-ds-j1024-r2', arms, tracks)[:3],
+        cars, tracks = ['es819', 'jdk25'], ['ds-g1920', 'ds-j1024', 'geo']
+        self.assertEqual(Q.split_fid('jdk25-ds-j1024-r2', cars, tracks)[:3],
                          ('jdk25', 'ds-j1024', 2))
-        self.assertEqual(Q.split_fid('es819-ds-g1920-r1', arms, tracks)[:3],
+        self.assertEqual(Q.split_fid('es819-ds-g1920-r1', cars, tracks)[:3],
                          ('es819', 'ds-g1920', 1))
-        self.assertEqual(Q.split_fid('jdk25-geo-r1-try3', arms, tracks)[3], 3)
+        self.assertEqual(Q.split_fid('jdk25-geo-r1-try3', cars, tracks)[3], 3)
 
 
 class TestLegacyCampaign(unittest.TestCase):
@@ -136,21 +136,21 @@ class TestLegacyCampaign(unittest.TestCase):
 
     def test_derived_plan_matches_observed_order(self):
         """核心不变式：推导出的队列 == 实际跑出来的顺序（含右旋交错）。"""
-        arms = ['ez240', 'jdk25', 'kona25']
+        cars = ['ez240', 'jdk25', 'kona25']
         tracks = ['geo', 'hnsw', 'nested']
         rounds = 3
-        # 按 run-bench.sh 的展平规则造真实顺序：赛道外层 → 轮次 → 臂右旋
+        # 按 run-bench.sh 的展平规则造真实顺序：赛道外层 → 轮次 → 车右旋
         expected = []
         for tk in tracks:
             for r in range(1, rounds + 1):
-                for idx in Q.order_for_round(r, len(arms)):
-                    expected.append('%s-%s-r%d' % (arms[idx], tk, r))
+                for idx in Q.order_for_round(r, len(cars)):
+                    expected.append('%s-%s-r%d' % (cars[idx], tk, r))
         self.assertEqual(expected[:3], ['ez240-geo-r1', 'jdk25-geo-r1', 'kona25-geo-r1'])
         self.assertEqual(expected[3:6], ['kona25-geo-r2', 'ez240-geo-r2', 'jdk25-geo-r2'])
         self.assertEqual(expected[6:9], ['jdk25-geo-r3', 'kona25-geo-r3', 'ez240-geo-r3'])
 
         fields = [(fid, 'VALID', 20) for fid in expected]
-        make_legacy_campaign(self.root, 'c1', arms, tracks, rounds, fields)
+        make_legacy_campaign(self.root, 'c1', cars, tracks, rounds, fields)
 
         c = Q.build_campaign(Q.Source(self.root), 'c1')
         self.assertEqual(c.mode, 'legacy')
@@ -175,19 +175,19 @@ class TestLegacyCampaign(unittest.TestCase):
     def test_retry_does_not_break_legacy_plan(self):
         """重跑会把同一 fid 再插回时间线中间；legacy 推导的自校验必须按首次出现去重，
         否则会把本来正确的排程误判成"推导不可信"（实测 ds2 campaign 被这么误判过）。"""
-        arms = ['jdk26', 'jdk27']
+        cars = ['jdk26', 'jdk27']
         tracks = ['ds-j1024']
         rounds = 2
         expected = ['jdk26-ds-j1024-r1', 'jdk27-ds-j1024-r1',
                     'jdk27-ds-j1024-r2', 'jdk26-ds-j1024-r2']
-        d = make_legacy_campaign(self.root, 'c4', arms, tracks, rounds,
+        d = make_legacy_campaign(self.root, 'c4', cars, tracks, rounds,
                                  [(f, 'VALID', 20) for f in expected])
         # 时间线：jdk26-r1 / jdk27-r1 先失败，修好后重跑 → 同一 fid 在中间再出现一次
         events = [('jdk26-ds-j1024-r1', 1), ('jdk27-ds-j1024-r1', 1),
                   ('jdk26-ds-j1024-r1', 1), ('jdk27-ds-j1024-r1', 1),
                   ('jdk27-ds-j1024-r2', 3), ('jdk26-ds-j1024-r2', 4)]
-        lines = ['[2026-10-20 10:00:00] campaign c4 启动: arms=[%s] tracks=%s rounds=%d'
-                 % (' '.join(arms), ' '.join(tracks), rounds)]
+        lines = ['[2026-10-20 10:00:00] campaign c4 启动: cars=[%s] tracks=%s rounds=%d'
+                 % (' '.join(cars), ' '.join(tracks), rounds)]
         for i, (fid, seq) in enumerate(events):
             lines.append('[2026-10-20 10:%02d:00] ===== [%d] %s 开始 =====' % (i, seq, fid))
         lines.append('[2026-10-20 11:00:00] campaign 结束: 4/4 场有效。')

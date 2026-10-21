@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 生成 Kibana Saved Objects 导入包(kibana-objects.ndjson), 模仿 opensearch.org/benchmarks:
-  * 每图一个指标族(family), series = arm(实验臂), x 轴 = 场次时间(@timestamp)
+  * 每图一个指标族(family), series = car_label(图例标签：引擎@版本@build@JDK), x 轴 = 场次时间(@timestamp)
   * 面板: 写入吞吐 / 索引耗时 / 查询吞吐 / 查询延迟p90 / 服务时间p99 / 错误率
          / KNN 吞吐 / 向量维度扫描 / 存储 / 段数 / GC
   * 顶部 Markdown = 环境台账(bench-env) + 固定过滤说明; 底部 = 原始层回钻路径
@@ -267,7 +267,7 @@ def tsvb_series(idx, terms_field, metric_type, metric_field, formatter):
     }
 
 
-def tsvb_timeseries(title, panel_filter, formatter, terms_field='arm_label',
+def tsvb_timeseries(title, panel_filter, formatter, terms_field='car_label',
                     metric_type='avg', metric_field='value', index_pattern='bench-metric',
                     interval='1d'):
     return {
@@ -436,19 +436,19 @@ IDX_PHASE_SPECS = [
 
 
 def track_mixed_builds(track):
-    """该赛道是否存在「同一臂跨多个引擎 build」的场次。
+    """该赛道是否存在「同一车跨多个引擎 build」的场次。
 
-    ds3 首轮是 easysearch 2.5.0-3009、ds2 是 2.5.0-3015，臂标签却都是
+    ds3 首轮是 easysearch 2.5.0-3009、ds2 是 2.5.0-3015，车标签却都是
     jdk25/jdk26/jdk27 —— 画在同一条线上就是跨 build 混线，结论会被误读。
 
-    现在面板统一按 arm_label 分线（标签自带 build），这个判断已不需要参与分组，
+    现在面板统一按 car_label 分线（标签自带 build），这个判断已不需要参与分组，
     但保留成体检项：返回 True 的赛道值得在图注里点一句"该赛道跨 build 采集"。
     """
     try:
         r = es_post('/bench-run/_search', {
             "size": 0,
             "query": {"term": {"track": track}},
-            "aggs": {"a": {"terms": {"field": "arm", "size": 30},
+            "aggs": {"a": {"terms": {"field": "car", "size": 30},
                            "aggs": {"b": {"terms": {"field": "engine_build", "size": 10}}}}}})
     except Exception:                                       # noqa: BLE001
         return False
@@ -467,11 +467,11 @@ def track_panel_specs(track, groups, interval):
     #   15 场 nested 就是这样在 valid:true 过滤下混进曲线的。
     # 唯一不放行 degraded 的是错误率面板 —— 它就是要显示失败场次。
     #
-    # 分组字段用 arm_label（引擎@版本@build@JDK，如 ez@2.5.0@3015@graalvm25）：
-    #   一是臂名（ez250 / jdk25@3015）看不出引擎版本与 JDK 发行版，读者没法判断两条线能不能比；
-    #   二是 arm_label 自带 build，跨 build 自动分线 —— 以前靠 arm_build/arm 二选一来避免
-    #   "jdk26 臂跨 3009/3015 两个 build 混成一条线"（ds3 与 ds2 两批数据就是这么混起来的）。
-    split = 'arm_label'
+    # 分组字段用 car_label（引擎@版本@build@JDK，如 ez@2.5.0@3015@graalvm25）：
+    #   一是车名（ez250 / jdk25@3015）看不出引擎版本与 JDK 发行版，读者没法判断两条线能不能比；
+    #   二是 car_label 自带 build，跨 build 自动分线 —— 以前靠 car_build/car 二选一来避免
+    #   "jdk26 车跨 3009/3015 两个 build 混成一条线"（ds3 与 ds2 两批数据就是这么混起来的）。
+    split = 'car_label'
     t = 'track:%s AND quality:ok' % track
     tq = 'track:%s' % track
     specs = [
@@ -563,7 +563,7 @@ def track_panel_specs(track, groups, interval):
 
 
 def visualization_obj(vis_id, title, panel_filter, formatter,
-                      terms_field='arm_label', metric_type='avg', interval='1d'):
+                      terms_field='car_label', metric_type='avg', interval='1d'):
     params = tsvb_timeseries(title, panel_filter, formatter,
                              terms_field=terms_field,
                              metric_type=metric_type,
@@ -607,16 +607,16 @@ def env_markdown():
         md.append('')
         md.append('(bench-env 读取失败: %s)' % e)
 
-    # 口径体检：valid / 实验臂 / 赛道
+    # 口径体检：valid / 实验车 / 赛道
     try:
         r = es_post('/bench-run/_search', {
             'size': 0,
             'aggs': {
                 'by_valid': {'terms': {'field': 'valid', 'size': 5}},
-                # arms 下挂 arm_label：把臂名（跑压时的 ARM_LABEL）与图例标签对上，
-                # 否则读者只看到 "jdk25=98" 却不知道图例里的 ez@2.5.0@3015@graalvm25 是哪个臂
-                'arms': {'terms': {'field': 'arm', 'size': 20},
-                         'aggs': {'labels': {'terms': {'field': 'arm_label', 'size': 10}}}},
+                # cars 下挂 car_label：把车名（跑压时的 CAR_LABEL）与图例标签对上，
+                # 否则读者只看到 "jdk25=98" 却不知道图例里的 ez@2.5.0@3015@graalvm25 是哪个车
+                'cars': {'terms': {'field': 'car', 'size': 20},
+                         'aggs': {'labels': {'terms': {'field': 'car_label', 'size': 10}}}},
                 'by_track': {'terms': {'field': 'track', 'size': 20}},
             }})
         aggs = r['aggregations']
@@ -630,10 +630,10 @@ def env_markdown():
         md.append('')
         md.append('**场次体检** — 共 %d 场（VALID %d / 非 VALID %d）' % (total, n_valid, n_invalid))
         md.append('被测配置（代号）: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
-                                         for b in aggs['arms']['buckets']))
+                                         for b in aggs['cars']['buckets']))
         # 配置代号 → 图例标签对照（同一代号可能对应多个标签：换了引擎 build 就各画一条线）
         pairs = []
-        for b in aggs['arms']['buckets']:
+        for b in aggs['cars']['buckets']:
             labs = b.get('labels', {}).get('buckets') or []
             for lb in labs:
                 pairs.append('%s → %s（%d 场）' % (b['key'], lb['key'], lb['doc_count']))
@@ -703,14 +703,14 @@ USAGE_MD = '''**看图指南**
     它吐出的时延量的是"失败响应有多快"，混进来会把引擎显得更快。
     **错误率面板是唯一的例外**，它刻意不带 quality 闸门 ——
     它就是要显示失败场次。
-- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定某套配置: `arm:es819`（代号见「环境说明」面板）；限定批次: `campaign:ds3-20261015-233223`
+- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定某套配置: `car:es819`（代号见「环境说明」面板）；限定批次: `campaign:ds3-20261015-233223`
 - **时延三兄弟，别混用**：
   - **引擎时延** (family=service_time) = 服务端执行时间，**跨引擎比较看这个**
   - **端到端时延** (family=latency) = 含发压机积压；开环 task（设了 target-throughput）
     饱和时会把 36ms 的引擎耗时放大成 1.4s
   - **发压机积压** (family=queue_time) = latency − service_time，看"是引擎慢还是发压机排队"
 - 每图一个 family（吞吐/延迟/服务时间/磁盘/GC…），单位已归一（时间 s、大小 GB、错误率 0~1）
-- series=arm: jdk25/kona25=easysearch2.5.0-3015+JDK25, ez240=easysearch2.4.0-2975, es819=ES8.19.23
+- series=car: jdk25/kona25=easysearch2.5.0-3015+JDK25, ez240=easysearch2.4.0-2975, es819=ES8.19.23
 - **错误率说明**: rally 的 error_rate 本就是 0~1 比例，1.0 = 该 task 请求全失败（不要按 % 再除）
 - 原始层回钻: campaigns-local/<campaign>/results/<fid>-race.json'''
 
@@ -910,7 +910,7 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
 
 
 def es_track_facts():
-    """读出每个赛道的：场次数 / 实验臂 / task 集合 / 时间范围。
+    """读出每个赛道的：场次数 / 实验车 / task 集合 / 时间范围。
 
     全部从 ES 实算，不在代码里硬编码赛道清单 —— 新增一场新赛道的压测后，
     看板脚本跑一次就会自动多出一个独立看板，不用改代码。
@@ -921,7 +921,7 @@ def es_track_facts():
             'size': 0,
             'aggs': {'t': {'terms': {'field': 'track', 'size': 200},
                            'aggs': {'k': {'terms': {'field': 'task', 'size': 200}},
-                                    'a': {'terms': {'field': 'arm', 'size': 50}},
+                                    'a': {'terms': {'field': 'car', 'size': 50}},
                                     'span': {'stats': {'field': '@timestamp'}}}}}})
     except Exception:                                       # noqa: BLE001
         return facts
@@ -930,7 +930,7 @@ def es_track_facts():
         facts[b['key']] = {
             'metrics': b['doc_count'],
             'tasks': [x['key'] for x in (b.get('k') or {}).get('buckets') or []],
-            'arms': [x['key'] for x in (b.get('a') or {}).get('buckets') or []],
+            'cars': [x['key'] for x in (b.get('a') or {}).get('buckets') or []],
             'lo': span.get('min'), 'hi': span.get('max'),
         }
     return facts
@@ -942,15 +942,15 @@ def es_track_runs(track):
         r = es_post('/bench-run/_search', {
             'size': 0, 'query': {'term': {'track': track}},
             'aggs': {'n': {'value_count': {'field': 'race_id'}},
-                     'arms': {'terms': {'field': 'arm', 'size': 50}},
+                     'cars': {'terms': {'field': 'car', 'size': 50}},
                      'span': {'stats': {'field': '@timestamp'}}}})
         a = r.get('aggregations', {})
         span = a.get('span') or {}
         return {'runs': (a.get('n') or {}).get('value', 0),
-                'arms': [x['key'] for x in (a.get('arms') or {}).get('buckets') or []],
+                'cars': [x['key'] for x in (a.get('cars') or {}).get('buckets') or []],
                 'lo': span.get('min'), 'hi': span.get('max')}
     except Exception:                                       # noqa: BLE001
-        return {'runs': 0, 'arms': [], 'lo': None, 'hi': None}
+        return {'runs': 0, 'cars': [], 'lo': None, 'hi': None}
 
 
 def pick_interval(lo_ms, hi_ms):
@@ -1038,16 +1038,16 @@ def nav_markdown(track_info):
     md = ['**赛道导航** — 每个 esrally track 一个独立看板'
           '（对照 opensearch.org/benchmarks：HTTP logs / NYC taxis / PMC / Big5 / '
           'Vectorsearch-* … 各自独立页面，不同 workload 不混图）', '']
-    md.append('| 赛道 | 说明 | 场次 | 实验臂 | workload 分组 | 未出图面板 | 看板路径 |')
+    md.append('| 赛道 | 说明 | 场次 | 被测配置 | workload 分组 | 未出图面板 | 看板路径 |')
     md.append('|---|---|---|---|---|---|---|')
     for track, info in track_info:
         label = TRACK_LABEL.get(track, track)
-        arms = ', '.join(info['arms']) or '—'
+        cars = ', '.join(info['cars']) or '—'
         groups = ' / '.join(g[1] for g in info['groups']) or '—'
         nod = info.get('nodata') or []
         nodtxt = ('%d 个（%s）' % (len(nod), '、'.join(nod))) if nod else '0'
         md.append('| `%s` | %s | %d | %s | %s | %s | `/app/dashboards#/view/bench-%s` |'
-                  % (track, label, info['runs'], arms, groups, nodtxt, track))
+                  % (track, label, info['runs'], cars, groups, nodtxt, track))
     md.append('')
     md.append('> **进各赛道看板**：把上表路径粘到地址栏，或左侧栏 ☰ → Analytics → '
               'Dashboard（`/app/dashboards/list`）点对应标题。')
@@ -1105,11 +1105,11 @@ def main():
         tf, tt = data_window(track)
         track_objs, dropped = build_track_dashboard(track, groups, interval, tf, tt)
         objs += track_objs
-        track_info.append((track, {'runs': runs['runs'], 'arms': runs['arms'],
+        track_info.append((track, {'runs': runs['runs'], 'cars': runs['cars'],
                                     'groups': groups,
                                     'nodata': [d[0] for d in dropped]}))
-        print('  track %-12s runs=%-4d arms=%-28s groups=%s interval=%s 未出图面板=%d'
-              % (track, runs['runs'], ','.join(runs['arms']),
+        print('  track %-12s runs=%-4d cars=%-28s groups=%s interval=%s 未出图面板=%d'
+              % (track, runs['runs'], ','.join(runs['cars']),
                  ','.join(g[0] for g in groups) or '-', interval, len(dropped)))
 
     objs.append(markdown_obj('bench-vis-head', '环境说明', env_markdown()))

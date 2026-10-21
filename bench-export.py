@@ -202,35 +202,38 @@ def knn_params_of(side):
 
 def fid_of(d):
     ut = d.get("user-tags") or {}
-    arm = ut.get("arm") or ut.get("engine") or "?"
+    # 改名兼容：改名前写的是 user-tags.arm，改名后写 user-tags.car。两者都读，
+    # 老的 race.json（改名前跑的那批）照样能解析出车的身份。
+    car = ut.get("car") or ut.get("arm") or ut.get("engine") or "?"
     tr = track_name_of(d.get("track"))
-    return arm, tr, ut
+    return car, tr, ut
 
 
 # ------------------------------------------------------------------ 图例标签派生
 #
-# 看板图例只显示臂名（ez250 / jdk25@3015 / kona25@3015）时，读者看不出三件事：
+# 看板图例只显示车名（ez250 / jdk25@3015 / kona25@3015）时，读者看不出三件事：
 # 引擎版本（ez240 与 ez250 都是 EasySearch，版本 2.4.0 / 2.5.0）、
 # 引擎 build（3015 / 3009 / 2975，同版本不同 build 的结论不能混）、
-# JDK 发行版（jdk25 臂是 Oracle GraalVM 25，kona25 臂是 Tencent Kona 25，
-# 两者主版本号都是 25，臂名区分得开但看不出是两种发行版）。
+# JDK 发行版（jdk25 车是 Oracle GraalVM 25，kona25 车是 Tencent Kona 25，
+# 两者主版本号都是 25，车名区分得开但看不出是两种发行版）。
 #
 # 标签口径（2026-10-21 sam 确认）：引擎名@版本号@build号@JDK名
 #   ez@2.4.0@2975@graalvm21     ez@2.5.0@3015@graalvm25
 #   ez@2.5.0@3015@kona25        es@8.19.23@—@openjdk27
-# 口径代码在 arm_label.py（唯一来源），这里只做引用 —— 别在这里另写一份。
+# 口径代码在 car_label.py（唯一来源），这里只做引用 —— 别在这里另写一份。
 
 try:
-    arm_label_mod = importlib.import_module('arm_label')
+    car_label_mod = importlib.import_module('car_label')
 except ImportError:                                                    # 从别处 import 本文件时
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    arm_label_mod = importlib.import_module('arm_label')
-ARM_FALLBACK = arm_label_mod.ARM_FALLBACK
-BUILD_UNKNOWN = arm_label_mod.BUILD_UNKNOWN
-ENGINE_SHORT = arm_label_mod.ENGINE_SHORT
-JDK_VENDOR_PREFIX = arm_label_mod.JDK_VENDOR_PREFIX
-arm_label_of = arm_label_mod.arm_label_of
-jdk_short_of = arm_label_mod.jdk_short_of
+    car_label_mod = importlib.import_module('car_label')
+CAR_FALLBACK = car_label_mod.CAR_FALLBACK
+BUILD_UNKNOWN = car_label_mod.BUILD_UNKNOWN
+ENGINE_SHORT = car_label_mod.ENGINE_SHORT
+JDK_VENDOR_PREFIX = car_label_mod.JDK_VENDOR_PREFIX
+car_label_of = car_label_mod.car_label_of
+jdk_short_of = car_label_mod.jdk_short_of
+jdk_vm_of = car_label_mod.jdk_vm_of
 
 
 # ---------------------------------------------------------------- 环境台账派生 (方案 §3.1)
@@ -299,10 +302,105 @@ def load_store(races_dir):
             yield d
 
 
+# ------------------------------------------------------------------ 源头证据
+#
+# 引擎身份（版本 + build）与 JDK 身份都有**实测/记录级**的源头，
+# 比"从车代号猜"可靠得多。三条源头，按可信度从高到低：
+#
+#   ① sidecar（赛末实测）：engine.pkg 包名 + jdk.per_node 的 vendor/major
+#   ② 部署日志（部署脚本自己写的）：logs/ibs-deploy-<车>.log 里的
+#      "Deploying Easysearch 2.4.0-2975" / "Deploying Elasticsearch 8.19.21"
+#      logs/jdk-<车>.txt 里的 java -version 原文
+#   ③ revision 指纹（race.json 的 cluster.revision）：引擎源码提交号，
+#      与包名一一对应（见 REVISION_IDENTITY，由①②实测归纳）
+#
+# 为什么不用 campaign 的 PACKAGES.txt：那是"这一批装了哪些包"的清单，
+# 不是"这个车实际跑的是哪个包" —— ez240 车在 jdk3-20261016-* 批次里跑的是
+# 2.4.0-2975，PACKAGES.txt 里写的却是该批默认包 2.5.0-3015，
+# 按它推会把 ez240 标成 "ez240@3015"（引擎版本还是 2.4.0，自相矛盾）。
+#
+# revision → 身份对照表（每条都有部署日志或 sidecar 实测背书）：
+#   d8d3be54… → EasySearch 2.5.0-3015（部署日志 ×6 + sidecar 实测）
+#   fab83e9f… → EasySearch 2.5.0-3009（部署日志 ×3 + sidecar 实测）
+#   79c5d197… → EasySearch 2.4.0-2975（部署日志 ×5 + sidecar 实测）
+#   bf8501f2… → EasySearch 2.5.0-3003（部署日志 ×2）
+#   b21f3974… → EasySearch 2.5.0（构建号无记录 —— 这批只有 car-es819.log，
+#                没有部署日志；不猜）
+#   4fe44c25… → Elasticsearch 8.19.21（部署日志 ×2）
+#   6940e499… → Elasticsearch 8.19.23（部署日志 ×3 + sidecar 实测）
+REVISION_IDENTITY = {
+    "d8d3be542d807ad57d4becbd0d4e95b560107453": ("easysearch", "2.5.0", "3015"),
+    "fab83e9f78f32c50dcd3793ff9e5a2d8c19210a9": ("easysearch", "2.5.0", "3009"),
+    "79c5d197a9ba7b28ec89b149c9eb320c52c5a784": ("easysearch", "2.4.0", "2975"),
+    "bf8501f2c621318bc031a859615402379ca9d7c1": ("easysearch", "2.5.0", "3003"),
+    "b21f39745344f63923d66df18875f1ddf487c5c6": ("easysearch", "2.5.0", None),
+    "4fe44c255c3d0da06779b921e132cdc555ed9aff": ("elasticsearch", "8.19.21", None),
+    "6940e499f8a38841809b8e295a20c6421c95d9e4": ("elasticsearch", "8.19.23", None),
+}
+
+_DEPLOY_RE = re.compile(r"Deploying\s+(Easysearch|Elasticsearch)\s+([0-9][0-9.]*)(?:-(\d+))?")
+
+
+def parse_deploy_logs(camp_dir):
+    """campaign/logs 里的部署日志 → {车或引擎名: (engine, version, build)}。
+
+    文件名两种写法都见过：ibs-deploy-<车>.log（ibs 部署脚本）与 deploy-<车>.log。
+    车名取文件名（ez240 / jdk25 / es819…），也可能是引擎名（easysearch /
+    elasticsearch）——那是"该批默认引擎"的部署记录，对该批所有对应引擎的车生效。
+    """
+    out = {}
+    for p in glob.glob(os.path.join(camp_dir, "logs", "*deploy-*.log")):
+        base = os.path.basename(p)
+        mm = re.match(r"^(?:ibs-)?deploy-(.+)\.log$", base)
+        if not mm:
+            continue
+        key = mm.group(1)
+        try:
+            txt = open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        m = _DEPLOY_RE.search(txt)
+        if not m:
+            continue
+        eng = "elasticsearch" if m.group(1) == "Elasticsearch" else "easysearch"
+        out[key] = (eng, m.group(2), m.group(3))
+    return out
+
+
+def parse_jdk_files(camp_dir):
+    """campaign/logs/jdk-<车>.txt 里的 java -version → {车: (vendor, major)}。
+
+    没有 sidecar 的批次靠它拿 JDK 身份（实测原文，不是从车名猜）。
+    """
+    out = {}
+    for p in glob.glob(os.path.join(camp_dir, "logs", "jdk-*.txt")):
+        car = os.path.basename(p)[len("jdk-"):-len(".txt")]
+        try:
+            txt = open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        vendor = None
+        if "TencentKonaJDK" in txt:
+            vendor = "TencentKonaJDK"
+        elif "GraalVM" in txt:
+            vendor = "GraalVM"
+        elif "OpenJDK" in txt or "openjdk" in txt:
+            vendor = "OpenJDK"
+        major = None
+        mm = re.search(r'(?:java version|openjdk version)\s+"([0-9]+)', txt)
+        if mm:
+            major = mm.group(1)
+        if vendor and major:
+            out[car] = (vendor, major)
+    return out
+
+
 def load_campaign_meta(camp_dir):
     """RACES.md 状态、PACKAGES 指纹、sidecar、monitors 摘要"""
     m = {"status": {}, "packages": "", "sidecar": {}, "sidecar_by_race": {},
          "post_merge": {}, "env": {}, "env_id": None}
+    m["deploys"] = parse_deploy_logs(camp_dir)
+    m["jdks"] = parse_jdk_files(camp_dir)
     rp = os.path.join(camp_dir, "RACES.md")
     if os.path.isfile(rp):
         for line in open(rp, encoding="utf-8", errors="replace"):
@@ -314,13 +412,13 @@ def load_campaign_meta(camp_dir):
         m["packages"] = open(pp, encoding="utf-8", errors="replace").read()
     # 本 campaign 自证的引擎包名（从 PACKAGES.txt 的 sha256+包名行解析）：
     #   没有 sidecar 的历史 campaign（如 ds3-20261015）只能靠它，
-    #   否则会套用别的 campaign 实测到的臂身份，把 3009 的场次标成 3015。
+    #   否则会套用别的 campaign 实测到的车身份，把 3009 的场次标成 3015。
     for _mm in re.finditer(r"(easysearch|elasticsearch)-[0-9][^\s]*\.tar\.gz", m.get("packages") or ""):
         m.setdefault("pkg_own", {}).setdefault(_mm.group(1), _mm.group(0))
     # 受污染场次清单（每行一个 fid）：给该场 bench-run 文档打 caliber_warnings 标注。
     # 为什么单独存文件而不是写进 RACES.md：RACES.md 的状态列直接决定 valid，
     # 写成 CONTAMINATED 会让 valid=false，看板闸门 valid:true 会把这一场整个滤掉
-    # （ds-j2048 只有 jdk25 臂有数据，一滤就空面板）。状态保持 VALID，
+    # （ds-j2048 只有 jdk25 车有数据，一滤就空面板）。状态保持 VALID，
     # 污染事实走这个清单 + 文档 caliber_warnings 双通道留痕。
     cf = os.path.join(camp_dir, "CONTAMINATED.txt")
     if os.path.isfile(cf):
@@ -700,15 +798,15 @@ def main():
         if os.path.isdir(c):
             metas[os.path.basename(c)] = load_campaign_meta(c)
 
-    # 预扫 sidecar：学出 arm -> 引擎身份（实测包名/版本/JDK）。
-    # 有些场次没有 sidecar（早期 campaign），但同一实验臂的包是同一份 ——
-    # 用别的场次实测到的身份回填，比留空或按臂名猜要准。
-    arm_identity = {}
+    # 预扫 sidecar：学出 car -> 引擎身份（实测包名/版本/JDK）。
+    # 有些场次没有 sidecar（早期 campaign），但同一实验车的包是同一份 ——
+    # 用别的场次实测到的身份回填，比留空或按车名猜要准。
+    car_identity = {}
     for meta in metas.values():
         seen_side = list(meta.get("sidecar", {}).values()) + list(meta.get("sidecar_by_race", {}).values())
         for s in seen_side:
-            arm = (s.get("run") or {}).get("arm")
-            if not arm or arm in arm_identity:
+            car = (s.get("run") or {}).get("car")
+            if not car or car in car_identity:
                 continue
             se = s.get("engine") or {}
             base_pkg = os.path.basename(se.get("pkg") or "")
@@ -717,7 +815,7 @@ def main():
             vm = se.get("version_measured_nodes") or []
             jdk_nodes = (s.get("jdk") or {}).get("measured_nodes") or []
             if eng:
-                arm_identity[arm] = {
+                car_identity[car] = {
                     "engine": eng, "pkg": se.get("pkg"),
                     "pkg_sha256": se.get("pkg_sha256"),
                     "version": vm[0] if vm else se.get("version_from_pkg"),
@@ -732,20 +830,20 @@ def main():
     fid_valid = {}          # fid → 场次有效性；system 行靠它回填 valid（否则被 KQL 过滤）
     fid_quality = {}        # fid → 场次级 quality；system 行同样要带 quality，
                             #   否则看板上 quality:ok 的闸门会把整个环境健康度段落过滤空
-    fid_arm = {}            # fid → 实验臂；system 行靠它回填 arm（否则按 arm 分线的面板拿不到 series）
-    fid_arm_build = {}      # fid → 臂@build；system 行同样要回填，否则按 arm_build 分线的
+    fid_car = {}            # fid → 实验车；system 行靠它回填 car（否则按 car 分线的面板拿不到 series）
+    fid_car_build = {}      # fid → 车@build；system 行同样要回填，否则按 car_build 分线的
                             # system 类面板（外来进程 CPU / 换入次数…）会分不出桶 → 空面板
-    fid_arm_label = {}      # fid → 图例标签；同上，system 行要一起回填
+    fid_car_label = {}      # fid → 图例标签；同上，system 行要一起回填
     seen = set()
     unmatched = 0
     skipped_no_campaign = 0
     for d in load_store(args.races):
         ut = d.get("user-tags") or {}
         camp = ut.get("campaign") or "unknown"
-        arm, tr, _ = fid_of(d)
+        car, tr, _ = fid_of(d)
         phase = PHASE.get(d.get("challenge"), "wq")
         rnd = ut.get("round")
-        fid = "%s-%s-r%s" % (arm, tr, rnd)
+        fid = "%s-%s-r%s" % (car, tr, rnd)
         meta = metas.get(camp, {})
         race_id = d.get("race-id") or os.path.basename(os.path.dirname(d["_path"]))
         if race_id in seen:
@@ -765,7 +863,7 @@ def main():
             or meta.get("status", {}).get(fid) or meta.get("status", {}).get(fid + "-try2") \
             or meta.get("status", {}).get(fid + "-try3")
         if real_fid:
-            fid = real_fid   # sidecar 的 fid 才是本场唯一身份（含变体名与 -tryN），比 arm-track-rN 拼出来的准
+            fid = real_fid   # sidecar 的 fid 才是本场唯一身份（含变体名与 -tryN），比 car-track-rN 拼出来的准
         dur = None
         for om in ((d.get("results") or {}).get("op_metrics") or []):
             if om.get("task") == "index-append" and om.get("duration"):
@@ -778,7 +876,7 @@ def main():
                 warn.append("受宿主旁路负载污染：该场写赛窗口内落过宿主侧全量导出，吞吐可能偏低，结论以重跑为准")
                 break
         if camp.startswith("ds3-") and eng_tag != "es819":
-            warn.append("heap 声明不实：user_tags heap:16g 但 ds3 campaign 的 easysearch 臂实测 -Xmx1g（2026-10-16 事故），绝对值不可与他批比较")
+            warn.append("heap 声明不实：user_tags heap:16g 但 ds3 campaign 的 easysearch 车实测 -Xmx1g（2026-10-16 事故），绝对值不可与他批比较")
         if not side:
             warn.append("no-sidecar：JDK/heap/clients/bulk 无实测值，仅有 user_tags 声明")
         if status is None:
@@ -788,45 +886,65 @@ def main():
         se = side.get("engine") or {}
         sj = side.get("jdk") or {}
         srp = side.get("run_params") or {}
-        ident = arm_identity.get(arm) or {}
-        pkg = se.get("pkg")
-        if not pkg:
-            # 没有 sidecar → 用本 campaign 自证的包（PACKAGES.txt），
-            # 而不是跨 campaign 借来的臂身份 —— 否则 ds3 的 3009 场次会被标成 3015。
-            pkg = (meta.get("pkg_own") or {}).get(ident.get("engine")) or ident.get("pkg")
-        # 引擎名从包名推导（bench-sidecar.py 同规则）：旧 sidecar 曾把 es819 臂写成 name=easysearch
+        ident = car_identity.get(car) or {}
+        # 身份来源按可信度排队：sidecar 实测 > 部署日志 > revision 指纹 > 批次清单 > 车名兜底。
+        # 批次清单（PACKAGES.txt）排最后：它是"这批装了哪些包"，不是"这个车跑的哪个包"。
+        deploys = meta.get("deploys") or {}
+        deploy = deploys.get(car)                       # 车级部署记录
+        rev = (d.get("cluster") or {}).get("revision")   # 引擎源码指纹
+        rev_id = REVISION_IDENTITY.get(rev) if rev else None
+        pkg = se.get("pkg")                             # 车实际用的包（sidecar 实测），没有就是没有
         base_pkg = os.path.basename(pkg or "")
         engine = ("elasticsearch" if base_pkg.startswith("elasticsearch")
                   else "easysearch" if base_pkg.startswith("easysearch") else None)
-        if not engine:
-            engine = ("easysearch" if (arm or "").startswith("ez")
-                      else "elasticsearch" if (arm or "").startswith("es") else None)
+        if not engine and rev_id:
+            engine = rev_id[0]
         if not engine:
             # 没有 sidecar 的早期 campaign（如 ds3 维度扫描）：rally 记的 distribution-flavor
             # 足以区分产品线 —— easysearch=oss，elasticsearch=default
             flavor = (d.get("cluster") or {}).get("distribution-flavor")
             engine = {"oss": "easysearch", "default": "elasticsearch"}.get(flavor)
+        if not engine and deploy:
+            engine = deploy[0]
+        if not engine:
+            engine = ("easysearch" if (car or "").startswith("ez")
+                      else "elasticsearch" if (car or "").startswith("es") else None)
         engine = engine or ident.get("engine")
+        # 引擎级部署记录（ibs-deploy-easysearch.log / deploy-elasticsearch.log）：
+        # 该批所有同引擎的车共用一份部署
+        deploy_eng = deploys.get(engine) if engine else None
         vm = se.get("version_measured_nodes") or []
-        version = (vm[0] if vm else None) or se.get("version_from_pkg") \
-            or ident.get("version") or (d.get("cluster") or {}).get("distribution-version")
+        version = ((vm[0] if vm else None) or se.get("version_from_pkg")
+                   or (deploy[1] if deploy else None)
+                   or (deploy_eng[1] if deploy_eng else None)
+                   or (rev_id[1] if rev_id else None)
+                   or ident.get("version")
+                   or (d.get("cluster") or {}).get("distribution-version"))
         build = re.sub(r"-linux.*$", "", pkg or "") or None
         # 构建号（3015 / 3009 …）：version 字段只有主次版本（如 2.5.0），无法区分
         # 跨 build 的两批数据。ds3 首轮是 2.5.0-3009、ds2 是 2.5.0-3015，
-        # 臂标签相同（jdk25/jdk26/jdk27）时看板上会混成一条线，必须能按 build 过滤。
+        # 车标签相同（jdk25/jdk26/jdk27）时看板上会混成一条线，必须能按 build 过滤。
         vfp = se.get("version_from_pkg") or ""
         _mb = re.search(r"-(\d+)-linux", pkg or "")
         build_no = _mb.group(1) if _mb else None
-        if not build_no:
-            build_no = (vfp.rsplit("-", 1)[-1] if "-" in vfp else None) or None
+        if not build_no and vfp:
+            build_no = vfp.rsplit("-", 1)[-1] if "-" in vfp else None
+        if not build_no and deploy:
+            build_no = deploy[2]
+        if not build_no and rev_id:
+            build_no = rev_id[2]
+        if not build_no and deploy_eng:
+            build_no = deploy_eng[2]
         if not build_no:
             _uv = ut.get("engine_ver") or ""
             build_no = (_uv.rsplit("-", 1)[-1] if "-" in _uv else None) or None
-        # 复合分组键：同一臂的跨 build 场次（3009 与 3015）必须能分开画线，
+        # 复合分组键：同一车的跨 build 场次（3009 与 3015）必须能分开画线，
         # 否则看板上"jdk26"那条线里混着两个不同引擎 build 的点，结论会被误读。
-        arm_build = ("%s@%s" % (arm, build_no)) if (arm and build_no) else arm
-        # 看板图例标签：引擎@版本@build@JDK（arm_build 只说了一半，看不出引擎版本与 JDK 发行版）
-        arm_label = arm_label_of(arm, engine, version, build_no, side)
+        car_build = ("%s@%s" % (car, build_no)) if (car and build_no) else car
+        # JDK 身份：sidecar 实测 → jdk-<车>.txt 的 java -version 原文 → 车兜底
+        jdk_vm = jdk_vm_of(sj, (meta.get("jdks") or {}).get(car))
+        # 看板图例标签：引擎@版本@build@JDK（car_build 只说了一半，看不出引擎版本与 JDK 发行版）
+        car_label = car_label_of(car, engine, version, build_no, side, jdk_vm=jdk_vm)
         jdk_nodes = sj.get("measured_nodes") or []
         jdk = ",".join(sorted({str(x) for x in jdk_nodes})) or ut.get("jdk") or ident.get("jdk")
         heap_max = srp.get("heap_max_measured_mb") or []
@@ -861,12 +979,15 @@ def main():
         write_degraded = any(is_write_task(t) for t in degraded_tasks)
         race_row_quality = "degraded" if write_degraded else "ok"
 
-        common = {"race_id": race_id, "campaign": camp, "arm": arm, "engine": engine,
+        common = {"race_id": race_id, "campaign": camp, "car": car, "engine": engine,
                   "version": str(version) if version is not None else None,
                   "engine_build": build_no,
-                  "arm_build": arm_build,
-                  # arm_label 是给人看的图例标签（引擎@版本@build@JDK），arm/arm_build 留作机器维度
-                  "arm_label": arm_label,
+                  "car_build": car_build,
+                  # car_label 是给人看的图例标签（引擎@版本@build@JDK），car/car_build 留作机器维度
+                  "car_label": car_label,
+                  # 旧字段镜像：arm* 与 car* 同值。改名是口径升级不是换数据，
+                  # 旧看板/旧 KQL（arm:jdk25）不能因此断线，所以两份一起写。
+                  "arm": car, "arm_build": car_build, "arm_label": car_label,
                   "jdk": jdk, "heap_gb": heap_gb,
                   "dims": dims, "lineage": lineage, "segment_form": segment_form,
                   "codec": codec_of(d, side),
@@ -887,14 +1008,16 @@ def main():
         # 查询框整体过滤掉，CPU steal 这类面板就全空。
         fid_valid.setdefault(fid, (status == "VALID") if status else None)
         fid_quality.setdefault(fid, race_row_quality)
-        fid_arm.setdefault(fid, arm)
-        fid_arm_build.setdefault(fid, arm_build)
-        fid_arm_label.setdefault(fid, arm_label)
+        fid_car.setdefault(fid, car)
+        fid_car_build.setdefault(fid, car_build)
+        fid_car_label.setdefault(fid, car_label)
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
-                     "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
+                     "campaign": camp, "fid": fid, "car": car, "engine": engine,
                      "version": str(version) if version is not None else None, "build": build,
-                     "engine_build": build_no, "arm_build": arm_build,
-                     "arm_label": arm_label,
+                     "engine_build": build_no, "car_build": car_build,
+                     "car_label": car_label,
+                     # 旧字段镜像（与 car* 同值），理由同 common
+                     "arm": car, "arm_build": car_build, "arm_label": car_label,
                      "jdk": jdk, "heap_gb": heap_gb,
                      "dims": dims, "lineage": lineage, "segment_form": segment_form,
                      "track": tr, "track_raw": d.get("track"), "challenge": d.get("challenge"),
@@ -902,10 +1025,17 @@ def main():
                      "cores_tag": ut.get("cores"), "heap_tag": ut.get("heap"),
                      "pipeline": d.get("pipeline"), "rally_version": d.get("rally-version"),
                      "environment": d.get("environment"), "user_tags": ut,
-                     "track_params": d.get("track-params"), "car": d.get("car"),
+                     "track_params": d.get("track-params"),
+                     # rally_car = Rally 自己的 car（客户端插件列表，如 ["external"]）——
+                     # 跟本项目的「车」（一套被测配置）不是一回事，单独存，别混进 car。
+                     "rally_car": d.get("car"),
                      "cluster": d.get("cluster"),
                      "version_from_pkg": (side.get("engine") or {}).get("version_from_pkg"),
                      "pkg": pkg,
+                     # 该批次的默认包（PACKAGES.txt 清单）—— 只是"这批装了哪些包"，
+                     # 不等于本车跑的包（ez240 车在 jdk3-20261016-* 跑的是 2.4.0-2975，
+                     # 那批清单里写的却是默认包 2.5.0-3015）。
+                     "pkg_inventory": (meta.get("pkg_own") or {}).get(engine) or None,
                      "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256") or ident.get("pkg_sha256"),
                      "jdk_want": (side.get("jdk") or {}).get("want"),
                      "jdk_measured": (side.get("jdk") or {}).get("measured_nodes"),
@@ -990,9 +1120,12 @@ def main():
                     sysrows += 1
                     metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                     "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
-                                    "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
-                                    "arm_build": fid_arm_build.get(fid),
-                                    "arm_label": fid_arm_label.get(fid),
+                                    "valid": fid_valid.get(fid), "car": fid_car.get(fid),
+                                    "car_build": fid_car_build.get(fid),
+                                    "car_label": fid_car_label.get(fid),
+                                    "arm": fid_car.get(fid),
+                                    "arm_build": fid_car_build.get(fid),
+                                    "arm_label": fid_car_label.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                     "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
@@ -1002,9 +1135,12 @@ def main():
                 sysrows += 1
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                 "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
-                                    "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
-                                    "arm_build": fid_arm_build.get(fid),
-                                    "arm_label": fid_arm_label.get(fid),
+                                    "valid": fid_valid.get(fid), "car": fid_car.get(fid),
+                                    "car_build": fid_car_build.get(fid),
+                                    "car_label": fid_car_label.get(fid),
+                                    "arm": fid_car.get(fid),
+                                    "arm_build": fid_car_build.get(fid),
+                                    "arm_label": fid_car_label.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
@@ -1062,11 +1198,17 @@ def main():
                        "lineage": {"type": "keyword"}, "segment_form": {"type": "keyword"},
                        "engine": {"type": "keyword"}, "version": {"type": "keyword"},
                        "engine_build": {"type": "keyword"},
-                       "arm_build": {"type": "keyword"},
-                       # arm_label：给人看的图例标签（引擎@版本@build@JDK），看板按它分线
+                       "car_build": {"type": "keyword"},
+                       # car_label：给人看的图例标签（引擎@版本@build@JDK），看板按它分线
+                       "car_label": {"type": "keyword"},
+                       # 旧字段镜像：arm* 与 car* 同值，兼容改名前的看板与 KQL
+                       "arm": {"type": "keyword"}, "arm_build": {"type": "keyword"},
                        "arm_label": {"type": "keyword"},
+                       # rally_car：Rally 自己的 car（客户端插件列表，如 ["external"]），
+                       # 与本项目的「车」（一套被测配置）不是一回事，单独一个字段
+                       "rally_car": {"type": "keyword"},
                        "build": {"type": "keyword"}, "jdk": {"type": "keyword"},
-                       "arm": {"type": "keyword"}, "env_id": {"type": "keyword"},
+                       "car": {"type": "keyword"}, "env_id": {"type": "keyword"},
                        # 存储设置的两个独立维度：压缩 与 source_reuse
                        "codec": {"type": "keyword"}, "source_reuse": {"type": "keyword"},
                        "track": {"type": "keyword"}, "campaign": {"type": "keyword"},

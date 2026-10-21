@@ -107,7 +107,7 @@ Vectorsearch-* 各自独立页面，**不同 track 不混在一张图里**。我
   `merge_count` 属 `merge`、`merge_time` 属 `merge_time`、`merge_throttle_time` /
   `refresh_time` / `flush_time` 各是独立 family。写错 family 面板恒空。
 - **仪表盘级过滤放顶部 KQL 查询框**（`searchSourceJSON.query`，默认 `valid: true`），
-  用户可直接改成 `arm:es819` / `valid:false` / `campaign:ds3-20261015-233223`。
+  用户可直接改成 `car:es819` / `valid:false` / `campaign:ds3-20261015-233223`。
   注意 system 指标行的 `valid` 是**按场次回填**的（见下），否则会被这个过滤整体清空。
 - **时间窗按数据实际范围自动计算**（`data_window(track)`），不设 `timeRestore` 会退回
   "最近 15 分钟"导致历史场次一片空白。每个看板各按自己赛道的批次走。

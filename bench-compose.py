@@ -3,18 +3,18 @@
 """bench-compose.py — raceway 排程编排台（PLAN v1：矩阵 → 排程文件 → 预览 → 起跑）
 
 设计要点（见 PLAN-raceway队列可视化与编排台.md §四 v1）：
-- 交错必须复刻 order_for_round（赛道外层 → 轮次 → 臂右旋），直接 import
+- 交错必须复刻 order_for_round（赛道外层 → 轮次 → 车右旋），直接 import
   bench-queue 的实现，不写第二份；
 - 预览直接来自 `run-bench.sh --dry-run`（用 runner 自己的语义），compose
   不复刻 resolve_engine / 包解析；
-- 起跑前：本地校验（ARM_LABEL 唯一、es 臂不带 JDK_DIR）+ 远端互斥预检
+- 起跑前：本地校验（CAR_LABEL 唯一、es 车不带 JDK_DIR）+ 远端互斥预检
   （无活跃 runner）+ dry-run 必须先通过；
 - compose 不提供任何绕过 runner precheck 的手段（heap/port/宿主安静卡点
   全在 runner 侧）。
 
 用法：
-  python3 bench-compose.py arms    [--arms-file F] [--ssh ...]        # 看臂候选
-  python3 bench-compose.py gen     --arms-file F --tracks ds-j1024,ds-g960 --rounds 2
+  python3 bench-compose.py cars    [--cars-file F] [--ssh ...]        # 看车候选
+  python3 bench-compose.py gen     --cars-file F --tracks ds-j1024,ds-g960 --rounds 2
   python3 bench-compose.py preview ... --ssh root@HOST                  # 生成+上传+DRY 预览
   python3 bench-compose.py start   ... [--ds-hours 12] [--camp-prefix ds2] [--yes]
   python3 bench-compose.py serve   [--port 8802] [--ssh ...]            # 本地 Web 界面
@@ -44,13 +44,13 @@ DEFAULT_WHAT = 'ds'
 DS_TIERS = ['ds-g1920', 'ds-j2048', 'ds-j1024', 'ds-g960', 'ds-j768', 'ds-j512', 'ds-j1536']
 DEFAULT_EST = 45
 
-Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
+Car = namedtuple('Car', 'name label engine build jdk_dir config')
 
 # ============================================================ 纯函数（可测）
 
-def parse_arms(text):
-    """解析臂定义文件：每行 `<臂名> <配置行...>`，# 注释与空行跳过。"""
-    arms = []
+def parse_cars(text):
+    """解析车定义文件：每行 `<车名> <配置行...>`，# 注释与空行跳过。"""
+    cars = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith('#'):
@@ -63,40 +63,40 @@ def parse_arms(text):
             if '=' in tok:
                 k, v = tok.split('=', 1)
                 kv[k] = v
-        arms.append(Arm(name=name, label=kv.get('ARM_LABEL', name),
+        cars.append(Car(name=name, label=kv.get('CAR_LABEL', name),
                         engine=kv.get('ENGINE_NAME', ''), build=kv.get('ENGINE_BUILD', ''),
                         jdk_dir=kv.get('JDK_DIR', ''), config=config))
-    return arms
+    return cars
 
 
-def validate_arms(arms):
+def validate_cars(cars):
     """本地能查的校验。返回 [(严重度, 消息)]，空列表 = 通过。
 
-    - ARM_LABEL 必须唯一（重复 → 场次名冲突，runner 侧非排程模式同规则）
+    - CAR_LABEL 必须唯一（重复 → 场次名冲突，runner 侧非排程模式同规则）
     - ENGINE_NAME 必填
-    - elasticsearch 臂不带 JDK_DIR（用户自管 JDK 只为 easysearch 臂接线）
+    - elasticsearch 车不带 JDK_DIR（用户自管 JDK 只为 easysearch 车接线）
     """
     problems = []
     seen = {}
-    for a in arms:
+    for a in cars:
         if a.label in seen:
-            problems.append(('error', 'ARM_LABEL 重复: %s（%s 与 %s）' % (a.label, seen[a.label], a.name)))
+            problems.append(('error', 'CAR_LABEL 重复: %s（%s 与 %s）' % (a.label, seen[a.label], a.name)))
         else:
             seen[a.label] = a.name
         if not a.engine:
-            problems.append(('error', '臂 %s 缺 ENGINE_NAME' % a.name))
+            problems.append(('error', '车 %s 缺 ENGINE_NAME' % a.name))
         if a.engine == 'elasticsearch' and a.jdk_dir:
-            problems.append(('error', 'es 臂 %s 不应带 JDK_DIR（用户自管 JDK 只为 easysearch 臂接线）' % a.name))
+            problems.append(('error', 'es 车 %s 不应带 JDK_DIR（用户自管 JDK 只为 easysearch 车接线）' % a.name))
     return problems
 
 
-def interleave(arms, tracks, rounds):
-    """生成场次行序：赛道外层 → 轮次 → 臂右旋（复刻 run-bench.sh 非排程主循环）。"""
+def interleave(cars, tracks, rounds):
+    """生成场次行序：赛道外层 → 轮次 → 车右旋（复刻 run-bench.sh 非排程主循环）。"""
     rows = []
     for tk in tracks:
         for r in range(1, rounds + 1):
-            for idx in order_for_round(r, len(arms)):
-                rows.append((arms[idx].name, tk, r))
+            for idx in order_for_round(r, len(cars)):
+                rows.append((cars[idx].name, tk, r))
     return rows
 
 
@@ -111,26 +111,26 @@ def parse_est_overrides(pairs):
     return out
 
 
-def render_schedule(rows, arms, tag, est_map=None, est_default=DEFAULT_EST, recall=True):
-    """渲染排程文件文本。字段：`<臂> <赛道> <轮次> <recall|norecall> <est分钟>`。
+def render_schedule(rows, cars, tag, est_map=None, est_default=DEFAULT_EST, recall=True):
+    """渲染排程文件文本。字段：`<车> <赛道> <轮次> <recall|norecall> <est分钟>`。
 
     注意：runner 的 schedule_lines 会整行剥 `#` 之后的内容，所以行内
     不能有任何 `#`；说明性文字全部放在行首注释区。
     """
     est_map = est_map or {}
-    by_name = {a.name: a for a in arms}
+    by_name = {a.name: a for a in cars}
     now = datetime.datetime.now().strftime('%F %T')
     head = [
         '# raceway compose 排程：tag=%s' % tag,
         '# 生成：bench-compose.py @ %s' % now,
-        '# 臂序（order_for_round 右旋基准序）： %s' % ' '.join(a.name for a in arms),
-        '# 交错：赛道外层 → 轮次 → 臂右旋（复刻 run-bench.sh 非排程主循环，方法学不变）',
-        '# 每行：<臂> <赛道> <轮次> <recall|norecall> <est分钟>',
+        '# 车序（order_for_round 右旋基准序）： %s' % ' '.join(a.name for a in cars),
+        '# 交错：赛道外层 → 轮次 → 车右旋（复刻 run-bench.sh 非排程主循环，方法学不变）',
+        '# 每行：<车> <赛道> <轮次> <recall|norecall> <est分钟>',
         '',
     ]
     lines = list(head)
-    for arm_name, tk, r in rows:
-        a = by_name[arm_name]
+    for car_name, tk, r in rows:
+        a = by_name[car_name]
         lines.append('%s %s %d %s %d' % (a.name, tk, r,
                                          'recall' if recall else 'norecall',
                                          est_map.get(tk, est_default)))
@@ -144,21 +144,21 @@ def schedule_rows_from_text(text):
         line = re.sub(r'#.*', '', raw).strip()
         if not line:
             continue
-        arm, tk, rnd, probe, est = line.split()
-        rows.append((arm, tk, int(rnd), probe, int(est)))
+        car, tk, rnd, probe, est = line.split()
+        rows.append((car, tk, int(rnd), probe, int(est)))
     return rows
 
 
-def render_arms(arms, tag):
-    """把臂候选固化为 <tag>-arms.conf（campaign 自带臂定义，可指纹化）。"""
+def render_cars(cars, tag):
+    """把车候选固化为 <tag>-cars.conf（campaign 自带车定义，可指纹化）。"""
     now = datetime.datetime.now().strftime('%F %T')
     head = [
-        '# raceway compose 臂定义：tag=%s' % tag,
-        '# 生成：bench-compose.py @ %s（源自所选臂定义文件）' % now,
-        '# 每行：<臂名> <配置行...>   配置行语法与 CONF_FILE 一致',
+        '# raceway compose 车定义：tag=%s' % tag,
+        '# 生成：bench-compose.py @ %s（源自所选车定义文件）' % now,
+        '# 每行：<车名> <配置行...>   配置行语法与 CONF_FILE 一致',
         '',
     ]
-    return '\n'.join(head) + '\n'.join('%s %s' % (a.name, a.config) for a in arms) + '\n'
+    return '\n'.join(head) + '\n'.join('%s %s' % (a.name, a.config) for a in cars) + '\n'
 
 
 # ---- 赛道清单（两层：基础赛道 → 压缩 × source_reuse 变体网格）-----------------
@@ -251,26 +251,26 @@ def track_est_map():
     return {k: v['est'] for k, v in TRACK_CATALOG.items()}
 
 
-def compat_problems(arms, rows):
-    """检查 (臂, 变体) 的引擎兼容性。
+def compat_problems(cars, rows):
+    """检查 (车, 变体) 的引擎兼容性。
 
     ZSTD 系列压缩与 index.source_reuse 都是 **Easysearch 专有** —— ES 上
     create-index 直接拒（unknown setting），要等建索引那步才炸，白烧一台机器
     的建库时间。编排时就拦下来。
-    返回 [(臂, 变体, 说明)]，空列表 = 全兼容。
+    返回 [(车, 变体, 说明)]，空列表 = 全兼容。
     """
-    by_name = {a.name: a for a in arms}
+    by_name = {a.name: a for a in cars}
     out = []
-    for arm, tk, rnd in rows:
+    for car, tk, rnd in rows:
         allow = H.engines_of(tk)
         if not allow:
             continue
-        a = by_name.get(arm)
+        a = by_name.get(car)
         if not a:
             continue
         if (a.engine or '').lower() != allow:
-            out.append((arm, tk, '臂 %s 的引擎是 %s，变体 %s 只支持 %s'
-                        % (arm, a.engine or '?', tk, allow)))
+            out.append((car, tk, '车 %s 的引擎是 %s，变体 %s 只支持 %s'
+                        % (car, a.engine or '?', tk, allow)))
     return out
 
 
@@ -304,24 +304,24 @@ def ssh_run(ssh_target, cmd, input_text=None, timeout=120):
     return p.returncode, p.stdout
 
 
-def read_arms_file(args):
-    """臂定义文本：本地路径或远端路径（--ssh 时）。"""
+def read_cars_file(args):
+    """车定义文本：本地路径或远端路径（--ssh 时）。"""
     if args.ssh:
-        rc, out = ssh_run(args.ssh, 'cat %s' % shlex.quote(args.arms_file))
+        rc, out = ssh_run(args.ssh, 'cat %s' % shlex.quote(args.cars_file))
         if rc != 0:
-            raise SystemExit('读不到远端臂定义 %s: %s' % (args.arms_file, out.strip()))
+            raise SystemExit('读不到远端车定义 %s: %s' % (args.cars_file, out.strip()))
         return out
-    with open(args.arms_file, encoding='utf-8') as f:
+    with open(args.cars_file, encoding='utf-8') as f:
         return f.read()
 
 
-def upload(args, tag, schedule_text, arms_text):
-    """排程 + 臂定义落到 <root>/schedules/<tag>.conf / <tag>-arms.conf。"""
+def upload(args, tag, schedule_text, cars_text):
+    """排程 + 车定义落到 <root>/schedules/<tag>.conf / <tag>-cars.conf。"""
     sdir = posixpath.join(args.root, 'schedules')
     rc, out = ssh_run(args.ssh, 'mkdir -p %s' % shlex.quote(sdir))
     if rc != 0:
         raise SystemExit('远端建目录失败: %s' % out.strip())
-    for name, text in (('%s.conf' % tag, schedule_text), ('%s-arms.conf' % tag, arms_text)):
+    for name, text in (('%s.conf' % tag, schedule_text), ('%s-cars.conf' % tag, cars_text)):
         dst = posixpath.join(sdir, name)
         rc, out = ssh_run(args.ssh, 'cat > %s' % shlex.quote(dst), input_text=text)
         if rc != 0:
@@ -341,10 +341,10 @@ def remote_mutex_check(args):
 def remote_dry_run(args, tag, ds_hours):
     """跑 runner 自己的 dry-run（排程校验 + 逐场引擎身份）。"""
     sdir = posixpath.join(args.root, 'schedules')
-    cmd = ('cd %s && SCHEDULE_FILE=%s ARMS_FILE=%s DS_HOURS=%d ./%s --dry-run %s'
+    cmd = ('cd %s && SCHEDULE_FILE=%s CARS_FILE=%s DS_HOURS=%d ./%s --dry-run %s'
            % (shlex.quote(args.root),
               shlex.quote(posixpath.join('schedules', '%s.conf' % tag)),
-              shlex.quote(posixpath.join('schedules', '%s-arms.conf' % tag)),
+              shlex.quote(posixpath.join('schedules', '%s-cars.conf' % tag)),
               ds_hours, 'run-bench.sh', shlex.quote(args.what)))
     return ssh_run(args.ssh, cmd, timeout=180)
 
@@ -355,9 +355,9 @@ def remote_start(args, tag, ds_hours, camp_prefix):
     if why:
         raise SystemExit(why)
     sdir = posixpath.join(args.root, 'schedules')
-    env = ('SCHEDULE_FILE=%s ARMS_FILE=%s DS_HOURS=%d'
+    env = ('SCHEDULE_FILE=%s CARS_FILE=%s DS_HOURS=%d'
            % (shlex.quote(posixpath.join('schedules', '%s.conf' % tag)),
-              shlex.quote(posixpath.join('schedules', '%s-arms.conf' % tag)), ds_hours))
+              shlex.quote(posixpath.join('schedules', '%s-cars.conf' % tag)), ds_hours))
     if camp_prefix:
         env += ' CAMP_PREFIX=%s' % shlex.quote(camp_prefix)
     log = 'compose-%s.log' % tag
@@ -385,7 +385,7 @@ def tracks_of(args):
 
 
 def load_history(args):
-    """读指标库的覆盖表（已入库跑过哪些 臂×赛道×轮次 格）。
+    """读指标库的覆盖表（已入库跑过哪些 车×赛道×轮次 格）。
 
     指标库不可用（没起 / 连不上 / 没口令）时返回 unavailable 表 —— 编排照常
     进行，但界面会显示"指标库未运行"。**绝不能**把空表当成"什么都没跑过"：
@@ -408,11 +408,11 @@ def report_skipped(plan):
         return ''
     out = ['已剔除 %d 格（指标库里当前 build 已跑过，不再重排）：' % len(skipped)]
     for c in skipped:
-        out.append('  %-8s %-10s r%d  %s' % (c['arm'], c['track'], c['round'], c['reason']))
+        out.append('  %-8s %-10s r%d  %s' % (c['car'], c['track'], c['round'], c['reason']))
     return '\n'.join(out)
 
 
-def build_rows(args, arms):
+def build_rows(args, cars):
     tracks = tracks_of(args)
     unknown = [t for t in tracks if t not in TRACK_CATALOG]
     if unknown:
@@ -421,7 +421,7 @@ def build_rows(args, arms):
             '可排的赛道：%s\n'
             '库里有历史数据的其他赛道只能看不能排（例如 hvtp200k-2s/3s 是旧版 runner 跑的）。'
             % ('、'.join(unknown), '、'.join(sorted(TRACK_CATALOG))))
-    rows = interleave(arms, tracks, args.rounds)
+    rows = interleave(cars, tracks, args.rounds)
     # est：先取赛道清单的实测值，再让 --est 覆盖（--est 优先）
     est_map = track_est_map()
     est_map.update(parse_est_overrides(args.est))
@@ -429,30 +429,30 @@ def build_rows(args, arms):
 
 
 def compose_all(args):
-    """arms 解析 + 校验 + 历史覆盖剔除 + 渲染。
+    """cars 解析 + 校验 + 历史覆盖剔除 + 渲染。
 
-    返回 (arms, schedule_text, arms_text, rows, tag, plan)。
+    返回 (cars, schedule_text, cars_text, rows, tag, plan)。
     """
-    arms = parse_arms(read_arms_file(args))
-    if not arms:
-        raise SystemExit('臂定义里没有可用臂: %s' % args.arms_file)
-    # --arms 过滤（GUI 里是勾选臂；CLI 给同样的能力）。
-    # 有了臂×变体兼容矩阵后这个开关是必需的 —— 比如只跑 easysearch 臂的
-    # ZSTD/source_reuse 变体，必须能把 ES 臂摘掉。
-    only = [x.strip() for x in (getattr(args, 'arms', '') or '').split(',') if x.strip()]
+    cars = parse_cars(read_cars_file(args))
+    if not cars:
+        raise SystemExit('车定义里没有可用车: %s' % args.cars_file)
+    # --cars 过滤（GUI 里是勾选车；CLI 给同样的能力）。
+    # 有了车×变体兼容矩阵后这个开关是必需的 —— 比如只跑 easysearch 车的
+    # ZSTD/source_reuse 变体，必须能把 ES 车摘掉。
+    only = [x.strip() for x in (getattr(args, 'cars', '') or '').split(',') if x.strip()]
     if only:
-        known = {a.name for a in arms}
+        known = {a.name for a in cars}
         unknown = [x for x in only if x not in known]
         if unknown:
-            raise SystemExit('--arms 里有臂定义中不存在的臂: %s\n可用: %s'
+            raise SystemExit('--cars 里有车定义中不存在的车: %s\n可用: %s'
                              % ('、'.join(unknown), '、'.join(sorted(known))))
-        arms = [a for a in arms if a.name in only]
-    problems = validate_arms(arms)
+        cars = [a for a in cars if a.name in only]
+    problems = validate_cars(cars)
     hard = [m for sev, m in problems if sev == 'error']
     if hard:
-        raise SystemExit('臂定义校验失败：\n  ' + '\n  '.join(hard))
+        raise SystemExit('车定义校验失败：\n  ' + '\n  '.join(hard))
     tracks = tracks_of(args)
-    rows, est_map = build_rows(args, arms)
+    rows, est_map = build_rows(args, cars)
 
     # --what 没显式给就按赛道集合推导（排程模式下 runner 会用排程文件的集合覆盖它，
     # 但给个语义正确的关键字更稳：单赛道用它自己、全 ds-* 用 ds、混排用 all）
@@ -461,7 +461,7 @@ def compose_all(args):
 
     # 已入库历史覆盖：默认剔除"当前 build 上已经跑过"的格
     cov = load_history(args)
-    plan = H.plan_cells(cov, arms, tracks, args.rounds,
+    plan = H.plan_cells(cov, cars, tracks, args.rounds,
                          include_covered=getattr(args, 'include_covered', False))
     if plan['skipped']:
         rows = H.filter_rows(plan, rows)
@@ -472,7 +472,7 @@ def compose_all(args):
 
     # 引擎 × 变体兼容性：ZSTD / source_reuse 是 Easysearch 专有，ES 上建索引就拒。
     # 编排时拦 —— 别排了再白跑一场建库。
-    bad = compat_problems(arms, rows)
+    bad = compat_problems(cars, rows)
     if bad:
         raise SystemExit('排程里有引擎与变体不兼容的组合：\n  '
                          + '\n  '.join(x[2] for x in bad)
@@ -480,24 +480,24 @@ def compose_all(args):
                            'ES 的 index.codec 只有 default/best_compression，也不认 source_reuse）')
 
     tag = args.tag or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
-    sched = render_schedule(rows, arms, tag, est_map, args.est_default, recall=args.recall)
+    sched = render_schedule(rows, cars, tag, est_map, args.est_default, recall=args.recall)
     # round-trip 自校验：渲染出来的文件按 runner 规则读回去必须等于生成序
     back = [(a, t, r) for a, t, r, _, _ in schedule_rows_from_text(sched)]
     if back != rows:
         raise SystemExit('内部错误：渲染结果与生成序不一致（round-trip 失败）')
-    return arms, sched, render_arms(arms, tag), rows, tag, plan
+    return cars, sched, render_cars(cars, tag), rows, tag, plan
 
 
-def cmd_arms(args):
-    arms = parse_arms(read_arms_file(args))
-    for a in arms:
+def cmd_cars(args):
+    cars = parse_cars(read_cars_file(args))
+    for a in cars:
         print('%-8s label=%-10s engine=%-14s jdk_dir=%s' % (a.name, a.label, a.engine, a.jdk_dir or '-'))
-    for sev, msg in validate_arms(arms):
+    for sev, msg in validate_cars(cars):
         print('[%s] %s' % (sev, msg), file=sys.stderr)
 
 
 def cmd_gen(args):
-    arms, sched, _, rows, _, plan = compose_all(args)
+    cars, sched, _, rows, _, plan = compose_all(args)
     rep = report_skipped(plan)
     if rep:
         print(rep, file=sys.stderr)
@@ -505,8 +505,8 @@ def cmd_gen(args):
 
 
 def cmd_preview(args):
-    arms, sched, arms_text, rows, tag, plan = compose_all(args)
-    upload(args, tag, sched, arms_text)
+    cars, sched, cars_text, rows, tag, plan = compose_all(args)
+    upload(args, tag, sched, cars_text)
     rc, out = remote_dry_run(args, tag, args.ds_hours)
     rep = report_skipped(plan)
     if rep:
@@ -522,11 +522,11 @@ def cmd_preview(args):
 def cmd_start(args):
     if not args.yes:
         raise SystemExit('起跑需显式确认：加 --yes（先 preview 检查过 dry-run 输出）')
-    arms, sched, arms_text, rows, tag, plan = compose_all(args)
+    cars, sched, cars_text, rows, tag, plan = compose_all(args)
     why = remote_mutex_check(args)
     if why:
         raise SystemExit(why)
-    upload(args, tag, sched, arms_text)
+    upload(args, tag, sched, cars_text)
     rc, out = remote_dry_run(args, tag, args.ds_hours)
     if rc != 0:
         print(out)
@@ -576,7 +576,7 @@ _PAGE = """<!doctype html>
 <p>矩阵勾选 → <b>自动剔除指标库里已跑过的格</b> → 生成排程 → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
 交错由服务端复刻 <code>order_for_round</code>；本页不做任何绕过 precheck 的事。</p>
 
-<fieldset><legend>臂（来自臂定义文件）</legend><div id="arms" class="tracks"></div></fieldset>
+<fieldset><legend>车（来自车定义文件）</legend><div id="cars" class="tracks"></div></fieldset>
 <fieldset><legend>赛道（全部可起跑的赛道，按族分组）</legend><div id="tracks"></div>
  自定义（逗号分隔，清单外的赛道）<input id="custom" size="30" placeholder="ds-hv1024,..."></fieldset>
 <fieldset><legend>轮次与口径</legend>
@@ -601,7 +601,7 @@ _PAGE = """<!doctype html>
  <div id="skipbox" class="skipbox"></div>
 </fieldset>
 
-<fieldset><legend>臂 × 变体 兼容性</legend>
+<fieldset><legend>车 × 变体 兼容性</legend>
  <div id="compatbox" class="hist-sum">…</div>
  <div style="font-size:12px;color:#666">ZSTD 压缩与 <code>index.source_reuse</code> 是 Easysearch 专有
  （ES 的 <code>index.codec</code> 只有 default/best_compression，也不认 source_reuse）——
@@ -618,7 +618,7 @@ _PAGE = """<!doctype html>
 
 <script>
 const DS_TIERS = %s;
-let ARMS = [];
+let CARS = [];
 let TRACKS = [];
 let TRACK_GROUPS = [];
 let BASE_TRACKS = [];
@@ -632,12 +632,12 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 async function boot(){
   const r = await fetch('/api/bootstrap'); const j = await r.json();
-  ARMS = j.arms; TRACKS = j.tracks||[]; TRACK_GROUPS = j.track_groups||[];
+  CARS = j.cars; TRACKS = j.tracks||[]; TRACK_GROUPS = j.track_groups||[];
   BASE_TRACKS = (j.tracks||[]).filter(function(t){return !t.variant;});
   CODEC_TOKENS = j.codec_tokens||[]; TOKEN_LABEL = j.token_label||{};
   TOKEN_CODEC = j.token_codec||{};
-  document.getElementById('arms').innerHTML = ARMS.map(a =>
-    `<label><input type="checkbox" class="armck" value="${a.name}" checked> ${a.name} <small>(${a.engine}${a.build?'@'+a.build:''}${a.jdk_dir? ' + '+a.jdk_dir.split('/').pop():''})</small></label>`).join('');
+  document.getElementById('cars').innerHTML = CARS.map(a =>
+    `<label><input type="checkbox" class="carck" value="${a.name}" checked> ${a.name} <small>(${a.engine}${a.build?'@'+a.build:''}${a.jdk_dir? ' + '+a.jdk_dir.split('/').pop():''})</small></label>`).join('');
   // 赛道按族渲染，**两层**：基础赛道 + 它的 压缩 × source_reuse 变体网格
   // （压缩与 source_reuse 是两个独立维度，正交可比 —— 网格就是那张二维表）
   let h='';
@@ -681,18 +681,18 @@ async function boot(){
     });
   });
   document.getElementById('tracks').innerHTML=h;
-  ['arms','tracks','rounds','incov'].forEach(function(id){
+  ['cars','tracks','rounds','incov'].forEach(function(id){
     document.getElementById(id).addEventListener('change',function(){loadHist();});
   });
   loadHist();
 }
 function paintCompat(){
-  // 臂的引擎 × 变体的兼容性：ZSTD 压缩与 index.source_reuse 是 Easysearch 专有，
+  // 车的引擎 × 变体的兼容性：ZSTD 压缩与 index.source_reuse 是 Easysearch 专有，
   // ES 上 create-index 直接拒 —— 提前标出来，别排了再白跑一场建库。
   const m=matrix();
   const bad=[];
-  ARMS.forEach(function(a){
-    if(m.arms.indexOf(a.name)<0) return;
+  CARS.forEach(function(a){
+    if(m.cars.indexOf(a.name)<0) return;
     m.tracks.forEach(function(t){
       const info=TRACKS.find(function(x){return x.name===t;});
       const allow=info?(info.engines||''):'';
@@ -701,16 +701,16 @@ function paintCompat(){
     });
   });
   const box=document.getElementById('compatbox');
-  if(!bad.length){ box.innerHTML='<span style="color:#080">✔ 当前矩阵的臂×变体组合全部兼容</span>'; return; }
+  if(!bad.length){ box.innerHTML='<span style="color:#080">✔ 当前矩阵的车×变体组合全部兼容</span>'; return; }
   box.innerHTML='<span class="err">✘ '+bad.length+' 个组合不兼容（起跑会被拦下）：<br>'
     + bad.map(esc).join('<br>')+'</span>';
 }
 function matrix(){
-  const arms=[...document.querySelectorAll('.armck:checked')].map(e=>e.value);
+  const cars=[...document.querySelectorAll('.carck:checked')].map(e=>e.value);
   const tracks=[...document.querySelectorAll('.tkck:checked')].map(e=>e.value);
   const custom=document.getElementById('custom').value.trim();
   if(custom) custom.split(',').forEach(t=>{t=t.trim(); if(t&&!tracks.includes(t))tracks.push(t);});
-  return {arms, tracks, rounds:+document.getElementById('rounds').value,
+  return {cars, tracks, rounds:+document.getElementById('rounds').value,
           recall:document.getElementById('recall').value,
           est:document.getElementById('estov').value.trim(),
           ds_hours:+document.getElementById('dsh').value,
@@ -740,17 +740,17 @@ async function loadHist(){
   HIST=j;
   const s=j.summary;
   box.innerHTML='指标库已连接：<b>'+s.races+'</b> 场次 / <b>'+s.rows+'</b> 行 / <b>'+
-    s.campaigns+'</b> 个 campaign / <b>'+s.tracks+'</b> 条赛道 / <b>'+s.arms+'</b> 个臂';
+    s.campaigns+'</b> 个 campaign / <b>'+s.tracks+'</b> 条赛道 / <b>'+s.cars+'</b> 个车';
   paintMatrix(); paintCompat();
 }
-function cellOf(arm,track,round){
+function cellOf(car,track,round){
   if(!HIST) return null;
-  return HIST.cells[arm+'|'+track+'|'+round] || null;
+  return HIST.cells[car+'|'+track+'|'+round] || null;
 }
-function roundsOf(arm,track){
+function roundsOf(car,track){
   // 该格在库里出现过哪些轮次（全量，不受当前矩阵的轮次限制）
   if(!HIST) return [];
-  const pre=arm+'|'+track+'|', out=[];
+  const pre=car+'|'+track+'|', out=[];
   for(const k in HIST.cells){
     if(k.indexOf(pre)===0) out.push(parseInt(k.slice(pre.length),10));
   }
@@ -759,9 +759,9 @@ function roundsOf(arm,track){
 function paintMatrix(){
   if(!HIST){ document.getElementById('histmatrix').innerHTML=''; return; }
   const m=matrix();
-  const selArms=new Set(m.arms), selTracks=new Set(m.tracks);
-  const arms=HIST.arms||[], tracks=HIST.tracks||[];
-  let h='<table class="hmatrix"><tr><th>臂 \\ 赛道</th>';
+  const selCars=new Set(m.cars), selTracks=new Set(m.tracks);
+  const cars=HIST.cars||[], tracks=HIST.tracks||[];
+  let h='<table class="hmatrix"><tr><th>车 \\ 赛道</th>';
   tracks.forEach(function(t){
     const info=TRACKS.find(function(x){return x.name===t;});
     const runnable = TRACKS.some(function(x){return x.name===t;});
@@ -773,10 +773,10 @@ function paintMatrix(){
   });
   h+='</tr>';
   const skip=[];
-  arms.forEach(function(a){
-    const armDef=ARMS.find(function(x){return x.name===a;})||{};
-    const want=armDef.build? (a+'@'+armDef.build) : a;
-    h+='<tr><th class="'+(selArms.has(a)?'cur':'dim')+'">'+esc(a)+
+  cars.forEach(function(a){
+    const carDef=CARS.find(function(x){return x.name===a;})||{};
+    const want=carDef.build? (a+'@'+carDef.build) : a;
+    h+='<tr><th class="'+(selCars.has(a)?'cur':'dim')+'">'+esc(a)+
        '<br><small style="font-weight:400">'+esc(want)+'</small></th>';
     tracks.forEach(function(t){
       let cell='';
@@ -788,7 +788,7 @@ function paintMatrix(){
           if(pb[want]){ v=pb[want].verdict; title=(pb[want].campaigns||[]).join(',')+' '+v; }
           else { v='UNKNOWN'; title='别的 build: '+(c.builds||[]).join(','); }
         }
-        const inMatrix = selArms.has(a) && selTracks.has(t) && r<=m.rounds;
+        const inMatrix = selCars.has(a) && selTracks.has(t) && r<=m.rounds;
         cell+='<td class="'+VC[v]+(inMatrix?'':' past')+'" title="'+esc(
           a+' '+t+' r'+r+' · '+title+(inMatrix?'（在本次矩阵内）':'（本次矩阵外）'))+'">r'+r+' '+VT[v]+'</td>';
         if(inMatrix && c && pb_covered(c,want)) skip.push(a+' '+t+' r'+r);
@@ -827,15 +827,15 @@ boot();
 
 
 class ComposeState:
-    """serve 模式的共享状态：启动参数 + 已解析臂。线程锁保护远端操作串行。"""
+    """serve 模式的共享状态：启动参数 + 已解析车。线程锁保护远端操作串行。"""
 
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
-        text = read_arms_file(args)
-        self.arms = parse_arms(text)
-        self.arms_src_text = text
-        self.problems = validate_arms(self.arms)
+        text = read_cars_file(args)
+        self.cars = parse_cars(text)
+        self.cars_src_text = text
+        self.problems = validate_cars(self.cars)
         self._hist = None
         self._hist_at = 0.0
         self._hist_lock = threading.Lock()
@@ -854,18 +854,18 @@ class ComposeState:
             self._hist_at = now
             return self._hist
 
-    def build_of(self, arm_name):
-        for a in self.arms:
-            if a.name == arm_name:
+    def build_of(self, car_name):
+        for a in self.cars:
+            if a.name == car_name:
                 return a.build
         return ''
 
 
 def api_render(st, body):
-    arms = [a for a in st.arms if a.name in body['arms']] or st.arms
-    order = {a.name: i for i, a in enumerate(st.arms)}
-    arms = sorted(arms, key=lambda a: order[a.name])
-    problems = validate_arms(arms)
+    cars = [a for a in st.cars if a.name in body['cars']] or st.cars
+    order = {a.name: i for i, a in enumerate(st.cars)}
+    cars = sorted(cars, key=lambda a: order[a.name])
+    problems = validate_cars(cars)
     hard = [m for s, m in problems if s == 'error']
     if hard:
         return 400, {'error': '；'.join(hard)}
@@ -873,12 +873,12 @@ def api_render(st, body):
         return 400, {'error': '未选赛道'}
     tracks = list(body['tracks'])
     rounds = max(1, int(body['rounds']))
-    rows = interleave(arms, tracks, rounds)
+    rows = interleave(cars, tracks, rounds)
 
     # 已入库历史覆盖：默认剔除"当前 build 上已经跑过"的格
     incov = bool(body.get('include_covered'))
     cov = st.history()
-    plan = H.plan_cells(cov, arms, tracks, rounds, include_covered=incov)
+    plan = H.plan_cells(cov, cars, tracks, rounds, include_covered=incov)
     if plan['skipped']:
         rows = H.filter_rows(plan, rows)
     if not rows:
@@ -887,7 +887,7 @@ def api_render(st, body):
                      'plan': plan}
 
     # 引擎 × 变体兼容性（ZSTD / source_reuse 是 Easysearch 专有）
-    bad = compat_problems(arms, rows)
+    bad = compat_problems(cars, rows)
     if bad:
         return 400, {'error': '矩阵里有引擎与变体不兼容的组合：\n'
                              + '\n'.join(x[2] for x in bad)
@@ -901,10 +901,10 @@ def api_render(st, body):
     est_over = body.get('est') or ''
     if est_over:
         est_map.update(parse_est_overrides([p for p in est_over.split(',') if p.strip()]))
-    sched = render_schedule(rows, arms, tag, est_map,
+    sched = render_schedule(rows, cars, tag, est_map,
                             int(body.get('est_default') or DEFAULT_EST),
                             recall=(body.get('recall') != 'norecall'))
-    st.last = {'arms': arms, 'schedule': sched, 'tag': tag, 'plan': plan}
+    st.last = {'cars': cars, 'schedule': sched, 'tag': tag, 'plan': plan}
     return 200, {'schedule': sched, 'rows': len(rows), 'plan': plan}
 
 
@@ -913,7 +913,7 @@ def api_preview(st, body):
     if rc_ != 200:
         return rc_, out
     with st.lock:
-        upload(st.args, st.last['tag'], st.last['schedule'], render_arms(st.last['arms'], st.last['tag']))
+        upload(st.args, st.last['tag'], st.last['schedule'], render_cars(st.last['cars'], st.last['tag']))
         drc, dry = remote_dry_run(st.args, st.last['tag'], int(body.get('ds_hours') or 0))
     return 200, {'schedule': st.last['schedule'], 'dryrun': dry, 'rc': drc}
 
@@ -926,7 +926,7 @@ def api_start(st, body):
         rc_, out = api_render(st, body)
         if rc_ != 200:
             return rc_, out
-        upload(st.args, st.last['tag'], st.last['schedule'], render_arms(st.last['arms'], st.last['tag']))
+        upload(st.args, st.last['tag'], st.last['schedule'], render_cars(st.last['cars'], st.last['tag']))
         drc, dry = remote_dry_run(st.args, st.last['tag'], int(body.get('ds_hours') or 0))
         if drc != 0:
             return 400, {'error': 'dry-run 未通过，拒绝起跑\n' + dry}
@@ -958,7 +958,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/bootstrap':
             st = self.server.state
             self._send(200, 'application/json', json.dumps({
-                'arms': [a._asdict() for a in st.arms],
+                'cars': [a._asdict() for a in st.cars],
                 'problems': st.problems, 'ds_tiers': DS_TIERS,
                 # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
                 'tracks': [dict(v, name=k) for k, v in TRACK_CATALOG.items()],
@@ -1002,13 +1002,13 @@ def cmd_serve(args):
     state = ComposeState(args)
     hard = [m for s, m in state.problems if s == 'error']
     if hard:
-        print('警告：臂定义有未解决问题（渲染时会拦截）：', file=sys.stderr)
+        print('警告：车定义有未解决问题（渲染时会拦截）：', file=sys.stderr)
         for m in hard:
             print('  ' + m, file=sys.stderr)
     srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     srv.state = state
-    print('编排台: http://127.0.0.1:%d  （远端 %s，臂源 %s）'
-          % (args.port, args.ssh or '本地', args.arms_file))
+    print('编排台: http://127.0.0.1:%d  （远端 %s，车源 %s）'
+          % (args.port, args.ssh or '本地', args.cars_file))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1018,10 +1018,10 @@ def cmd_serve(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['arms', 'gen', 'preview', 'start', 'serve'])
-    ap.add_argument('--arms-file', default=None, help='臂定义文件（本地路径；--ssh 时为远端路径）')
-    ap.add_argument('--arms', default=None,
-                    help='只用这些臂（逗号分隔）；缺省用臂定义文件里的全部')
+    ap.add_argument('cmd', choices=['cars', 'gen', 'preview', 'start', 'serve'])
+    ap.add_argument('--cars-file', default=None, help='车定义文件（本地路径；--ssh 时为远端路径）')
+    ap.add_argument('--cars', default=None,
+                    help='只用这些车（逗号分隔）；缺省用车定义文件里的全部')
     ap.add_argument('--tracks', default='ds-g1920,ds-j2048,ds-j1024,ds-g960,ds-j768,ds-j512,ds-j1536')
     ap.add_argument('--rounds', type=int, default=1)
     ap.add_argument('--recall', dest='recall', action='store_true', default=True)
@@ -1050,27 +1050,27 @@ def main(argv=None):
                     help='不查指标库历史（默认会查；查不到时编排照常，只是不剔除）')
     args = ap.parse_args(argv)
 
-    if args.arms_file is None:
+    if args.cars_file is None:
         if args.ssh:
-            args.arms_file = posixpath.join(args.root, 'schedules', 'dimsweep-arms.conf')
+            args.cars_file = posixpath.join(args.root, 'schedules', 'dimsweep-cars.conf')
         else:
-            # 本地模式的臂定义默认取仓库内 schedules/dimsweep-arms.conf。
+            # 本地模式的车定义默认取仓库内 schedules/dimsweep-cars.conf。
             # 该文件属内部资料，不随公共库公开（仓库里没有这个目录），
             # 所以按「环境变量 → 仓库内默认 → 明确报错」三级回退，
             # 免得直接抛一个看不懂的 FileNotFoundError。
             here = os.path.dirname(os.path.abspath(__file__))
-            args.arms_file = (os.environ.get('RACEWAY_ARMS_FILE')
-                               or os.path.join(here, 'schedules', 'dimsweep-arms.conf'))
-            if not os.path.isfile(args.arms_file):
+            args.cars_file = (os.environ.get('RACEWAY_CARS_FILE')
+                               or os.path.join(here, 'schedules', 'dimsweep-cars.conf'))
+            if not os.path.isfile(args.cars_file):
                 raise SystemExit(
-                    '找不到臂定义文件: %s\n'
-                    '臂定义属内部资料，未随公共库公开 —— 用 --arms-file 指定路径，'
-                    '或设环境变量 RACEWAY_ARMS_FILE 指向它。\n'
+                    '找不到车定义文件: %s\n'
+                    '车定义属内部资料，未随公共库公开 —— 用 --cars-file 指定路径，'
+                    '或设环境变量 RACEWAY_CARS_FILE 指向它。\n'
                     '远端模式（--ssh）不受影响：默认读远端 %s'
-                    % (args.arms_file,
-                       posixpath.join(args.root, 'schedules', 'dimsweep-arms.conf')))
+                    % (args.cars_file,
+                       posixpath.join(args.root, 'schedules', 'dimsweep-cars.conf')))
 
-    {'arms': cmd_arms, 'gen': cmd_gen, 'preview': cmd_preview,
+    {'cars': cmd_cars, 'gen': cmd_gen, 'preview': cmd_preview,
      'start': cmd_start, 'serve': cmd_serve}[args.cmd](args)
 
 
