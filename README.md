@@ -114,6 +114,49 @@ python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out �
 ```
 
 
+## 存储压缩 × source_reuse 变体
+
+`index.codec`（存储压缩）与 `index.source_reuse`（_source 复用）是**索引级设置**，
+对任何索引都成立。raceway 把它们做成**两个独立维度**，按需派生出赛道变体：
+
+```
+变体 id = <基础赛道>-codec-<def|zstd|bc>[-sr]      （与变体目录名一致）
+  geo-codec-def      geo-codec-def-sr
+  geo-codec-zstd     geo-codec-zstd-sr
+  geo-codec-bc       geo-codec-bc-sr
+  hnsw-codec-zstd    ds-j1024-codec-bc-sr   …（任意基础赛道都适用）
+```
+
+**为什么要正交展开**：早先三个变体把两个维度糅在赛道名里
+（`geo-codec-zstd-sr` = ZSTD **且** source_reuse），于是"ZSTD 那档比 default 快/慢"
+**无法归因**。正交后任意两档的差异只归因到一个变量：
+
+| 对比 | 隔离出的变量 |
+|---|---|
+| `geo-codec-def` ↔ `geo-codec-zstd` | 压缩（source_reuse 都关） |
+| `geo-codec-def-sr` ↔ `geo-codec-zstd-sr` | 压缩（source_reuse 都开） |
+| `geo-codec-def` ↔ `geo-codec-def-sr` | source_reuse（压缩都是 default） |
+| `geo-codec-zstd` ↔ `geo-codec-zstd-sr` | source_reuse（压缩都是 ZSTD） |
+
+**引擎兼容**（据 Easysearch 源码 `EngineConfig.INDEX_CODEC_SETTING` 与实测）：
+`index.codec` 合法值 = `default` / `best_compression` / `lucene_default` / ZSTD 系列
+（ZSTD 系列是 Easysearch 专有；ES 的 `index.codec` 只有 default/best_compression）；
+`index.source_reuse` 也是 Easysearch 专有（ES 不认这个设置）。
+→ 两侧通用：压缩 default/best_compression 且 sr 关；其余**仅 Easysearch**。
+编排台与 runner 都会在起跑前拦下不兼容的组合（别等建索引那步才炸）。
+
+```bash
+# 按需生成变体（语料只软链不复制，变体目录 4MB 级）
+./prepare-codec-track.sh                      # 默认：geonames 一族 6 个
+./prepare-codec-track.sh hnsw-codec-zstd      # 任意基础赛道的变体
+```
+
+历史短 id `gdef` / `gzstd` / `gbc` 保留为别名（`gzstd` 实为 `geo-codec-zstd-sr`）——
+不改名是为了让旧 campaign 的场次名（`…-gzstd-r1`）语义不漂移。
+变体的推导是**规则**不是查表（`vm-bench-lib.sh` 的 `track_*` 与 `bench-history.py`
+的同名函数），`tests/test_codec_variants.py` 直接执行 bash 那套与 python 侧逐项比对。
+
+
 ## 队列观测与图形编排
 
 三个只读/半读的本地工具，把"队列"从散落的文件变成能看能排的东西：
