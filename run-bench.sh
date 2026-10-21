@@ -705,9 +705,10 @@ recall_probe() { # <fid> <track_dir> <track_key>
 # security agent 还原成发行版原版（原版 agent 1.18.8 不支持 Java 25+，
 # 原版 jvm.options 的 javaagent 作用域只到 21），不推就等于没修。
 #
-# 作用域按目标 JDK 主版本号现算，不写死：
+# 作用域固定，不跟随目标 JDK 主版本：
 #   javaagent      → 21-:（21 及以上都挂修补版 agent 1.18.15）
-#   UseJVMCICompiler→ 21-<hi>:（hi = max(目标主版本, 26)；OpenJDK 26+ 默认开 JVMCI 必须关）
+#   UseJVMCICompiler→ 21-26:（OpenJDK 26+ 默认开 JVMCI 必须关；OpenJDK 27 已移除该选项，
+#                              作用域带上 27 会直接报 "Unrecognized VM option 'UseJVMCICompiler'"）
 #
 # 顺序陷阱（2026-10-21 实测踩坑）：UseJVMCICompiler 在 OpenJDK 26/27 上属实验选项，
 #   显式设置（哪怕是 -XX:- 关掉）也必须先 -XX:+UnlockExperimentalVMOptions 解锁，
@@ -728,7 +729,6 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
   local agent="$fixdir/agent-patched-1.18.15.jar"
   [ -f "$agent" ] || agent="$PKG_DIR/agent-patched-1.18.15.jar"
   [ -f "$agent" ] || { log "  警告: 修补版 agent 缺失（$agent），跳过 agent 替换"; }
-  local hi=$major; [ "$hi" -lt 26 ] && hi=26
   # JVMCI 作用域固定止于 26（不跟随目标主版本）：OpenJDK 27 已移除 UseJVMCICompiler，
   #   作用域带上 27 会让 JDK 27 直接报 "Unrecognized VM option 'UseJVMCICompiler'"。
   #   JDK 27 里压根没有 JVMCI 这个概念，行为上与「JVMCI 关」等价，
@@ -753,7 +753,7 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
         || { log "  $ip: 推送修补版 agent 失败"; return 1; }
     fi
   done
-  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$jci_hi: 带解锁三连；目标 JDK $hi）"
+  log "  JDK 修补组合已推送（javaagent 21-: / UseJVMCICompiler 21-$jci_hi: 带解锁三连；目标 JDK $major）"
 }
 
 # JDK 身份断言：三节点实测 java -version 的主版本号必须等于期望（JDK_WANT="26|OpenJDK"）
