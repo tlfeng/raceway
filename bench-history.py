@@ -53,10 +53,14 @@ DEFAULT_ES_URL = 'https://127.0.0.1:9237'
 PAGE_SIZE = 2000
 
 # bench-run 里要取的字段（只取覆盖判定用得到的，省带宽也省内存）
+# 注意 track_raw / codec / source_reuse 都要取：
+#   track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
+#   codec 相同，靠 codec 分不出，只能靠目录名）
+#   codec / source_reuse = 压缩与复用的两个独立维度
 _SOURCE_FIELDS = ['campaign', 'fid', 'arm', 'arm_build', 'engine', 'engine_build',
-                  'build', 'track', 'round', 'status', 'quality', 'phase',
+                  'build', 'track', 'track_raw', 'round', 'status', 'quality', 'phase',
                   '@timestamp', 'caliber_warnings', 'jdk', 'dims', 'pkg',
-                  'challenge']
+                  'challenge', 'codec', 'source_reuse']
 
 # 判定失败的状态（与 bench-queue 的 STATUS_FAILS 对齐，只取库里真会出现的）
 FAIL_STATUSES = (
@@ -82,6 +86,116 @@ class HistoryUnavailable(Exception):
     调用方**必须**降级处理：界面要显示"指标库未运行"，而不是把空结果当成
     "什么都没跑过" —— 后者会让编排台把已跑过的场次重排一遍。
     """
+
+
+# ------------------------------------------------------------------ 变体推导
+# 压缩与 source_reuse 是**索引级设置**，对任何基础赛道都成立 → 变体 id 用
+# 规则推导（与压测机 vm-bench-lib.sh 的 track_canonical / track_base 等同一套，
+# tests/test_codec_variants.py 会比对两边推导结果）。
+#
+#   变体 id = <基础赛道>-codec-<def|zstd|bc>[-sr]      （与变体目录名一致）
+#   历史短 id（只作兼容输入）：gdef / gzstd / gbc
+#     gzstd 实为 geo-codec-zstd-sr —— 历史名不改，免得旧 campaign 场次名漂移
+#
+# 为什么覆盖判定必须带变体：库里 track 字段是**基础赛道**（"geo"/"hnsw"/…），
+# 压缩与 source_reuse 是另外两个维度。若覆盖键只用 (臂, 赛道, 轮次)，6 个变体的
+# 历史会混成一格 —— "ZSTD+sr 跑过"会被当成"default 也跑过"，把没跑的格误判成已覆盖。
+CODEC_TOKEN = {'default': 'def', 'ZSTD': 'zstd', 'best_compression': 'bc'}
+TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
+CANONICAL_ALIAS = {'gdef': 'geo-codec-def', 'gzstd': 'geo-codec-zstd-sr',
+                   'gbc': 'geo-codec-bc'}
+
+
+def canonical_id(tid):
+    """历史短 id → 规范 id。"""
+    return CANONICAL_ALIAS.get(tid, tid)
+
+
+def is_variant(tid):
+    return '-codec-' in canonical_id(tid)
+
+
+def base_of(tid):
+    """变体 id → 基础赛道 id。"""
+    c = canonical_id(tid)
+    return c.split('-codec-', 1)[0] if '-codec-' in c else c
+
+
+def token_of(tid):
+    """变体 id → 压缩 token（def/zstd/bc）；非变体返回空。"""
+    c = canonical_id(tid)
+    if '-codec-' not in c:
+        return ''
+    tok = c.split('-codec-', 1)[1]
+    return tok[:-3] if tok.endswith('-sr') else tok
+
+
+def compression_of(tid):
+    """变体 id → index.codec 取值；非变体返回 None。"""
+    return TOKEN_CODEC.get(token_of(tid))
+
+
+def source_reuse_of(tid):
+    """变体 id → True/False；非变体返回 None。"""
+    c = canonical_id(tid)
+    if '-codec-' not in c:
+        return None
+    return c.split('-codec-', 1)[1].endswith('-sr')
+
+
+def engines_of(tid):
+    """变体 id → 允许的引擎（None = 两侧通用）。
+
+    ZSTD 系列压缩与 index.source_reuse 都是 Easysearch 专有（ES 的 index.codec
+    只有 default/best_compression，也不认 index.source_reuse）。
+    """
+    if not is_variant(tid):
+        return None
+    if source_reuse_of(tid) or compression_of(tid) == 'ZSTD':
+        return 'easysearch'
+    return None
+
+
+def variant_of(track, codec, sr):
+    """(基础赛道, 压缩, source_reuse) → 变体 id；没有压缩就是基础赛道本身。"""
+    if not codec:
+        return track
+    token = CODEC_TOKEN.get(codec)
+    if not token:
+        return track
+    return '%s-codec-%s%s' % (track, token, '-sr' if sr == 'true' else '')
+
+
+def variant_id_of(row):
+    """一行 bench-run → 变体 id（覆盖判定的 key 维度）。
+
+    **按 track_raw（变体目录名）判定，不用 codec 字段反推** —— 因为基座赛道
+    与它的 default 变体实测出来的 index.codec 是一样的（引擎默认就是 LZ4），
+    靠 codec 分不出"geonames 基座"和"geo-codec-def"，只能靠目录名。
+
+    - track_raw 含 "-codec-" → 就是变体 id
+    - 否则 → 基础赛道（用 track 字段，它已把目录名归一过：track="geo" 等）
+    """
+    raw = row.get('track_raw') or ''
+    if '-codec-' in raw:
+        return raw
+    return row.get('track') or raw
+
+
+def split_codec(codec, sr=None):
+    """(codec 字段, source_reuse 字段) → (压缩, source_reuse)。
+
+    兼容旧格式：老的 user_tags.codec 是糅合串 "ZSTD+source_reuse"（两个维度
+    挤在一起）→ 拆开，让新旧数据落到同一套干净维度上，可比。
+    """
+    if not codec:
+        return None, None
+    if '+' in codec:
+        comp, _, tail = codec.partition('+')
+        return comp, ('true' if 'source_reuse' in tail else 'false')
+    if sr is None:
+        return codec, None
+    return codec, ('true' if str(sr).lower() == 'true' else 'false')
 
 
 # ------------------------------------------------------------------ 查指标库
@@ -200,7 +314,11 @@ def _verdict_of(rows):
 
 @dataclass
 class Cell:
-    """一个 (臂, 赛道, 轮次) 格的覆盖情况。
+    """一个 (臂, **变体**, 轮次) 格的覆盖情况。
+
+    变体 id = <基础赛道>-codec-<压缩>[-sr]；没有压缩的场次就是基础赛道本身。
+    （库里 track 字段是基础赛道，压缩与 source_reuse 是另外两个维度 ——
+    不合成变体 id 的话，6 个变体的历史会混成一格。）
 
     注意：同一格可能有**多个 build** 的记录 —— ds3 跑的是 3009（有些场次
     DEADLINE-SKIP），ds2 拿 3015 重跑（成功）。所以判定必须**按 build 分开**：
@@ -216,8 +334,35 @@ class Cell:
         self.rows.append(row)
 
     @property
+    def compression(self):
+        """这一格用到的压缩：优先实测值，缺失时按变体 id 的定义回落。
+
+        （变体目录本身就是"烘了什么设置"的 ground truth —— 变体没烘
+        source_reuse 就是没烘，引擎默认 false。）
+        """
+        for r in self.rows:
+            c, _ = split_codec(r.get('codec'), r.get('source_reuse'))
+            if c:
+                return c
+        return compression_of(self.track)
+
+    @property
+    def source_reuse(self):
+        """这一格是否开了 source_reuse：优先实测值，缺失时按变体 id 的定义回落。"""
+        for r in self.rows:
+            _, s = split_codec(r.get('codec'), r.get('source_reuse'))
+            if s is not None:
+                return s == 'true'
+        return source_reuse_of(self.track)
+
+    @property
     def key(self):
         return (self.arm, self.track, self.round)
+
+    @property
+    def base(self):
+        """基础赛道 id（变体剥掉 -codec-... 后缀）。"""
+        return base_of(self.track)
 
     @property
     def builds(self):
@@ -358,10 +503,13 @@ def build_coverage(rows, total=None):
             rnd = 0
         if not arm or not track:
             continue
-        key = (arm, track, rnd)
+        # 变体身份按 track_raw（目录名）判定；压缩/sr 是另外两个维度
+        vid = variant_id_of(r)
+        comp, sr = split_codec(r.get('codec'), r.get('source_reuse'))
+        key = (arm, vid, rnd)
         cell = cov.cells.get(key)
         if cell is None:
-            cell = Cell(arm=arm, track=track, round=rnd)
+            cell = Cell(arm=arm, track=vid, round=rnd)
             cov.cells[key] = cell
         cell.add(r)
         camps.add(r.get('campaign') or '')

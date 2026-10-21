@@ -27,18 +27,39 @@ import os
 import re
 import shutil
 import sys
+import importlib
+
+# 压缩 / source_reuse 两个维度的推导与 legacy 拆分放在 bench-history（与编排台
+# 同一份实现），避免两处各写一套慢慢漂移。
+H = importlib.import_module('bench-history')  # 文件名带连字符
 
 DOCS = {"track": 11396503, "hnsw2m-2m-s3": 2000000, "nested-s3": 11203029,
         "hv1024-s3": 1000000, "dsj512-s3": 1000000, "dsj768-s3": 1000000,
         "dsj1024-s3": 1000000, "dsj1536-s3": 1000000, "dsj2048-s3": 1000000,
         "dsg960-s3": 1000000, "dsg1920-s3": 1000000,
-        # geonames 存储压缩对比三变体（prepare-codec-track.sh 生成，语料与基座同一份）
-        "geo-codec-def": 11396503, "geo-codec-zstd-sr": 11396503, "geo-codec-bc": 11396503}
-TRACK_NAME = {"track": "geo", "hnsw2m-2m-s3": "hnsw", "nested-s3": "nested", "hv1024-s3": "hv1024",
-              "geo-codec-def": "geo", "geo-codec-zstd-sr": "geo", "geo-codec-bc": "geo"}
-# 变体名 → 期望 codec（实测值优先取 sidecar 的 index_settings_measured，这里只兜底）
-TRACK_CODEC = {"geo-codec-def": "default", "geo-codec-zstd-sr": "ZSTD+source_reuse",
-               "geo-codec-bc": "best_compression"}
+        # geonames 存储压缩 × source_reuse 正交六变体（prepare-codec-track.sh 生成，
+        # 语料与基座同一份 → doc 数相同）
+        "geo-codec-def": 11396503, "geo-codec-def-sr": 11396503,
+        "geo-codec-zstd": 11396503, "geo-codec-zstd-sr": 11396503,
+        "geo-codec-bc": 11396503, "geo-codec-bc-sr": 11396503}
+TRACK_NAME = {"track": "geo", "hnsw2m-2m-s3": "hnsw", "nested-s3": "nested", "hv1024-s3": "hv1024"}
+
+
+def track_name_of(raw):
+    """变体目录名（track_raw）→ 基础赛道名。
+
+    显式表（基座目录名）+ 规则（任意 `<base>-codec-*` 变体 → 它的 base）。
+    规则化才能推广到全部基础赛道，新增赛道不用再改表。
+    """
+    if raw in TRACK_NAME:
+        return TRACK_NAME[raw]
+    if raw and '-codec-' in raw:
+        return H.base_of(raw)
+    return raw
+# 变体目录 → (压缩, source_reuse) 两个**独立维度**的期望值：**按规则推导**
+# （变体 id 本身就编码了压缩与 sr），不用查表 —— 新增赛道/变体不用改表。
+# 压缩：default(LZ4) / ZSTD / best_compression(DEFLATE)
+# source_reuse：true / false —— Easysearch 专有（ES 不认 index.source_reuse）
 PHASE = {"write-only": "w", "query-only": "q", "index-only": "w",
          "nested-search-challenge": "wq", "default": "wq"}
 LOWER_BETTER = ("latency", "service_time", "processing_time", "error_rate", "duration",
@@ -132,21 +153,41 @@ def direction_of_system(metric):
     return "lower-better"
 
 
-def codec_of(d, side):
-    """本场**实测生效**的存储编码（codec 对比结论的分组键）：
-    优先 sidecar 的 _settings 回读 → user_tags.codec → 赛道变体名期望值；都没有则 None（非 codec 场）。"""
+def codec_dims(d, side):
+    """本场**实测生效**的存储设置 → (compression, source_reuse) 两个**独立维度**。
+
+    为什么拆两个维度：压缩（index.codec）与 source_reuse 是两个独立变量，
+    糅在一个串里（旧的 "ZSTD+source_reuse"）就没法归因"是谁带来的差异"。
+    拆开后任意一维都能单独分组对比。
+
+    优先级：sidecar 的 _settings 回读（最权威，是实测值）
+          → user_tags（新格式 codec/source_reuse 分开；旧格式 "ZSTD+source_reuse" 拆开）
+          → 赛道变体名兜底。
+    非 codec 变体场次 → (None, None)。
+    """
     st = ((side.get("run_params") or {}).get("index_settings_measured") or {}) if side else {}
     for _idx, s in (st.items() if isinstance(st, dict) else []):
         c = (s or {}).get("index.codec")
         sr = str((s or {}).get("index.source_reuse", "")).lower()
-        if c and sr == "true":
-            return c + "+source_reuse"
         if c:
-            return c
+            return c, ("true" if sr == "true" else "false")
     ut = d.get("user-tags") or {}
-    if ut.get("codec"):
-        return ut["codec"]
-    return TRACK_CODEC.get(d.get("track"))
+    c = ut.get("codec")
+    if c:
+        return H.split_codec(c, ut.get("source_reuse"))
+    tr = d.get("track")
+    return H.compression_of(tr), (('true' if H.source_reuse_of(tr) else 'false')
+                                  if H.source_reuse_of(tr) is not None else None)
+
+
+def codec_of(d, side):
+    """兼容旧调用点：只取压缩维度（source_reuse 另有 source_reuse_of）。"""
+    return codec_dims(d, side)[0]
+
+
+def source_reuse_of(d, side):
+    """本场是否开了 index.source_reuse（Easysearch 专有设置）。"""
+    return codec_dims(d, side)[1]
 
 
 def knn_params_of(side):
@@ -162,8 +203,34 @@ def knn_params_of(side):
 def fid_of(d):
     ut = d.get("user-tags") or {}
     arm = ut.get("arm") or ut.get("engine") or "?"
-    tr = TRACK_NAME.get(d.get("track"), d.get("track"))
+    tr = track_name_of(d.get("track"))
     return arm, tr, ut
+
+
+# ------------------------------------------------------------------ 图例标签派生
+#
+# 看板图例只显示臂名（ez250 / jdk25@3015 / kona25@3015）时，读者看不出三件事：
+# 引擎版本（ez240 与 ez250 都是 EasySearch，版本 2.4.0 / 2.5.0）、
+# 引擎 build（3015 / 3009 / 2975，同版本不同 build 的结论不能混）、
+# JDK 发行版（jdk25 臂是 Oracle GraalVM 25，kona25 臂是 Tencent Kona 25，
+# 两者主版本号都是 25，臂名区分得开但看不出是两种发行版）。
+#
+# 标签口径（2026-10-21 sam 确认）：引擎名@版本号@build号@JDK名
+#   ez@2.4.0@2975@graalvm21     ez@2.5.0@3015@graalvm25
+#   ez@2.5.0@3015@kona25        es@8.19.23@—@openjdk27
+# 口径代码在 arm_label.py（唯一来源），这里只做引用 —— 别在这里另写一份。
+
+try:
+    arm_label_mod = importlib.import_module('arm_label')
+except ImportError:                                                    # 从别处 import 本文件时
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    arm_label_mod = importlib.import_module('arm_label')
+ARM_FALLBACK = arm_label_mod.ARM_FALLBACK
+BUILD_UNKNOWN = arm_label_mod.BUILD_UNKNOWN
+ENGINE_SHORT = arm_label_mod.ENGINE_SHORT
+JDK_VENDOR_PREFIX = arm_label_mod.JDK_VENDOR_PREFIX
+arm_label_of = arm_label_mod.arm_label_of
+jdk_short_of = arm_label_mod.jdk_short_of
 
 
 # ---------------------------------------------------------------- 环境台账派生 (方案 §3.1)
@@ -599,6 +666,7 @@ def validate_payload(runs, metrics):
         "dims": cov(lambda r: r.get("dims") is not None),
         "segment_form": cov(lambda r: bool(r.get("segment_form"))),
         "codec": cov(lambda r: bool(r.get("codec"))),
+        "source_reuse": cov(lambda r: r.get("source_reuse") is not None),
         "sidecar": cov(lambda r: not any(str(w).startswith("no-sidecar")
                                          for w in (r.get("caliber_warnings") or []))),
         "quality_ok": cov(lambda r: r.get("quality") == "ok"),
@@ -667,6 +735,7 @@ def main():
     fid_arm = {}            # fid → 实验臂；system 行靠它回填 arm（否则按 arm 分线的面板拿不到 series）
     fid_arm_build = {}      # fid → 臂@build；system 行同样要回填，否则按 arm_build 分线的
                             # system 类面板（外来进程 CPU / 换入次数…）会分不出桶 → 空面板
+    fid_arm_label = {}      # fid → 图例标签；同上，system 行要一起回填
     seen = set()
     unmatched = 0
     skipped_no_campaign = 0
@@ -756,6 +825,8 @@ def main():
         # 复合分组键：同一臂的跨 build 场次（3009 与 3015）必须能分开画线，
         # 否则看板上"jdk26"那条线里混着两个不同引擎 build 的点，结论会被误读。
         arm_build = ("%s@%s" % (arm, build_no)) if (arm and build_no) else arm
+        # 看板图例标签：引擎@版本@build@JDK（arm_build 只说了一半，看不出引擎版本与 JDK 发行版）
+        arm_label = arm_label_of(arm, engine, version, build_no, side)
         jdk_nodes = sj.get("measured_nodes") or []
         jdk = ",".join(sorted({str(x) for x in jdk_nodes})) or ut.get("jdk") or ident.get("jdk")
         heap_max = srp.get("heap_max_measured_mb") or []
@@ -794,9 +865,12 @@ def main():
                   "version": str(version) if version is not None else None,
                   "engine_build": build_no,
                   "arm_build": arm_build,
+                  # arm_label 是给人看的图例标签（引擎@版本@build@JDK），arm/arm_build 留作机器维度
+                  "arm_label": arm_label,
                   "jdk": jdk, "heap_gb": heap_gb,
                   "dims": dims, "lineage": lineage, "segment_form": segment_form,
                   "codec": codec_of(d, side),
+                  "source_reuse": source_reuse_of(d, side),
                   "quality": race_row_quality,
                   "knn_params": knn_params_of(side),
                   # track 必须进 common：bench-metric 的指标行没有它就没法按赛道过滤，
@@ -815,10 +889,12 @@ def main():
         fid_quality.setdefault(fid, race_row_quality)
         fid_arm.setdefault(fid, arm)
         fid_arm_build.setdefault(fid, arm_build)
+        fid_arm_label.setdefault(fid, arm_label)
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
                      "campaign": camp, "fid": fid, "arm": arm, "engine": engine,
                      "version": str(version) if version is not None else None, "build": build,
                      "engine_build": build_no, "arm_build": arm_build,
+                     "arm_label": arm_label,
                      "jdk": jdk, "heap_gb": heap_gb,
                      "dims": dims, "lineage": lineage, "segment_form": segment_form,
                      "track": tr, "track_raw": d.get("track"), "challenge": d.get("challenge"),
@@ -848,6 +924,7 @@ def main():
                      "corpus": side.get("corpus") or ({"docs": DOCS.get(d.get("track"))} if DOCS.get(d.get("track")) else None),
                      "env_id": (side.get("env") or {}).get("env_id"),
                      "codec": codec_of(d, side),
+                     "source_reuse": source_reuse_of(d, side),
                      "store_size_gb_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("store_gb"),
                      "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
                      "write_task_duration_s": dur, "throughput_docs_per_s_whole": rate_b,
@@ -915,6 +992,7 @@ def main():
                                     "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
                                     "arm_build": fid_arm_build.get(fid),
+                                    "arm_label": fid_arm_label.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                     "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
@@ -926,6 +1004,7 @@ def main():
                                 "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
                                     "valid": fid_valid.get(fid), "arm": fid_arm.get(fid),
                                     "arm_build": fid_arm_build.get(fid),
+                                    "arm_label": fid_arm_label.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
@@ -984,8 +1063,12 @@ def main():
                        "engine": {"type": "keyword"}, "version": {"type": "keyword"},
                        "engine_build": {"type": "keyword"},
                        "arm_build": {"type": "keyword"},
+                       # arm_label：给人看的图例标签（引擎@版本@build@JDK），看板按它分线
+                       "arm_label": {"type": "keyword"},
                        "build": {"type": "keyword"}, "jdk": {"type": "keyword"},
                        "arm": {"type": "keyword"}, "env_id": {"type": "keyword"},
+                       # 存储设置的两个独立维度：压缩 与 source_reuse
+                       "codec": {"type": "keyword"}, "source_reuse": {"type": "keyword"},
                        "track": {"type": "keyword"}, "campaign": {"type": "keyword"},
                        "family": {"type": "keyword"}, "metric": {"type": "keyword"},
                        "stat": {"type": "keyword"}, "task": {"type": "keyword"},

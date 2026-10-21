@@ -267,7 +267,7 @@ def tsvb_series(idx, terms_field, metric_type, metric_field, formatter):
     }
 
 
-def tsvb_timeseries(title, panel_filter, formatter, terms_field='arm',
+def tsvb_timeseries(title, panel_filter, formatter, terms_field='arm_label',
                     metric_type='avg', metric_field='value', index_pattern='bench-metric',
                     interval='1d'):
     return {
@@ -440,7 +440,9 @@ def track_mixed_builds(track):
 
     ds3 首轮是 easysearch 2.5.0-3009、ds2 是 2.5.0-3015，臂标签却都是
     jdk25/jdk26/jdk27 —— 画在同一条线上就是跨 build 混线，结论会被误读。
-    真有混线的赛道，面板改按 arm_build 分组（jdk26@3009 / jdk26@3015 两条线）。
+
+    现在面板统一按 arm_label 分线（标签自带 build），这个判断已不需要参与分组，
+    但保留成体检项：返回 True 的赛道值得在图注里点一句"该赛道跨 build 采集"。
     """
     try:
         r = es_post('/bench-run/_search', {
@@ -464,8 +466,12 @@ def track_panel_specs(track, groups, interval):
     #   "失败响应有多快"（实测 p99 只有 0.22s），混进延迟曲线会把引擎显得比实际更快。
     #   15 场 nested 就是这样在 valid:true 过滤下混进曲线的。
     # 唯一不放行 degraded 的是错误率面板 —— 它就是要显示失败场次。
-    # 跨 build 混线的赛道改按 arm_build 分线（jdk26@3009 / jdk26@3015）
-    split = 'arm_build' if track_mixed_builds(track) else 'arm'
+    #
+    # 分组字段用 arm_label（引擎@版本@build@JDK，如 ez@2.5.0@3015@graalvm25）：
+    #   一是臂名（ez250 / jdk25@3015）看不出引擎版本与 JDK 发行版，读者没法判断两条线能不能比；
+    #   二是 arm_label 自带 build，跨 build 自动分线 —— 以前靠 arm_build/arm 二选一来避免
+    #   "jdk26 臂跨 3009/3015 两个 build 混成一条线"（ds3 与 ds2 两批数据就是这么混起来的）。
+    split = 'arm_label'
     t = 'track:%s AND quality:ok' % track
     tq = 'track:%s' % track
     specs = [
@@ -557,7 +563,7 @@ def track_panel_specs(track, groups, interval):
 
 
 def visualization_obj(vis_id, title, panel_filter, formatter,
-                      terms_field='arm', metric_type='avg', interval='1d'):
+                      terms_field='arm_label', metric_type='avg', interval='1d'):
     params = tsvb_timeseries(title, panel_filter, formatter,
                              terms_field=terms_field,
                              metric_type=metric_type,
@@ -577,7 +583,9 @@ def env_markdown():
     md = ['**Benchmark 结果总览** · 数据源 `bench-run` / `bench-metric`'
           '（raceway bench-export.py 离线入库，源 = rally race.json + sidecar）',
           '',
-          '每点 = 一场 race；曲线 = 实验臂(arm)；同臂跨引擎 build 时自动拆成「臂@build」多条线（如 jdk26@3009 / jdk26@3015），因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
+          '每点 = 一场 race；曲线 = 实验臂(arm)，图例标签 = `引擎@版本@build@JDK`（如 ez@2.5.0@3015@graalvm25，'
+          'arm_label 字段）；同臂跨引擎 build 会自动拆成多条线（如 jdk26@3009 / jdk26@3015），'
+          '因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
     try:
         r = es_get('/bench-env/_search?size=10')
         for hit in r['hits']['hits']:
@@ -604,7 +612,10 @@ def env_markdown():
             'size': 0,
             'aggs': {
                 'by_valid': {'terms': {'field': 'valid', 'size': 5}},
-                'arms': {'terms': {'field': 'arm', 'size': 20}},
+                # arms 下挂 arm_label：把臂名（跑压时的 ARM_LABEL）与图例标签对上，
+                # 否则读者只看到 "jdk25=98" 却不知道图例里的 ez@2.5.0@3015@graalvm25 是哪个臂
+                'arms': {'terms': {'field': 'arm', 'size': 20},
+                         'aggs': {'labels': {'terms': {'field': 'arm_label', 'size': 10}}}},
                 'by_track': {'terms': {'field': 'track', 'size': 20}},
             }})
         aggs = r['aggregations']
@@ -619,6 +630,14 @@ def env_markdown():
         md.append('**场次体检** — 共 %d 场（VALID %d / 非 VALID %d）' % (total, n_valid, n_invalid))
         md.append('实验臂: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                          for b in aggs['arms']['buckets']))
+        # 臂名 → 图例标签对照（同一臂可能对应多个标签：跨 build 采集时各 build 一条线）
+        pairs = []
+        for b in aggs['arms']['buckets']:
+            labs = b.get('labels', {}).get('buckets') or []
+            for lb in labs:
+                pairs.append('%s → %s（%d 场）' % (b['key'], lb['key'], lb['doc_count']))
+        if pairs:
+            md.append('臂名 → 图例标签: ' + ' · '.join(pairs))
         md.append('赛道: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                         for b in aggs['by_track']['buckets']))
     except Exception as e:                                   # noqa: BLE001
@@ -667,7 +686,14 @@ USAGE_MD = '''**看图指南**
   量纲不可比，所以不放在同一张图里对比 —— 对照 opensearch.org/benchmarks 的分页口径。
 - 看板内再按 **workload 分图**：同一赛道内不同 task（term 检索 / country 聚合 / sort /
   decay / KNN k 值）的吞吐与延迟量纲不同，混在一张图里同样是误读。
-- 每点 = 一场 race；曲线 = 实验臂(arm)；同臂跨引擎 build 时自动拆成「臂@build」多条线（如 jdk26@3009 / jdk26@3015），因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
+- 每点 = 一场 race；曲线 = 实验臂(arm)，图例标签 = `引擎@版本@build@JDK`；同臂跨引擎 build 时自动拆成多条线（如 ez@2.5.0@3009@openjdk26 / ez@2.5.0@3015@openjdk26），因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
+- **图例标签怎么读**（`arm_label` 字段，格式 `引擎@版本@build@JDK`）：
+  - 引擎名：`ez` = EasySearch、`es` = Elasticsearch
+  - 版本号：引擎版本（2.4.0 / 2.5.0 / 8.19.23）
+  - build 号：引擎构建号（2975 / 3009 / 3015），无构建号时显示 `—`（如 ES 8.19.23）
+  - JDK 名：`graalvm21/25` = Oracle GraalVM 21/25、`kona25` = Tencent Kona 25、
+    `openjdk26/27` = OpenJDK 26/27（均为 sidecar 实测值，非臂名推测）
+  - 臂名（跑压时的 `ARM_LABEL`，如 jdk25）与标签的对应关系见「环境说明」面板的对照行。
 - **两层闸门，各管各的**：
   - `valid`（看板级，管所有面板）= 场次跑完了、且 RACES.md 记为 VALID。没记账的批次
     （早期 one-off 场次）没有这个标记，**默认不出图** —— 它们不可信，不能和正式批次同图比较。
