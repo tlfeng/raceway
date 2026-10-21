@@ -84,12 +84,22 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 - 实验变量 `dims` / `lineage` 从 user-tags 提升为 typed 列，可 range/排序
 - **bench-metric 带 `track` 列**（归一化赛道名）：按赛道拆看板的前提 —— 指标行没有
   track 就没法按赛道过滤
-- **monitors 补的 system 行按场次回填 `@timestamp` / `valid` / `car`**：这行是按场次
-  采集的摘要，本身没有时间戳也没有车名 —— 不回填的话 CPU steal 这类数据可信度指标
+- **bench-metric 只带一个身份字段 `series_key`**（引擎@版本@build@JDK，如
+  `ez@2.5.0@3015@graalvm25`）：run 维度（engine/version/jdk/dims/segment_form/
+  env_id/round/phase/车代号…）在指标行上与 bench-run 完全重复，既白付体积又多一份漂移面，
+  全部回 bench-run 查（方案 §1 修订）。看板按 `series_key` 分线，TSVB 的 split-by 只吃一个字段；
+  按引擎过滤写 `series_key:ez@*`（**不加引号** —— 带引号是精确短语，实测匹配 0 条）
+- **身份只认实测**：`jdk_vendor` / `jdk_version` 取 sidecar 的 `java -version` 原文与节点 JVM 版本，
+  查不到就空 —— 车代号推不出 patch 号（jdk25 可能是 25.0.4 也可能是 25.0.5），不知道就不猜；
+  厂商必须单列（GraalVM 25.0.4 与 TencentKonaJDK 25.0.4 的版本号一模一样，只有厂商能区分）
+- **monitors 补的 system 行按场次回填 `@timestamp` / `valid` / `series_key` / `race_id`**：这行是按场次
+  采集的摘要，本身没有时间戳也没有身份 —— 不回填的话 CPU steal 这类数据可信度指标
   既画不出折线（x 轴无值），也会被 dashboard 的 `valid: true` 整体过滤掉
 - 引擎身份 `engine`（easysearch/elasticsearch）从**包名**推导，不信 sidecar 的 `name` 字段
 - 幂等：文档 `_id` 固定（`race_id` / `race_id|task|family|stat`），重复执行是覆盖不是翻倍
 - 改了 index template 必须 `--drop` 重建索引，旧 mapping 不会自动更新
+- **bench-metric 的索引模板是 `dynamic: strict`**：字段集 = 导出器的白名单，白名单外的字段
+  （run 维度回流）在 ES 侧直接拒收 —— 精简靠机制保证，不靠口头约定
 
 看板对照 [opensearch.org/benchmarks](https://opensearch.org/benchmarks/) 的分页口径：
 **每个 esrally track 一个独立看板**（`bench-geo` / `bench-hnsw` / `bench-nested` /

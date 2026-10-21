@@ -42,8 +42,24 @@ def load_runs(path):
     return out
 
 
-def load_detail_metrics(path, camp):
-    """流式扫大文件，只留目标 campaign 且画图用得上的行"""
+def car_of_run(run):
+    """场次行的车代号（编排时起的名字）。
+
+    车代号不再作顶层 typed 列（方案 §1 修订：身份由 engine / version /
+    engine_build / jdk_vendor / jdk_version / series_key 表达），它留在 user_tags 里
+    —— 改名后的批次写 user_tags.car，改名前的批次写 user_tags.arm，两个都读。
+    """
+    ut = (run or {}).get("user_tags") or {}
+    return ut.get("car") or ut.get("arm") or (run or {}).get("car") or (run or {}).get("arm") or ""
+
+
+def load_detail_metrics(path, camp, run_index=None):
+    """流式扫大文件，只留目标 campaign 且画图用得上的行
+
+    bench-metric 精简后**不再冗余场次维度**（car / engine / track_raw / codec /
+    round / phase…，方案 §1 修订）—— 这些按 race_id 从 bench-run 回填：
+    指标行只留指标事实与口径，场次维度以 bench-run 为准，避免两份漂移。
+    """
     rows = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -54,11 +70,20 @@ def load_detail_metrics(path, camp):
                 continue
             if d.get("stat") not in KEEP_STAT:
                 continue
-            rows.append({k: d.get(k) for k in ("race_id", "fid", "campaign", "engine", "track", "track_raw",
-                                               "codec", "valid", "round",
-                                               "phase", "task", "family", "stat", "value", "unit")})
-            # 车身份统一口径（兼容改名前的文档：那时 car 存的是 Rally 插件列表）
-            rows[-1]["car"] = car_of(d)
+            row = {k: d.get(k) for k in ("race_id", "fid", "campaign", "track", "valid",
+                                         "task", "family", "stat", "value", "unit")}
+            run = (run_index or {}).get(d.get("race_id"))
+            if run:
+                row.update({"car": car_of_run(run), "engine": run.get("engine"),
+                            "track_raw": run.get("track_raw"), "codec": run.get("codec"),
+                            "round": run.get("round"), "phase": run.get("phase"),
+                            "series_key": run.get("series_key")})
+            else:
+                # 老载荷（车代号还在指标行上）：直接读，兼容旧导出快照
+                row.update({"car": car_of(d), "engine": d.get("engine"),
+                            "track_raw": d.get("track_raw"), "codec": d.get("codec"),
+                            "round": d.get("round"), "phase": d.get("phase")})
+            rows.append(row)
     return rows
 
 
@@ -69,7 +94,7 @@ def build(runs, detail, sysrows, camp):
     for r in W:
         if r["campaign"] != camp:
             continue
-        byat.setdefault((r["car"], r["track"]), []).append(r)
+        byat.setdefault((car_of_run(r), r["track"]), []).append(r)
     detail_card = []
     for (car, track), rs in sorted(byat.items()):
         rs.sort(key=lambda x: x.get("round") or 0)
@@ -136,20 +161,20 @@ def build(runs, detail, sysrows, camp):
     #    不能混进来（valid is False 的行直接跳过，valid 未知的保留并在 ⚠ 里体现）。
     tl = {}
     for r in W:
-        if r["car"] not in TREND_CARS or not r.get("throughput_docs_per_s_whole"):
+        if car_of_run(r) not in TREND_CARS or not r.get("throughput_docs_per_s_whole"):
             continue
         if r.get("track") not in ("geo", "hnsw", "nested"):
             continue
         if r.get("valid") is False:
             continue
-        key = (r["car"], r["track"], r.get("codec") or "")
+        key = (car_of_run(r), r["track"], r.get("codec") or "")
         tl.setdefault(key, {}).setdefault(r["campaign"], []).append(
             r["throughput_docs_per_s_whole"])
     trend = {}
     for (car, track, codec), camps in tl.items():
         pts = []
         for campname, vs in camps.items():
-            same = [r for r in W if r["campaign"] == campname and r["car"] == car]
+            same = [r for r in W if r["campaign"] == campname and car_of_run(r) == car]
             warn = any("heap 声明不实" in " ".join(r.get("caliber_warnings") or []) for r in same)
             # es819 在 10-18 之前没有 es_heap_pin：ES 出厂 jvm.options 无 -Xms/-Xmx，实际走
             # JVM 默认（物理内存 1/4 = 8g），与 16g 点不可同线比较
@@ -457,7 +482,10 @@ def main():
     args = ap.parse_args()
     camp = os.path.basename(args.campaign.rstrip("/"))
     runs = load_runs(os.path.join(args.export, "bench-run.jsonl"))
-    detail = load_detail_metrics(os.path.join(args.export, "bench-metric.jsonl"), camp)
+    # 场次维度以 bench-run 为准：指标行不再冗余 car/engine/track_raw/codec/round/phase
+    # （方案 §1 修订）—— 报告按 race_id 回填，两边口径不会漂移。
+    run_index = {r.get("race_id"): r for r in runs}
+    detail = load_detail_metrics(os.path.join(args.export, "bench-metric.jsonl"), camp, run_index)
     sysrows = [m for m in detail if m.get("family") == "system"]
     # system 行没有 phase/task，需要单独捞
     with open(os.path.join(args.export, "bench-metric.jsonl"), encoding="utf-8") as f:
@@ -470,7 +498,7 @@ def main():
     ccamp = args.codec_campaign and os.path.basename(args.codec_campaign.rstrip("/"))
     if ccamp:
         payload["codec"] = build_codec(runs, load_detail_metrics(
-            os.path.join(args.export, "bench-metric.jsonl"), ccamp), ccamp)
+            os.path.join(args.export, "bench-metric.jsonl"), ccamp, run_index), ccamp)
     payload["head"] = [
         "campaign %s：3 车 × 3 赛道 × 3 轮 = 27 场，全 VALID、0 重试" % camp,
         "口径 16g 堆 / 32 vCPU 逐场实测断言；负载卡点仅起跑前一次，赛中分相位采样只记录",
@@ -478,7 +506,7 @@ def main():
         "生成于导出载荷 bench-run/bench-metric（离线，未依赖 ES）",
     ]
     payload["concl"] = [
-        "Kona 25 与 Oracle GraalVM 25 在三赛道写入上全部持平：geo +0.6%、hnsw +1.9%、nested +2.2%，均小于同车轮间极差（7.8~25.5%）。此前「Kona 快 14~17%」与「nested GraalVM 快 19%」均未复现，已撤回。",
+        "Kona 25 与 Oracle GraalVM 25 在三赛道写入上全部持平：geo +0.6%、hnsw +1.9%、nested +2.2%，均小于同车轮次间极差（7.8~25.5%）。此前「Kona 快 14~17%」与「nested GraalVM 快 19%」均未复现，已撤回。",
         "2.5.0 相对 2.4.0 有实质收益：geonames 写入 +12.4%、hnsw 建库 +21.9%、knn 查询 p50 −15~19%、painless_dynamic −17%、bulk p100 5.6s→4.4s；nested 文档灌入 +0.7%（无收益）。",
         "复现性最好的赛道是 hnsw（同车极差 1.3~3.8%），最差是 nested（14.7~25.5%）；比较结论应取中位并要求 ≥3 轮同场配对。",
         "环境证据：27 场分相位采样显示 steal 全程 0.00%、iowait ≤2%、disk util 3~5%、load1 ≤6.6（32 核）、ENV-VERDICT 全 OK ⇒ 宿主抢占无法解释历史上 45% 的读数散布；跨 campaign 电平漂移（hnsw 三批 4828→4652→4199）需在集群内部（merge/页缓存/JIT 状态）继续找因。",
@@ -492,7 +520,7 @@ def main():
             payload["concl"] = [
                 "存储压缩主结论：Easysearch 2.5.0 开 `index.codec=ZSTD` + `index.source_reuse` 后，geonames 赛末落盘 %.2f GB（比默认 LZ4 的 %.2f GB 省 %.1f%%）；ES 8.19 开 best_compression 只到 %.2f GB（省 %.1f%%）。同语料、同 3 分片 0 副本、同 16g 堆 32 核，且两侧 codec 都从 sidecar 的 `_settings` 回读确认生效。" % (
                     zst["store"], ez["store"], -zst["store_delta"], bc["store"], -bc["store_delta"]),
-                "写入不赔：ez-zstd-sr 口径B %.0f docs/s vs ez-def %.0f（差 %.1f%%，远小于同车轮间极差 %.1f%%/%.1f%%）。" % (
+                "写入不赔：ez-zstd-sr 口径B %.0f docs/s vs ez-def %.0f（差 %.1f%%，远小于同车轮次间极差 %.1f%%/%.1f%%）。" % (
                     zst["med_b"], ez["med_b"], (zst["med_b"] / ez["med_b"] - 1) * 100,
                     ez["spread"] or 0, zst["spread"] or 0),
                 "代价在读 stored fields 的操作：%s。走 doc_values 的聚合/计数不动。" % (

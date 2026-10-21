@@ -20,8 +20,16 @@
      CAR_FALLBACK 按车代号给身份。车代号在整个测试期对应同一份包与同一个 JDK，
      兜底值来自实测（见 ENV-perf-metric-store-单机实例.md 环境台账）。
 
-术语：代码里的 car 是"配置代号"（A/B 测试的实验车），不是手车；
-面向人的文案一律叫「配置」。
+术语：**车（car）= 一套固定的被测配置**（引擎 + 引擎版本 + 引擎 build + JDK + 堆）。
+沿用 Rally 的原生词汇 —— Rally 官方定义：a Rally "car" is a specific configuration
+of Elasticsearch that is benchmarked（如 "a configuration with a specific heap size"）。
+面向人的文案一律叫「车」。
+
+注意与 Rally 自己的 car 区分：race.json 顶层的 "car"（值形如 ["external"]）是 Rally 的
+**car plugin**（发压端驱动插件），跟本项目的「车」（被测集群配置）不是一回事。
+Rally 只在自己起集群时才应用 car config；我们用 --pipeline=benchmark-only 打自建集群，
+Rally 从不管我们的堆和 JDK —— 手工管的那套配置正是 car config 的等价物。
+所以本项目的车身份写进 user-tags.car，Rally 的插件列表原样保留在 race.json 顶层。
 """
 
 ENGINE_SHORT = {"easysearch": "ez", "elasticsearch": "es"}
@@ -82,7 +90,12 @@ def jdk_short_of(side, car=None, jdk_vm=None):
         if prefix:
             return "%s%s" % (prefix, vm[1])
     fb = CAR_FALLBACK.get(car or "")
-    return (fb or {}).get("jdk")
+    if fb:
+        return fb.get("jdk")
+    # 车表里没有这个车 → 用 unk-<车代号> 兜底，而不是留 "?"：
+    # "?" 会让**所有未实测且不在车表里的车**塌成同一个键（同一赛道里两辆车
+    # 混成一条线，结论直接作废）。unk- 前缀明确标出"未实测"，车代号保证不塌线。
+    return "unk-%s" % car if car else None
 
 
 def car_label_of(car, engine, version, build_no, side=None, jdk_vm=None):
