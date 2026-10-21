@@ -302,6 +302,13 @@ http.createServer((req, res) => {
               reqBody: reqBody.slice(0, 60000), status: statusOverride || proxyRes.statusCode,
               resBody: outBody.toString('utf8').slice(0, 3000), fixed: fixed || fixedNote || null,
             });
+            // 产品校验头：Kibana 7.17 在 **404 响应**上判产品
+            // （repository.js: indexNotFound && !isSupportedEsServer(headers)
+            //   → 抛「ES 不可用 503」而不是干净的 404）。
+            // EasySearch 从不发 x-elastic-product，shim 之前只在根路径伪造过，
+            // 于是 saved object 取不到时一律 503（UI 设置保存失败、页面 503 等）。
+            // 这里给**所有**响应补上：Kibana 的产品校验只认这个头的取值。
+            outHeaders['x-elastic-product'] = 'Elasticsearch';
             res.writeHead(statusOverride || proxyRes.statusCode, outHeaders);
             res.end(outBody);
           };
@@ -401,20 +408,34 @@ http.createServer((req, res) => {
             const noNodes = !parsed || !parsed.nodes || Object.keys(parsed.nodes).length === 0;
             if (noNodes) {
               fetchNodes().then((fb) => {
-                if (fb) {
-                  const body = {
-                    _nodes: { total: Object.keys(fb.nodes).length, successful: Object.keys(fb.nodes).length, failed: 0 },
-                    cluster_name: (parsed && parsed.cluster_name) || '',
-                    nodes: fb.nodes,
-                  };
-                  outBody = Buffer.from(JSON.stringify(body));
-                  outHeaders['content-type'] = 'application/json; charset=UTF-8';
-                  outHeaders['content-length'] = String(outBody.length);
-                  delete outHeaders['content-encoding'];
-                  send('nodes_backfill', 200);
-                } else {
-                  send();
-                }
+                // 回填也可能是空的（上游此刻恰好返回空 nodes 或非 JSON）：
+                // Kibana 的版本探测拿到空 nodes 会判定「取不到版本信息」并无限重试，
+                // 整个 Kibana 卡在 "not ready yet" 起不来。
+                // 版本探测不能依赖上游的瞬时状态 —— 兜底合成一个节点。
+                const fbNodes = (fb && fb.nodes) || {};
+                const haveReal = Object.keys(fbNodes).length > 0;
+                const nodes = haveReal ? fbNodes : {
+                  'shim-node-0': {
+                    name: 'shim-node-0',
+                    transport_address: `${TARGET_HOST}:${TARGET_PORT}`,
+                    host: TARGET_HOST,
+                    ip: TARGET_HOST,
+                    version: FAKE_VERSION,
+                    build_flavor: 'default',
+                    http: { publish_address: `${TARGET_HOST}:${TARGET_PORT}` },
+                    roles: ['data', 'master'],
+                  },
+                };
+                const body = {
+                  _nodes: { total: Object.keys(nodes).length, successful: Object.keys(nodes).length, failed: 0 },
+                  cluster_name: (parsed && parsed.cluster_name) || '',
+                  nodes,
+                };
+                outBody = Buffer.from(JSON.stringify(body));
+                outHeaders['content-type'] = 'application/json; charset=UTF-8';
+                outHeaders['content-length'] = String(outBody.length);
+                delete outHeaders['content-encoding'];
+                send(haveReal ? 'nodes_backfill' : 'nodes_synthesized', 200);
               });
               return;
             }
@@ -434,7 +455,10 @@ http.createServer((req, res) => {
     );
     proxyReq.on('error', (e) => {
       log({ ts: new Date().toISOString(), method: req.method, url: req.url, error: String(e) });
-      res.writeHead(502, { 'content-type': 'application/json' });
+      res.writeHead(502, {
+        'content-type': 'application/json',
+        'x-elastic-product': 'Elasticsearch',
+      });
       res.end(JSON.stringify({ error: String(e) }));
     });
     if (raw.length) proxyReq.write(raw);

@@ -47,6 +47,11 @@ die() { echo "[deploy-kibana] ERROR: $*" >&2; exit 1; }
 start_shim() {
   [ -f "$SHIM_JS" ] || die "shim 脚本不存在: $SHIM_JS"
   [ -x "$KB_ROOT/node/bin/node" ] || die "Kibana 自带 Node 不存在: $KB_ROOT/node/bin/node"
+  # 指标库口令必填：为空 → shim 的上游请求全部 401，而 shim 的伪造路径
+  # （product_root / _nodes）会把 401 掩盖成"看着正常"，最终表现为
+  # 「Kibana 起不来、/api/status 一直 not ready」，根本看不出是认证问题。
+  # 与其静默半死，不如在这里直接失败并说清楚。
+  [ -n "$ES_PASS" ] || die "ES_PASS 未设置 —— 指标库 admin 口令必填（如 ES_PASS='<口令>'）"
   if [ -f "$PID_SHIM" ] && kill -0 "$(cat $PID_SHIM)" 2>/dev/null; then
     log "shim 已在跑 (pid $(cat $PID_SHIM))"; return 0
   fi
