@@ -159,6 +159,36 @@ class TestPrepareDefaults(unittest.TestCase):
         self.assertIn('targets=("$@")', text)   # 可传变体 id
 
 
+class TestDatasetLabels(unittest.TestCase):
+    """ds-* 族的两套数据集标注：血统字母必须与数据集对上。"""
+
+    def test_every_ds_track_has_dataset(self):
+        for name, v in C.TRACK_CATALOG.items():
+            if v['variant'] or not name.startswith('ds-'):
+                continue
+            self.assertTrue(v.get('dataset'), 'ds 赛道 %s 没标数据集' % name)
+
+    def test_lineage_letter_matches_dataset(self):
+        """赛道名里的血统字母（j=jina 系 / g=GIST 系）必须与标注一致。"""
+        for name, v in C.TRACK_CATALOG.items():
+            if v['variant'] or not name.startswith('ds-'):
+                continue
+            letter = name[3]
+            ds = (v.get('dataset') or '').lower()
+            self.assertTrue(
+                (letter == 'j' and 'jina' in ds) or (letter == 'g' and 'gist' in ds),
+                '赛道 %s 的血统字母与数据集标注对不上: %s' % (name, v.get('dataset')))
+
+    def test_dataset_inherited_by_variants(self):
+        """变体的数据集与其基础赛道一致。"""
+        for name, v in C.TRACK_CATALOG.items():
+            if not v['variant']:
+                continue
+            base = C.TRACK_CATALOG.get(v['base'])
+            self.assertEqual(v.get('dataset'), base.get('dataset'),
+                             '变体 %s 的数据集标注与基础赛道不一致' % name)
+
+
 class TestComposeCompat(unittest.TestCase):
     """编排台的臂 × 变体兼容检查。"""
 
