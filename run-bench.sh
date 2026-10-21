@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # run-bench.sh —— 性能编排（配置 × 赛道 × 轮次，在压测机上运行；单入口，esrally 风格）
-#   ./run-bench.sh <geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all|list> [rounds=3] [配置文件]
+#   ./run-bench.sh <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds=3] [配置文件]
 #   ./run-bench.sh list                          # 列可用赛道/配置模板/近期 campaign
 #
 # 配置文件（第 3 参数或 CONF= 环境变量）：每行一个配置，轮内按行序右旋配对交错——
@@ -40,9 +40,9 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ./vm-bench-lib.sh
 
-WHAT="${1:?用法: $0 <geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
+WHAT="${1:?用法: $0 <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
 [ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
-WHAT="${1:?用法: $0 <geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
+WHAT="${1:?用法: $0 <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
 ROUNDS="${2:-3}"
 DRY=${DRY:-0}
 
@@ -107,16 +107,19 @@ fi
 
 case "$WHAT" in
   geo)  TRACKS=(geo);;
-  gdef|gzstd|gbc) TRACKS=("$WHAT");;    # 单独跑某个 codec 变体
+  *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道，见 prepare-codec-track.sh）
+  gdef|gzstd|gbc) TRACKS=("$WHAT");; # 历史短名（= geo-codec-* 的别名）
   hnsw) TRACKS=(hnsw);;
   hv1024) TRACKS=(hv1024);;
   nested) TRACKS=(nested);;
-  codec) TRACKS=(gdef gzstd gbc);;
+  codec) TRACKS=(geo-codec-def geo-codec-def-sr geo-codec-zstd geo-codec-zstd-sr geo-codec-bc geo-codec-bc-sr);;
+           # geonames 一族的压缩×source_reuse 全套 6 变体
+           # 不兼容的（臂引擎 × 变体）在起跑时留痕跳过
   both) TRACKS=(geo hnsw);;
   all) TRACKS=(geo hnsw nested);;
   ds) TRACKS=(ds-g1920 ds-j2048 ds-j1024 ds-g960 ds-j768 ds-j512 ds-j1536);;
   ds-*) TRACKS=("$WHAT");;
-  *) die "track 参数必须是 geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>";;
+  *) die "track 参数必须是 geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>";;
 esac
 
 # ---- 配置解析与校验（fail-fast 在建 campaign 目录之前） -------------------------
@@ -246,12 +249,41 @@ schedule_lines() {
   sed 's/#.*//' "$SCHEDULE_FILE" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
 }
 
+# 臂定义行 → 引擎名（只读，不 apply_config，不改任何状态）
+arm_engine() { printf '%s' "$1" | grep -o 'ENGINE_NAME=[^ ]*' | cut -d= -f2 | tr 'A-Z' 'a-z'; }
+
+# 排程起跑前复核「臂的引擎 × 变体」兼容性 —— fail-fast。
+# 为什么要拦：ZSTD / index.source_reuse 是 Easysearch 专有设置，ES 上 create-index
+# 直接拒（unknown setting）。不拦的话要等建索引那一步才炸，白烧一台机器的建库时间。
+# 排程模式是用户**逐行写死**的组合 → 有不兼容就 die（在 campaign 起跑前）。
+check_track_engine_compat() {
+  local arm tk rnd dr est cfg eng allow bad=0
+  while read -r arm tk rnd dr est; do
+    [ -n "$arm" ] || continue
+    allow=$(track_engines "$tk")
+    [ -n "$allow" ] || continue
+    cfg=$(arm_config "$arm")
+    eng=$(arm_engine "$cfg")
+    [ -n "$eng" ] || continue
+    if [ "$eng" != "$allow" ]; then
+      echo "  不兼容: 臂 $arm（引擎 $eng）× 变体 $tk（该变体只支持 $allow）" >&2
+      bad=1
+    fi
+  done < <(schedule_lines)
+  [ "$bad" = 0 ] || die "排程里有引擎与变体不兼容的组合（见上）—— 起跑前拦下，别白跑"
+  return 0
+}
+
+
 if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   echo "== DRY RUN 排程（不执行任何操作） =="
   if [ -n "${SCHEDULE_FILE:-}" ]; then
     echo "排程模式: SCHEDULE_FILE=$SCHEDULE_FILE"
     echo "臂定义:   ARMS_FILE=$ARMS_FILE"
     [ "${DS_HOURS:-0}" -gt 0 ] && echo "窗底守卫: ${DS_HOURS}h（窗底留 20min 余量）"
+    # 引擎 × 变体兼容性先查：ZSTD / source_reuse 是 Easysearch 专有，ES 上
+    # create-index 会拒。dry-run 就报出来，别等真跑起来才炸。
+    check_track_engine_compat
     echo "| # | 臂 | 赛道 | 轮 | recall | est(min) | 引擎身份 |"
     echo "|---|---|---|---|---|---|---|"
     n=0
@@ -497,21 +529,20 @@ prepare_hnsw_s3() {
 
 # ds-*（维度扫描）赛道：目录固定在 $ROOT/tracks/<名字>，索引名 vectors
 # 维度 → 写入超时：≥1536 维给 14400s，其余 10800s（PLAN §五 时间预算）
-track_dims() { case "$1" in ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;; ds-g960) echo 960;; ds-j768) echo 768;; ds-j512) echo 512;; *) return 1;; esac; }
-track_dir()   { case "$1" in geo) echo "$TRACK_GEO";; gdef) echo "$TRACK_GEO_DEF";; gzstd) echo "$TRACK_GEO_ZSTD_SR";; gbc) echo "$TRACK_GEO_BC";; hnsw) echo "$TRACK_HNSW_S3";; hv1024) echo "$TRACK_HV1024";; nested) echo "$TRACK_NESTED_S3";; ds-*) echo "$ROOT/tracks/$1";; esac; }
-track_index() { case "$1" in geo|gdef|gzstd|gbc) echo "geonames";; hnsw|hv1024) echo "vectors";; nested) echo "sonested";; ds-*) echo "vectors";; esac; }
-track_tmo_w() { case "$1" in
-  geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_W";;
+#
+# 变体的索引名 / 超时 / 维度都沿用**基础赛道**（hnsw-codec-zstd 的索引是 vectors，
+# 不是 geonames —— 变体只改存储设置，不改索引语义）。
+# 变体 id ↔ 目录 ↔ 压缩/sr/引擎 的推导在 vm-bench-lib.sh（与编排台同一套规则）。
+track_dims() { local b; b=$(track_base "$1"); case "$b" in ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;; ds-g960) echo 960;; ds-j768) echo 768;; ds-j512) echo 512;; *) return 1;; esac; }
+track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
+  geo) echo "$TIMEOUT_GEO_W";;
   hnsw) echo "$TIMEOUT_HNSW_W";;
   hv1024) echo "$TIMEOUT_HV1024_W";;
   nested) echo "$TIMEOUT_NESTED_W";;
   ds-*) local dm; dm=$(track_dims "$1") || { echo "$TIMEOUT_DS_W"; return; }
         if [ "$dm" -ge 1536 ]; then echo "$TIMEOUT_DS_W_HI"; else echo "$TIMEOUT_DS_W"; fi;;
  esac; }
-track_tmo_q() { case "$1" in geo|gdef|gzstd|gbc) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
-# 变体烘入的 settings（进 user-tags，入库时 codec 是一个维度而不是靠 track 名反推）；
-# 非 codec 变体返回空 → 不加标签，历史 campaign 的标签口径不变
-track_codec() { case "$1" in gdef) echo "default";; gzstd) echo "ZSTD+source_reuse";; gbc) echo "best_compression";; *) echo "";; esac; }
+track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
 
 monitor_start() { # <fid> <eng> —— 被动周期采样（5s，只记录，不做卡点、不触发重试）
   local fid="$1" eng="$2" ip dir
@@ -786,7 +817,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local HOSTS; HOSTS=$(target_hosts)
   local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
   local tp=""
-  case "$tk" in geo|nested|gdef|gzstd|gbc) tp="number_of_shards:$SHARDS,number_of_replicas:$REPLICAS";; esac
+  case "$tk" in geo|nested|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr) tp="number_of_shards:$SHARDS,number_of_replicas:$REPLICAS";; esac
   local t0=$(date +%s)
 
   PROGSTEP "===== [$seq] $fid 开始 ====="
@@ -839,7 +870,14 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   PROGSTEP "[$seq] $fid write race 开始（timeout $(track_tmo_w "$tk")s）"
   local rc=0
   local ctag=""; [ -n "${EXPECT_CPU_CORES:-}" ] && ctag=",cores:${EXPECT_CPU_CORES}"
-  local cdc=""; [ -n "$(track_codec "$tk")" ] && cdc=",codec:$(track_codec "$tk")"
+  # 压缩与 source_reuse 是**两个独立标签**（不再糅成 "ZSTD+source_reuse"）：
+  # 入库侧把它们拆成两个维度，任意一维都能单独分组对比。
+  # 旧 campaign 的 user_tags.codec 是糅合串（"ZSTD+source_reuse"），
+  # 入库侧做兼容解析 → 新旧数据落到同一套干净维度上，可比。
+  local cdc="" _comp _sr
+  _comp=$(track_compression "$tk"); _sr=$(track_source_reuse "$tk")
+  [ -n "$_comp" ] && cdc=",codec:$_comp"
+  [ -n "$_sr" ] && cdc="$cdc,source_reuse:$_sr"
   timeout "$(track_tmo_w "$tk")" "$RALLY" race --pipeline=benchmark-only \
     --target-hosts="$HOSTS" --track-path="$track" --challenge=write-only \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
@@ -976,6 +1014,8 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
     case " ${TRACKS[*]} " in *" $tk "*) ;; *) TRACKS+=("$tk");; esac
   done < <(schedule_lines)
   PROGSTEP "排程赛道集合: ${TRACKS[*]}"
+  # 引擎 × 变体兼容性复核（fail-fast，在建 campaign 目录/起跑之前）
+  check_track_engine_compat
 fi
 
 prepare_hnsw_s3
@@ -991,18 +1031,23 @@ case " ${TRACKS[*]} " in *" nested "*)
   [ -d "$TRACK_NESTED_S3" ] || die "nested 赛道准备失败"
 ;; esac
 
-case " ${TRACKS[*]} " in *gdef*|*gzstd*|*gbc*)
-  ./prepare-codec-track.sh || die "codec 赛道变体准备失败"
-  for d in "$TRACK_GEO_DEF" "$TRACK_GEO_ZSTD_SR" "$TRACK_GEO_BC"; do
-    [ -d "$d" ] || die "codec 赛道变体缺失: $d"
+# 压缩变体：按**规范 id** 收集（历史短名 gdef/gzstd/gbc 先归一），按需生成。
+# 变体目录名 = 规范 id，所以任意基础赛道的变体都能用同一套逻辑。
+_variants=()
+for _t in "${TRACKS[@]}"; do
+  if track_is_variant "$_t"; then _variants+=("$(track_canonical "$_t")"); fi
+done
+if [ ${#_variants[@]} -gt 0 ]; then
+  ./prepare-codec-track.sh ${_variants[@]+"${_variants[@]}"} || die "codec 赛道变体准备失败"
+  for d in ${_variants[@]+"${_variants[@]}"}; do
+    [ -d "$ROOT/tracks/$d" ] || die "codec 赛道变体缺失: $ROOT/tracks/$d"
   done
-  # 烘进 index.json 的 settings 逐场可回溯：把三个变体的 settings 差异 + VARIANT.txt 落一份台账
-  { echo "# codec 变体台账（settings 烘在副本 index.json，共享基座 $TRACK_GEO 未改动）"
-    for d in "$TRACK_GEO_DEF" "$TRACK_GEO_ZSTD_SR" "$TRACK_GEO_BC"; do
-      echo "== $d"; cat "$d/VARIANT.txt" 2>/dev/null
-      grep -A6 'requests.cache' "$d/index.json" | head -12
+  # 烘进 index.json 的 settings 逐场可回溯：变体的 settings 差异 + VARIANT.txt 落一份台账
+  { echo "# codec 变体台账（settings 烘在副本 index.json，基座未改动）"
+    for d in ${_variants[@]+"${_variants[@]}"}; do
+      echo "== $d"; cat "$ROOT/tracks/$d/VARIANT.txt" 2>/dev/null
     done; } > "$CAMP_DIR/CODEC-VARIANTS.txt"
-;; esac
+fi
 
 case " ${TRACKS[*]} " in *ds-*)
   # CAMP_DIR 显式传下去：run-bench.sh 里它是普通 shell 变量（没 export），
@@ -1068,6 +1113,16 @@ else
     for r in $(seq 1 "$ROUNDS"); do
       for idx in $(order_for_round "$r"); do
         seqn=$((seqn+1))
+        # 变体 × 引擎兼容：不适配的组合**留痕跳过**（与 DEADLINE-SKIP 同语义：
+        # 不计入 total，不白跑一场再失败）。排程模式是逐行写死的，那里直接 die。
+        _allow=$(track_engines "$tk")
+        if [ -n "$_allow" ]; then
+          _eng=$(arm_engine "${CONFIGS[$idx]:-}")
+          if [ -n "$_eng" ] && [ "$_eng" != "$_allow" ]; then
+            PROGSTEP "[$seqn] ${CONF_LABELS[$idx]:-?}-$tk-r$r 跳过（引擎 $_eng 不支持该变体，该变体只支持 $_allow）"
+            continue
+          fi
+        fi
         if run_field_with_retry "$idx" "$tk" "$r" "$seqn"; then okcnt=$((okcnt+1)); fi
         total=$((total+1))
       done

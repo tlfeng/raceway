@@ -44,61 +44,7 @@ DEFAULT_WHAT = 'ds'
 DS_TIERS = ['ds-g1920', 'ds-j2048', 'ds-j1024', 'ds-g960', 'ds-j768', 'ds-j512', 'ds-j1536']
 DEFAULT_EST = 45
 
-# ---- 赛道清单 ----------------------------------------------------------------
-# 名字 → (展示名, est 默认分钟, 分组)
-#
-# 依据两处：
-# 1. **能不能起跑**看 run-bench.sh:109-118 的赛道分支（geo / gdef|gzstd|gbc /
-#    hnsw / hv1024 / nested / ds-*）。库里的 hvtp200k-2s、hvtp200k-3s 是旧版
-#    runner 跑的，当前 runner 的 track_dir 没有这两个分支 → 只能看历史，排不了。
-# 2. **est** 取各 campaign 的 RACES.md 实测耗时上界 + 余量（窗底守卫靠它算
-#    "这场塞不塞得进剩余窗口"，估小了会把排得下的场次误判成 DEADLINE-SKIP）。
-#    ds-* 用现成排程 dimsweep-24.conf 里的值 —— 那是在用口径，别另起一套。
-TRACK_CATALOG = {
-    'geo':      ('geonames', 50, 'geo'),
-    'gdef':     ('geo 默认压缩', 30, 'geo'),
-    'gzstd':    ('geo ZSTD+reuse', 35, 'geo'),
-    'gbc':      ('geo best_compression', 30, 'geo'),
-    'hnsw':     ('hnsw 2m', 25, 'vector'),
-    'hv1024':   ('hv 1024 维', 30, 'vector'),
-    'nested':   ('nested', 35, 'nested'),
-    'ds-g1920': ('1920 维', 56, 'ds'),
-    'ds-j2048': ('2048 维', 49, 'ds'),
-    'ds-j1024': ('1024 维', 35, 'ds'),
-    'ds-g960':  ('960 维', 30, 'ds'),
-    'ds-j768':  ('768 维', 26, 'ds'),
-    'ds-j512':  ('512 维', 21, 'ds'),
-    'ds-j1536': ('1536 维', 44, 'ds'),
-}
-TRACK_GROUPS = [('ds', '维度扫描 ds-*'), ('geo', 'geonames / codec 变体'),
-                ('vector', '向量 hnsw / hv1024'), ('nested', 'nested')]
-
-
-def track_est_map():
-    """赛道 → est 分钟。排程里没单独指定的赛道用它。"""
-    return {k: v[1] for k, v in TRACK_CATALOG.items()}
-
-
-def what_for(tracks):
-    """给 runner 的赛道分支参数（--what）。
-
-    排程模式下 runner 会用**排程文件里的赛道集合**覆盖 TRACKS
-    （run-bench.sh:973-980），所以 --what 只需要是个合法关键字；但给语义正确的
-    值更好：单赛道直接用它自己，全 ds-* 用 ds，混排用 all。
-    """
-    ts = [t for t in tracks if t]
-    if not ts:
-        return DEFAULT_WHAT
-    uniq = sorted(set(ts))
-    if all(t.startswith('ds-') for t in uniq):
-        return 'ds'
-    if len(uniq) == 1:
-        return uniq[0]
-    return 'all'          # 混排：runner 的 all 分支覆盖 geo/hnsw/nested，
-                          # 排程模式会再用排程文件的集合覆盖它
-
 Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
-
 
 # ============================================================ 纯函数（可测）
 
@@ -213,6 +159,127 @@ def render_arms(arms, tag):
         '',
     ]
     return '\n'.join(head) + '\n'.join('%s %s' % (a.name, a.config) for a in arms) + '\n'
+
+
+# ---- 赛道清单（两层：基础赛道 → 压缩 × source_reuse 变体网格）-----------------
+# 压缩与 source_reuse 是**索引级设置**，对任何基础赛道都成立 → 不再只给 geonames
+# 做变体，而是让**每个**基础赛道都能派生 6 个变体（3 压缩 × 2 sr）。
+#
+# 变体 id = <基础赛道id>-codec-<def|zstd|bc>[-sr]  （与变体目录名一致）
+# 引擎兼容不是查表而是**规则推导**（与压测机 vm-bench-lib.sh 同一套）→
+# 不存在两处表格漂移的可能。
+#
+# 能不能起跑看 run-bench.sh:109-118 的赛道分支；库里的 hvtp200k-2s/3s 是旧版
+# runner 跑的，当前 runner 的 track_dir 没有这两个分支 → 只能看历史，排不了。
+#
+# est 取各 campaign 的 RACES.md 实测耗时上界 + 余量（窗底守卫靠它算"这场塞不塞
+# 得进剩余窗口"，估小了会把排得下的场次误判成 DEADLINE-SKIP）。
+# ds-* 用现成排程 dimsweep-24.conf 里的值 —— 那是在用口径，别另起一套。
+BASE_TRACKS = {
+    'geo':      ('geonames', 30),
+    'hnsw':     ('hnsw 2m', 25),
+    'hv1024':   ('hv 1024 维', 30),
+    'nested':   ('nested', 35),
+    'ds-g1920': ('1920 维', 56),
+    'ds-j2048': ('2048 维', 49),
+    'ds-j1024': ('1024 维', 35),
+    'ds-g960':  ('960 维', 30),
+    'ds-j768':  ('768 维', 26),
+    'ds-j512':  ('512 维', 21),
+    'ds-j1536': ('1536 维', 44),
+}
+TRACK_GROUPS = [('ds', '维度扫描 ds-*'), ('geo', 'geonames'),
+                ('vector', '向量 hnsw / hv1024'), ('nested', 'nested')]
+BASE_GROUP = {'geo': 'geo', 'hnsw': 'vector', 'hv1024': 'vector', 'nested': 'nested'}
+# 压缩 token（与 vm-bench-lib.sh 的 track_compression 同一套）
+CODEC_TOKENS = ['def', 'zstd', 'bc']
+TOKEN_LABEL = {'def': 'default(LZ4)', 'zstd': 'ZSTD', 'bc': 'best_compression'}
+TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
+# 变体 est 系数（相对基础赛道）：
+#   （default,关）1.0 —— 基线
+#   （ZSTD,开）  1.25 —— 来自 geo 实测（ZSTD+sr 中位 30min / 基座 24min）
+#   其余取中间值 —— 压缩对总耗时的影响**没有实测**，这里是保守估计，
+#   跑完一轮后按实测值用 --est 覆盖。
+VARIANT_EST_FACTOR = {
+    ('def', False): 1.0, ('def', True): 1.05,
+    ('zstd', False): 1.2, ('zstd', True): 1.25,
+    ('bc', False): 1.0, ('bc', True): 1.05,
+}
+
+
+def build_catalog():
+    """完整赛道清单：每个基础赛道 + 它的 6 个压缩变体。
+
+    返回 {id: {name, label, est, group, base, compression, source_reuse, engines}}
+    """
+    cat = {}
+    for base, (label, est) in BASE_TRACKS.items():
+        grp = BASE_GROUP.get(base, 'ds' if base.startswith('ds-') else 'geo')
+        cat[base] = {'name': base, 'label': label, 'est': est, 'group': grp,
+                     'base': base, 'compression': None, 'source_reuse': None,
+                     'engines': H.engines_of(base), 'variant': False}
+        for tok in CODEC_TOKENS:
+            for sr in (False, True):
+                vid = '%s-codec-%s%s' % (base, tok, '-sr' if sr else '')
+                cat[vid] = {
+                    'name': vid,
+                    'label': '%s · sr %s' % (TOKEN_LABEL[tok], '开' if sr else '关'),
+                    'est': int(round(est * VARIANT_EST_FACTOR[(tok, sr)])),
+                    'group': grp, 'base': base,
+                    'compression': TOKEN_CODEC[tok], 'source_reuse': sr,
+                    'engines': H.engines_of(vid), 'variant': True,
+                }
+    return cat
+
+
+TRACK_CATALOG = build_catalog()
+
+
+def track_est_map():
+    """赛道 → est 分钟。排程里没单独指定的赛道用它。"""
+    return {k: v['est'] for k, v in TRACK_CATALOG.items()}
+
+
+def compat_problems(arms, rows):
+    """检查 (臂, 变体) 的引擎兼容性。
+
+    ZSTD 系列压缩与 index.source_reuse 都是 **Easysearch 专有** —— ES 上
+    create-index 直接拒（unknown setting），要等建索引那步才炸，白烧一台机器
+    的建库时间。编排时就拦下来。
+    返回 [(臂, 变体, 说明)]，空列表 = 全兼容。
+    """
+    by_name = {a.name: a for a in arms}
+    out = []
+    for arm, tk, rnd in rows:
+        allow = H.engines_of(tk)
+        if not allow:
+            continue
+        a = by_name.get(arm)
+        if not a:
+            continue
+        if (a.engine or '').lower() != allow:
+            out.append((arm, tk, '臂 %s 的引擎是 %s，变体 %s 只支持 %s'
+                        % (arm, a.engine or '?', tk, allow)))
+    return out
+
+
+def what_for(tracks):
+    """给 runner 的赛道分支参数（--what）。
+
+    排程模式下 runner 会用**排程文件里的赛道集合**覆盖 TRACKS
+    （run-bench.sh:973-980），所以 --what 只需要是个合法关键字；但给语义正确的
+    值更好：单赛道直接用它自己，全 ds-* 用 ds，混排用 all。
+    """
+    ts = [t for t in tracks if t]
+    if not ts:
+        return DEFAULT_WHAT
+    uniq = sorted(set(ts))
+    if all(t.startswith('ds-') for t in uniq):
+        return 'ds'
+    if len(uniq) == 1:
+        return uniq[0]
+    return 'all'          # 混排：runner 的 all 分支覆盖 geo/hnsw/nested，
+                          # 排程模式会再用排程文件的集合覆盖它
 
 
 # ============================================================ ssh / 远端
@@ -358,6 +425,17 @@ def compose_all(args):
     arms = parse_arms(read_arms_file(args))
     if not arms:
         raise SystemExit('臂定义里没有可用臂: %s' % args.arms_file)
+    # --arms 过滤（GUI 里是勾选臂；CLI 给同样的能力）。
+    # 有了臂×变体兼容矩阵后这个开关是必需的 —— 比如只跑 easysearch 臂的
+    # ZSTD/source_reuse 变体，必须能把 ES 臂摘掉。
+    only = [x.strip() for x in (getattr(args, 'arms', '') or '').split(',') if x.strip()]
+    if only:
+        known = {a.name for a in arms}
+        unknown = [x for x in only if x not in known]
+        if unknown:
+            raise SystemExit('--arms 里有臂定义中不存在的臂: %s\n可用: %s'
+                             % ('、'.join(unknown), '、'.join(sorted(known))))
+        arms = [a for a in arms if a.name in only]
     problems = validate_arms(arms)
     hard = [m for sev, m in problems if sev == 'error']
     if hard:
@@ -380,6 +458,15 @@ def compose_all(args):
             raise SystemExit(
                 '矩阵里的每一格都已在指标库跑过（当前 build），无事可排。\n'
                 '要重跑请加 --include-covered。')
+
+    # 引擎 × 变体兼容性：ZSTD / source_reuse 是 Easysearch 专有，ES 上建索引就拒。
+    # 编排时拦 —— 别排了再白跑一场建库。
+    bad = compat_problems(arms, rows)
+    if bad:
+        raise SystemExit('排程里有引擎与变体不兼容的组合：\n  '
+                         + '\n  '.join(x[2] for x in bad)
+                         + '\n（EASYSEARCH 专有：ZSTD 压缩、index.source_reuse；'
+                           'ES 的 index.codec 只有 default/best_compression，也不认 source_reuse）')
 
     tag = args.tag or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     sched = render_schedule(rows, arms, tag, est_map, args.est_default, recall=args.recall)
@@ -503,6 +590,13 @@ _PAGE = """<!doctype html>
  <div id="skipbox" class="skipbox"></div>
 </fieldset>
 
+<fieldset><legend>臂 × 变体 兼容性</legend>
+ <div id="compatbox" class="hist-sum">…</div>
+ <div style="font-size:12px;color:#666">ZSTD 压缩与 <code>index.source_reuse</code> 是 Easysearch 专有
+ （ES 的 <code>index.codec</code> 只有 default/best_compression，也不认 source_reuse）——
+ 编排台与 runner 都会在起跑前拦下不兼容的组合。</div>
+</fieldset>
+
 <button onclick="doRender()">生成排程</button>
 <button onclick="doPreview()">上传 + dry-run 预览</button>
 <button onclick="doStart()">互斥预检并起跑</button>
@@ -516,6 +610,10 @@ const DS_TIERS = %s;
 let ARMS = [];
 let TRACKS = [];
 let TRACK_GROUPS = [];
+let BASE_TRACKS = [];
+let CODEC_TOKENS = [];
+let TOKEN_LABEL = {};
+let TOKEN_CODEC = {};
 let HIST = null;
 const VT = {VALID:'✓已跑',DEGRADED:'~降级',HALF:'半',SKIP:'跳过',FAIL:'✗失败',UNKNOWN:'?'};
 const VC = {VALID:'v-ok',DEGRADED:'v-deg',HALF:'v-half',SKIP:'v-skip',FAIL:'v-fail',UNKNOWN:'v-none'};
@@ -524,23 +622,76 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
 async function boot(){
   const r = await fetch('/api/bootstrap'); const j = await r.json();
   ARMS = j.arms; TRACKS = j.tracks||[]; TRACK_GROUPS = j.track_groups||[];
+  BASE_TRACKS = (j.tracks||[]).filter(function(t){return !t.variant;});
+  CODEC_TOKENS = j.codec_tokens||[]; TOKEN_LABEL = j.token_label||{};
+  TOKEN_CODEC = j.token_codec||{};
   document.getElementById('arms').innerHTML = ARMS.map(a =>
     `<label><input type="checkbox" class="armck" value="${a.name}" checked> ${a.name} <small>(${a.engine}${a.build?'@'+a.build:''}${a.jdk_dir? ' + '+a.jdk_dir.split('/').pop():''})</small></label>`).join('');
-  // 赛道按族分组渲染：全部可起跑的赛道都在，不只是 ds-*
+  // 赛道按族渲染，**两层**：基础赛道 + 它的 压缩 × source_reuse 变体网格
+  // （压缩与 source_reuse 是两个独立维度，正交可比 —— 网格就是那张二维表）
   let h='';
   TRACK_GROUPS.forEach(function(g){
-    const items=TRACKS.filter(t=>t.group===g[0]);
-    if(!items.length) return;
-    h+='<div style="margin:4px 0"><b style="font-size:12px;color:#555">'+esc(g[1])+'</b><br>';
-    h+=items.map(t=>`<label title="est ${t.est}min"><input type="checkbox" class="tkck" value="${t.name}" checked> ${esc(t.label)} <small style="color:#888">(${t.name}, ~${t.est}min)</small></label>`).join(' ');
-    h+='</div>';
+    const bases=BASE_TRACKS.filter(t=>t.group===g[0]);
+    if(!bases.length) return;
+    h+='<div style="margin:8px 0"><b style="font-size:12px;color:#555">'+esc(g[1])+'</b></div>';
+    bases.forEach(function(b){
+      h+='<div style="margin:6px 0 10px 8px">';
+      h+='<label title="'+esc(b.name)+' · 基座（不带压缩变体）· ~'+b.est+'min"><input type="checkbox" class="tkck" value="'+b.name+'" checked> <b>'+esc(b.label)+'</b> <small style="color:#888">('+b.name+', ~'+b.est+'min)</small></label>';
+      // 该基础赛道的变体网格：行=压缩，列=source_reuse
+      // **默认折叠** —— 11 个基础赛道 × 6 变体平铺出来没法看，展开才看细节
+      const vs=TRACKS.filter(t=>t.base===b.name && t.variant);
+      if(vs.length){
+        h+='<details style="margin:2px 0 0 16px"><summary style="cursor:pointer;font-size:12px;color:#555">'
+          + '变体网格（压缩 × source_reuse）· '+vs.length+' 个</summary>';
+        h+='<table style="border-collapse:collapse;font-size:12px;margin:3px 0 4px 0">';
+        h+='<tr><th style="border:1px solid #ddd;padding:2px 8px"></th>';
+        h+='<th style="border:1px solid #ddd;padding:2px 8px">source_reuse 关</th>';
+        h+='<th style="border:1px solid #ddd;padding:2px 8px">source_reuse 开</th></tr>';
+        CODEC_TOKENS.forEach(function(tok){
+          h+='<tr><th style="border:1px solid #ddd;padding:2px 8px;text-align:left">'+esc(TOKEN_LABEL[tok])+'</th>';
+          [false,true].forEach(function(sr){
+            const t=vs.find(x=>x.compression===TOKEN_CODEC[tok] && x.source_reuse===sr);
+            if(t){
+              const eng=t.engines||'';
+              h+='<td style="border:1px solid #ddd;padding:2px 8px"><label title="'+esc(
+                t.name+' · '+(eng?('只支持 '+eng):'两侧通用')+' · ~'+t.est+'min')+
+                '"><input type="checkbox" class="tkck" value="'+t.name+'" checked> '+esc(t.name)+
+                ' <small style="color:#888">(~'+t.est+'min)</small></label></td>';
+            } else {
+              h+='<td style="border:1px solid #ddd;padding:2px 8px;color:#bbb">—</td>';
+            }
+          });
+          h+='</tr>';
+        });
+        h+='</table></details>';
+      }
+      h+='</div>';
+    });
   });
   document.getElementById('tracks').innerHTML=h;
-  document.getElementById('arms').addEventListener('change',loadHist);
-  document.getElementById('tracks').addEventListener('change',loadHist);
-  document.getElementById('rounds').addEventListener('change',loadHist);
-  document.getElementById('incov').addEventListener('change',loadHist);
+  ['arms','tracks','rounds','incov'].forEach(function(id){
+    document.getElementById(id).addEventListener('change',function(){loadHist();});
+  });
   loadHist();
+}
+function paintCompat(){
+  // 臂的引擎 × 变体的兼容性：ZSTD 压缩与 index.source_reuse 是 Easysearch 专有，
+  // ES 上 create-index 直接拒 —— 提前标出来，别排了再白跑一场建库。
+  const m=matrix();
+  const bad=[];
+  ARMS.forEach(function(a){
+    if(m.arms.indexOf(a.name)<0) return;
+    m.tracks.forEach(function(t){
+      const info=TRACKS.find(function(x){return x.name===t;});
+      const allow=info?(info.engines||''):'';
+      if(allow && (a.engine||'').toLowerCase()!==allow)
+        bad.push(a.name+'（'+a.engine+'）× '+t+'（只支持 '+allow+'）');
+    });
+  });
+  const box=document.getElementById('compatbox');
+  if(!bad.length){ box.innerHTML='<span style="color:#080">✔ 当前矩阵的臂×变体组合全部兼容</span>'; return; }
+  box.innerHTML='<span class="err">✘ '+bad.length+' 个组合不兼容（起跑会被拦下）：<br>'
+    + bad.map(esc).join('<br>')+'</span>';
 }
 function matrix(){
   const arms=[...document.querySelectorAll('.armck:checked')].map(e=>e.value);
@@ -572,13 +723,13 @@ async function loadHist(){
       '　—— 编排照常可用，但无法自动剔除已跑过的格（压测窗口内指标库停着是常态）。</span>';
     document.getElementById('histmatrix').innerHTML='';
     document.getElementById('skipbox').textContent='';
-    HIST=null; return;
+    HIST=null; paintCompat(); return;
   }
   HIST=j;
   const s=j.summary;
   box.innerHTML='指标库已连接：<b>'+s.races+'</b> 场次 / <b>'+s.rows+'</b> 行 / <b>'+
     s.campaigns+'</b> 个 campaign / <b>'+s.tracks+'</b> 条赛道 / <b>'+s.arms+'</b> 个臂';
-  paintMatrix();
+  paintMatrix(); paintCompat();
 }
 function cellOf(arm,track,round){
   if(!HIST) return null;
@@ -719,6 +870,15 @@ def api_render(st, body):
                              '要重跑请勾选"含已跑过的格"。',
                      'plan': plan}
 
+    # 引擎 × 变体兼容性（ZSTD / source_reuse 是 Easysearch 专有）
+    bad = compat_problems(arms, rows)
+    if bad:
+        return 400, {'error': '矩阵里有引擎与变体不兼容的组合：\n'
+                             + '\n'.join(x[2] for x in bad)
+                             + '\n（EASYSEARCH 专有：ZSTD 压缩、index.source_reuse；'
+                               'ES 的 index.codec 只有 default/best_compression，也不认 source_reuse）',
+                     'plan': plan}
+
     tag = body.get('tag') or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     # est：赛道清单的实测值 → 界面/CLI 的覆盖值
     est_map = track_est_map()
@@ -785,9 +945,12 @@ class Handler(BaseHTTPRequestHandler):
                 'arms': [a._asdict() for a in st.arms],
                 'problems': st.problems, 'ds_tiers': DS_TIERS,
                 # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
-                'tracks': [{'name': k, 'label': v[0], 'est': v[1], 'group': v[2]}
-                           for k, v in TRACK_CATALOG.items()],
+                'tracks': [dict(v, name=k) for k, v in TRACK_CATALOG.items()],
                 'track_groups': TRACK_GROUPS,
+                'base_tracks': sorted(BASE_TRACKS),
+                'codec_tokens': CODEC_TOKENS,
+                'token_label': TOKEN_LABEL,
+                'token_codec': TOKEN_CODEC,
             }, ensure_ascii=False))
         elif self.path == '/api/history':
             st = self.server.state
@@ -841,6 +1004,8 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('cmd', choices=['arms', 'gen', 'preview', 'start', 'serve'])
     ap.add_argument('--arms-file', default=None, help='臂定义文件（本地路径；--ssh 时为远端路径）')
+    ap.add_argument('--arms', default=None,
+                    help='只用这些臂（逗号分隔）；缺省用臂定义文件里的全部')
     ap.add_argument('--tracks', default='ds-g1920,ds-j2048,ds-j1024,ds-g960,ds-j768,ds-j512,ds-j1536')
     ap.add_argument('--rounds', type=int, default=1)
     ap.add_argument('--recall', dest='recall', action='store_true', default=True)

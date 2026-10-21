@@ -38,6 +38,81 @@ node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsea
 # 服务运行用户（wipe 后 chown 用）
 eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; esac; }
 
+# ---- 赛道变体（压缩 × source_reuse）--------------------------------------------
+# 一个**变体** = 基础赛道 + 压缩档 + source_reuse 开关。
+#
+#   规范 id = <基础赛道id>-codec-<压缩token>[-sr]   （与变体目录名一致）
+#     geo-codec-def      geo-codec-def-sr
+#     geo-codec-zstd     geo-codec-zstd-sr
+#     geo-codec-bc       geo-codec-bc-sr
+#     hnsw-codec-zstd    ds-j1024-codec-def-sr  …（任意基础赛道都适用）
+#
+# 历史短 id（只作**兼容输入**，历史排程文件里就是这么写的）：
+#   gdef  → geo-codec-def
+#   gzstd → geo-codec-zstd-sr   ← 历史名"gzstd"实为 ZSTD + source_reuse，
+#                                  不改名是为了让旧 campaign 的场次名语义不漂移
+#   gbc  → geo-codec-bc
+#
+# 压缩 token ↔ index.codec：def=default(LZ4) / zstd=ZSTD / bc=best_compression
+# -sr 后缀 = index.source_reuse 开（Easysearch 专有设置）
+#
+# 为什么用**规则**而不是查表：压缩与 source_reuse 是索引级设置，对**任何**基础
+# 赛道都成立 —— 规则化才能推广到全部赛道，新增赛道不用再改表。
+#
+# 引擎兼容（据 Easysearch 源码 EngineConfig.INDEX_CODEC_SETTING + index.source_reuse
+# 的专有性）：
+#   index.codec 合法值 = default / best_compression / lucene_default / ZSTD 系列
+#     （ZSTD 系列 Easysearch 专有；ES 的 index.codec 只有 default/best_compression）
+#   index.source_reuse = Easysearch 专有（ES 不认这个设置）
+#   → 两侧通用：default/best_compression 且 sr 关
+#   → 仅 Easysearch：ZSTD（任意 sr）、或任意压缩 + sr 开
+
+track_canonical() { # <短 id> → 规范 id
+  case "$1" in
+    gdef) echo "geo-codec-def";;
+    gzstd) echo "geo-codec-zstd-sr";;
+    gbc) echo "geo-codec-bc";;
+    *) echo "$1";;
+  esac; }
+track_is_variant() { # <id> → 是变体则 0
+  case "$(track_canonical "$1")" in *-codec-*) return 0;; *) return 1;; esac; }
+track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀）
+  local c; c=$(track_canonical "$1")
+  case "$c" in *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
+track_dir() { # <赛道/变体 id> → 目录
+  local c; c=$(track_canonical "$1")
+  case "$c" in
+    *-codec-*) echo "$ROOT/tracks/$c";;
+    geo) echo "$TRACK_GEO";;
+    hnsw) echo "$TRACK_HNSW_S3";;
+    hv1024) echo "$TRACK_HV1024";;
+    nested) echo "$TRACK_NESTED_S3";;
+    *) echo "$ROOT/tracks/$1";;
+  esac; }
+track_compression() { # <id> → index.codec 取值（空 = 非压缩变体）
+  # 先剥掉 -sr 后缀再匹配压缩档 —— 否则 "*-codec-bc" 匹配不上
+  # "…-codec-bc-sr"（串尾是 -sr），压缩标签会静默变空。
+  local t; t=$(track_canonical "$1")
+  case "$t" in *-codec-*-sr) t="${t%-sr}";; esac
+  case "$t" in
+    *-codec-def) echo "default";;
+    *-codec-zstd) echo "ZSTD";;
+    *-codec-bc) echo "best_compression";;
+    *) echo "";; esac; }
+track_source_reuse() { # <id> → true / false（空 = 非压缩变体）
+  case "$(track_canonical "$1")" in
+    *-codec-*-sr) echo "true";;
+    *-codec-*) echo "false";;
+    *) echo "";; esac; }
+track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
+  local b; b=$(track_base "$1"); case "$b" in geo) echo "geonames";; nested) echo "sonested";; *) echo "vectors";; esac; }
+track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
+  local comp sr
+  track_is_variant "$1" || { echo ""; return 0; }
+  comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
+  if [ "$sr" = "true" ] || [ "$comp" = "ZSTD" ]; then echo "easysearch"; else echo ""; fi
+}
+
 # ---- 拓扑（单事实源 = ibs ip.txt）---------------------------------------------
 # 集群节点 = ip.txt 中主机名不以 esrally 开头的行（esrally 行是驱动器，不进集群）。
 # 产出：VM_IPS/VM_NODES（角色节点数组）、NNODES、NODE_RANGE（ops.deploy -n 的 1-based 行号区间）、
