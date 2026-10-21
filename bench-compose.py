@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 Q = importlib.import_module('bench-queue')  # 文件名带连字符
 order_for_round = Q.order_for_round
+H = importlib.import_module('bench-history')  # 已入库历史覆盖（指标库 bench-run）
 
 DEFAULT_ROOT = '/opt/raceway'
 DEFAULT_WHAT = 'ds'
@@ -43,7 +44,60 @@ DEFAULT_WHAT = 'ds'
 DS_TIERS = ['ds-g1920', 'ds-j2048', 'ds-j1024', 'ds-g960', 'ds-j768', 'ds-j512', 'ds-j1536']
 DEFAULT_EST = 45
 
-Arm = namedtuple('Arm', 'name label engine jdk_dir config')
+# ---- 赛道清单 ----------------------------------------------------------------
+# 名字 → (展示名, est 默认分钟, 分组)
+#
+# 依据两处：
+# 1. **能不能起跑**看 run-bench.sh:109-118 的赛道分支（geo / gdef|gzstd|gbc /
+#    hnsw / hv1024 / nested / ds-*）。库里的 hvtp200k-2s、hvtp200k-3s 是旧版
+#    runner 跑的，当前 runner 的 track_dir 没有这两个分支 → 只能看历史，排不了。
+# 2. **est** 取各 campaign 的 RACES.md 实测耗时上界 + 余量（窗底守卫靠它算
+#    "这场塞不塞得进剩余窗口"，估小了会把排得下的场次误判成 DEADLINE-SKIP）。
+#    ds-* 用现成排程 dimsweep-24.conf 里的值 —— 那是在用口径，别另起一套。
+TRACK_CATALOG = {
+    'geo':      ('geonames', 50, 'geo'),
+    'gdef':     ('geo 默认压缩', 30, 'geo'),
+    'gzstd':    ('geo ZSTD+reuse', 35, 'geo'),
+    'gbc':      ('geo best_compression', 30, 'geo'),
+    'hnsw':     ('hnsw 2m', 25, 'vector'),
+    'hv1024':   ('hv 1024 维', 30, 'vector'),
+    'nested':   ('nested', 35, 'nested'),
+    'ds-g1920': ('1920 维', 56, 'ds'),
+    'ds-j2048': ('2048 维', 49, 'ds'),
+    'ds-j1024': ('1024 维', 35, 'ds'),
+    'ds-g960':  ('960 维', 30, 'ds'),
+    'ds-j768':  ('768 维', 26, 'ds'),
+    'ds-j512':  ('512 维', 21, 'ds'),
+    'ds-j1536': ('1536 维', 44, 'ds'),
+}
+TRACK_GROUPS = [('ds', '维度扫描 ds-*'), ('geo', 'geonames / codec 变体'),
+                ('vector', '向量 hnsw / hv1024'), ('nested', 'nested')]
+
+
+def track_est_map():
+    """赛道 → est 分钟。排程里没单独指定的赛道用它。"""
+    return {k: v[1] for k, v in TRACK_CATALOG.items()}
+
+
+def what_for(tracks):
+    """给 runner 的赛道分支参数（--what）。
+
+    排程模式下 runner 会用**排程文件里的赛道集合**覆盖 TRACKS
+    （run-bench.sh:973-980），所以 --what 只需要是个合法关键字；但给语义正确的
+    值更好：单赛道直接用它自己，全 ds-* 用 ds，混排用 all。
+    """
+    ts = [t for t in tracks if t]
+    if not ts:
+        return DEFAULT_WHAT
+    uniq = sorted(set(ts))
+    if all(t.startswith('ds-') for t in uniq):
+        return 'ds'
+    if len(uniq) == 1:
+        return uniq[0]
+    return 'all'          # 混排：runner 的 all 分支覆盖 geo/hnsw/nested，
+                          # 排程模式会再用排程文件的集合覆盖它
+
+Arm = namedtuple('Arm', 'name label engine build jdk_dir config')
 
 
 # ============================================================ 纯函数（可测）
@@ -64,8 +118,8 @@ def parse_arms(text):
                 k, v = tok.split('=', 1)
                 kv[k] = v
         arms.append(Arm(name=name, label=kv.get('ARM_LABEL', name),
-                        engine=kv.get('ENGINE_NAME', ''), jdk_dir=kv.get('JDK_DIR', ''),
-                        config=config))
+                        engine=kv.get('ENGINE_NAME', ''), build=kv.get('ENGINE_BUILD', ''),
+                        jdk_dir=kv.get('JDK_DIR', ''), config=config))
     return arms
 
 
@@ -245,17 +299,62 @@ def remote_start(args, tag, ds_hours, camp_prefix):
 
 # ============================================================ 子命令
 
-def build_rows(args, arms):
+def tracks_of(args):
     tracks = [t.strip() for t in args.tracks.split(',') if t.strip()]
     if not tracks:
         raise SystemExit('--tracks 不能为空（如 ds-g1920,ds-j1024）')
+    return tracks
+
+
+def load_history(args):
+    """读指标库的覆盖表（已入库跑过哪些 臂×赛道×轮次 格）。
+
+    指标库不可用（没起 / 连不上 / 没口令）时返回 unavailable 表 —— 编排照常
+    进行，但界面会显示"指标库未运行"。**绝不能**把空表当成"什么都没跑过"：
+    那会让编排台把已经跑过的场次重排一遍，白烧机器还把时序摊薄的前提搞脏。
+    """
+    if getattr(args, 'no_history', False):
+        return H.Coverage(available=False, error='已按参数关闭历史覆盖检查')
+    auth = getattr(args, 'es_auth', None) or os.environ.get('RACEWAY_ES_AUTH')
+    if not auth:
+        return H.Coverage(available=False,
+                          error='未配置指标库口令（--es-auth 或环境变量 RACEWAY_ES_AUTH）')
+    return H.fetch_coverage(ssh=args.ssh, auth=auth,
+                            es_url=getattr(args, 'es_url', None) or H.DEFAULT_ES_URL)
+
+
+def report_skipped(plan):
+    """把"剔除了哪些格、为什么"说清楚 —— 编排结果必须可追溯。"""
+    skipped = plan['skipped']
+    if not skipped:
+        return ''
+    out = ['已剔除 %d 格（指标库里当前 build 已跑过，不再重排）：' % len(skipped)]
+    for c in skipped:
+        out.append('  %-8s %-10s r%d  %s' % (c['arm'], c['track'], c['round'], c['reason']))
+    return '\n'.join(out)
+
+
+def build_rows(args, arms):
+    tracks = tracks_of(args)
+    unknown = [t for t in tracks if t not in TRACK_CATALOG]
+    if unknown:
+        raise SystemExit(
+            '这些赛道当前 runner 跑不了（run-bench.sh 没有对应分支）：%s\n'
+            '可排的赛道：%s\n'
+            '库里有历史数据的其他赛道只能看不能排（例如 hvtp200k-2s/3s 是旧版 runner 跑的）。'
+            % ('、'.join(unknown), '、'.join(sorted(TRACK_CATALOG))))
     rows = interleave(arms, tracks, args.rounds)
-    est_map = parse_est_overrides(args.est)
+    # est：先取赛道清单的实测值，再让 --est 覆盖（--est 优先）
+    est_map = track_est_map()
+    est_map.update(parse_est_overrides(args.est))
     return rows, est_map
 
 
 def compose_all(args):
-    """arms 解析 + 校验 + 渲染。返回 (arms, schedule_text, arms_text, rows)。"""
+    """arms 解析 + 校验 + 历史覆盖剔除 + 渲染。
+
+    返回 (arms, schedule_text, arms_text, rows, tag, plan)。
+    """
     arms = parse_arms(read_arms_file(args))
     if not arms:
         raise SystemExit('臂定义里没有可用臂: %s' % args.arms_file)
@@ -263,14 +362,32 @@ def compose_all(args):
     hard = [m for sev, m in problems if sev == 'error']
     if hard:
         raise SystemExit('臂定义校验失败：\n  ' + '\n  '.join(hard))
+    tracks = tracks_of(args)
     rows, est_map = build_rows(args, arms)
+
+    # --what 没显式给就按赛道集合推导（排程模式下 runner 会用排程文件的集合覆盖它，
+    # 但给个语义正确的关键字更稳：单赛道用它自己、全 ds-* 用 ds、混排用 all）
+    if not getattr(args, 'what', None):
+        args.what = what_for(tracks)
+
+    # 已入库历史覆盖：默认剔除"当前 build 上已经跑过"的格
+    cov = load_history(args)
+    plan = H.plan_cells(cov, arms, tracks, args.rounds,
+                         include_covered=getattr(args, 'include_covered', False))
+    if plan['skipped']:
+        rows = H.filter_rows(plan, rows)
+        if not rows:
+            raise SystemExit(
+                '矩阵里的每一格都已在指标库跑过（当前 build），无事可排。\n'
+                '要重跑请加 --include-covered。')
+
     tag = args.tag or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     sched = render_schedule(rows, arms, tag, est_map, args.est_default, recall=args.recall)
     # round-trip 自校验：渲染出来的文件按 runner 规则读回去必须等于生成序
     back = [(a, t, r) for a, t, r, _, _ in schedule_rows_from_text(sched)]
     if back != rows:
         raise SystemExit('内部错误：渲染结果与生成序不一致（round-trip 失败）')
-    return arms, sched, render_arms(arms, tag), rows, tag
+    return arms, sched, render_arms(arms, tag), rows, tag, plan
 
 
 def cmd_arms(args):
@@ -282,14 +399,20 @@ def cmd_arms(args):
 
 
 def cmd_gen(args):
-    arms, sched, _, rows, _ = compose_all(args)
+    arms, sched, _, rows, _, plan = compose_all(args)
+    rep = report_skipped(plan)
+    if rep:
+        print(rep, file=sys.stderr)
     sys.stdout.write(sched)
 
 
 def cmd_preview(args):
-    arms, sched, arms_text, rows, tag = compose_all(args)
+    arms, sched, arms_text, rows, tag, plan = compose_all(args)
     upload(args, tag, sched, arms_text)
     rc, out = remote_dry_run(args, tag, args.ds_hours)
+    rep = report_skipped(plan)
+    if rep:
+        print(rep, file=sys.stderr)
     print('== 排程文件（tag=%s，%d 场）==' % (tag, len(rows)))
     sys.stdout.write(sched)
     print('== run-bench.sh --dry-run（rc=%d）==' % rc)
@@ -301,7 +424,7 @@ def cmd_preview(args):
 def cmd_start(args):
     if not args.yes:
         raise SystemExit('起跑需显式确认：加 --yes（先 preview 检查过 dry-run 输出）')
-    arms, sched, arms_text, rows, tag = compose_all(args)
+    arms, sched, arms_text, rows, tag, plan = compose_all(args)
     why = remote_mutex_check(args)
     if why:
         raise SystemExit(why)
@@ -311,6 +434,9 @@ def cmd_start(args):
         print(out)
         raise SystemExit('dry-run 未通过，拒绝起跑（rc=%d）' % rc)
     camp, log = remote_start(args, tag, args.ds_hours, args.camp_prefix)
+    rep = report_skipped(plan)
+    if rep:
+        print(rep)
     print('已起跑 tag=%s（%d 场）' % (tag, len(rows)))
     print('campaign: %s' % camp)
     print('日志: %s@%s:%s' % (args.ssh, args.root, log))
@@ -323,7 +449,7 @@ _PAGE = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>raceway 排程编排台</title>
 <style>
- body{font:14px/1.6 -apple-system,'PingFang SC',sans-serif;margin:24px;max-width:1100px;color:#222}
+ body{font:14px/1.6 -apple-system,'PingFang SC',sans-serif;margin:24px;max-width:1240px;color:#222}
  h2{border-bottom:2px solid #3a7;padding-bottom:4px}
  table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 10px;text-align:left}
  .tracks label{margin-right:12px;white-space:nowrap}
@@ -331,21 +457,51 @@ _PAGE = """<!doctype html>
  pre{background:#f6f6f6;border:1px solid #ddd;padding:10px;max-height:340px;overflow:auto}
  .err{color:#b00}.ok{color:#080}
  fieldset{border:1px solid #bbb;margin-bottom:14px}
+ .hist-sum{font-size:13px;margin:4px 0 8px}
+ .hmatrix{border-collapse:collapse;font-size:12px;max-width:100%%;overflow:auto;display:block;max-height:420px}
+ .hmatrix td,.hmatrix th{border:1px solid #ddd;padding:2px 6px;white-space:nowrap}
+ .hmatrix th{background:#f2f2f2;position:sticky;top:0}
+ .hmatrix tr>th:first-child{position:sticky;left:0;z-index:2;background:#f2f2f2}
+ .v-ok{background:#dcfce7;color:#14532d;font-weight:600}
+ .v-deg{background:#fef9c3;color:#713f12;font-weight:600}
+ .v-half{background:#ffedd5;color:#7c2d12}
+ .v-skip{background:#e5e7eb;color:#374151}
+ .v-fail{background:#fee2e2;color:#7f1d1d;font-weight:600}
+ .v-none{background:#fafafa;color:#bbb}
+ .hmatrix th.cur{background:#e8f4ff}
+ .hmatrix th.dim{background:#f7f7f7;color:#aaa;font-weight:400}
+ .hmatrix td.past{opacity:.42}
+ .legend span{margin-right:14px;font-size:12px}
+ .skipbox{font-size:12px;color:#666;margin-top:6px;max-height:120px;overflow:auto;word-break:break-all;white-space:normal}
 </style></head><body>
 <h1>raceway 排程编排台（compose）</h1>
-<p>矩阵勾选 → 生成排程 → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
+<p>矩阵勾选 → <b>自动剔除指标库里已跑过的格</b> → 生成排程 → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
 交错由服务端复刻 <code>order_for_round</code>；本页不做任何绕过 precheck 的事。</p>
 
 <fieldset><legend>臂（来自臂定义文件）</legend><div id="arms" class="tracks"></div></fieldset>
-<fieldset><legend>赛道（ds-* 档位）</legend><div id="tracks" class="tracks"></div>
- 自定义（逗号分隔）<input id="custom" size="30" placeholder="ds-hv1024,..."></fieldset>
+<fieldset><legend>赛道（全部可起跑的赛道，按族分组）</legend><div id="tracks"></div>
+ 自定义（逗号分隔，清单外的赛道）<input id="custom" size="30" placeholder="ds-hv1024,..."></fieldset>
 <fieldset><legend>轮次与口径</legend>
  轮次 <input id="rounds" type="number" value="1" min="1" max="9" style="width:4em">
  探针 <select id="recall"><option value="recall">recall（带召回探针）</option>
    <option value="norecall">norecall</option></select>
- 默认 est <input id="estd" type="number" value="45" min="5" style="width:5em"> 分钟
+ est 覆盖 <input id="estov" size="30" placeholder="ds-g1920=52,nested=40">（赛道=分钟；留空用赛道清单的实测值）
  DS_HOURS <input id="dsh" type="number" value="12" min="0" style="width:5em">（0=不启用窗底守卫）
  tag <input id="tag" size="22" placeholder="留空自动生成"></fieldset>
+
+<fieldset><legend>已入库历史（指标库 bench-run）</legend>
+ <div id="histbox" class="hist-sum">加载中…</div>
+ <div class="legend">
+  <span class="v-ok">✓已跑</span><span class="v-deg">~降级</span><span class="v-half">半(缺相位)</span>
+  <span class="v-skip">跳过</span><span class="v-fail">✗失败</span><span class="v-none">未跑</span>
+ </div>
+ <div id="histmatrix"></div>
+ <div style="margin-top:8px">
+  <label><input type="checkbox" id="incov"> 编排时<b>含</b>已跑过的格（默认剔除，避免重跑已做过的测试）</label>
+  <button onclick="loadHist()">刷新历史</button>
+ </div>
+ <div id="skipbox" class="skipbox"></div>
+</fieldset>
 
 <button onclick="doRender()">生成排程</button>
 <button onclick="doPreview()">上传 + dry-run 预览</button>
@@ -358,13 +514,33 @@ _PAGE = """<!doctype html>
 <script>
 const DS_TIERS = %s;
 let ARMS = [];
+let TRACKS = [];
+let TRACK_GROUPS = [];
+let HIST = null;
+const VT = {VALID:'✓已跑',DEGRADED:'~降级',HALF:'半',SKIP:'跳过',FAIL:'✗失败',UNKNOWN:'?'};
+const VC = {VALID:'v-ok',DEGRADED:'v-deg',HALF:'v-half',SKIP:'v-skip',FAIL:'v-fail',UNKNOWN:'v-none'};
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 async function boot(){
   const r = await fetch('/api/bootstrap'); const j = await r.json();
-  ARMS = j.arms;
+  ARMS = j.arms; TRACKS = j.tracks||[]; TRACK_GROUPS = j.track_groups||[];
   document.getElementById('arms').innerHTML = ARMS.map(a =>
-    `<label><input type="checkbox" class="armck" value="${a.name}" checked> ${a.name} <small>(${a.engine}${a.jdk_dir? ' + '+a.jdk_dir.split('/').pop():''})</small></label>`).join('');
-  document.getElementById('tracks').innerHTML = DS_TIERS.map(t =>
-    `<label><input type="checkbox" class="tkck" value="${t}" checked> ${t.replace('ds-','')}</label>`).join('');
+    `<label><input type="checkbox" class="armck" value="${a.name}" checked> ${a.name} <small>(${a.engine}${a.build?'@'+a.build:''}${a.jdk_dir? ' + '+a.jdk_dir.split('/').pop():''})</small></label>`).join('');
+  // 赛道按族分组渲染：全部可起跑的赛道都在，不只是 ds-*
+  let h='';
+  TRACK_GROUPS.forEach(function(g){
+    const items=TRACKS.filter(t=>t.group===g[0]);
+    if(!items.length) return;
+    h+='<div style="margin:4px 0"><b style="font-size:12px;color:#555">'+esc(g[1])+'</b><br>';
+    h+=items.map(t=>`<label title="est ${t.est}min"><input type="checkbox" class="tkck" value="${t.name}" checked> ${esc(t.label)} <small style="color:#888">(${t.name}, ~${t.est}min)</small></label>`).join(' ');
+    h+='</div>';
+  });
+  document.getElementById('tracks').innerHTML=h;
+  document.getElementById('arms').addEventListener('change',loadHist);
+  document.getElementById('tracks').addEventListener('change',loadHist);
+  document.getElementById('rounds').addEventListener('change',loadHist);
+  document.getElementById('incov').addEventListener('change',loadHist);
+  loadHist();
 }
 function matrix(){
   const arms=[...document.querySelectorAll('.armck:checked')].map(e=>e.value);
@@ -373,25 +549,111 @@ function matrix(){
   if(custom) custom.split(',').forEach(t=>{t=t.trim(); if(t&&!tracks.includes(t))tracks.push(t);});
   return {arms, tracks, rounds:+document.getElementById('rounds').value,
           recall:document.getElementById('recall').value,
-          est_default:+document.getElementById('estd').value,
+          est:document.getElementById('estov').value.trim(),
           ds_hours:+document.getElementById('dsh').value,
+          include_covered:document.getElementById('incov').checked,
           tag:document.getElementById('tag').value.trim()};
 }
 async function post(path){ const r=await fetch(path,{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(matrix())});
   return {status:r.status, j:await r.json()}; }
 function show(el,text){document.getElementById(el).textContent=text;}
+function setMsg(ok,text){const m=document.getElementById('msg');
+  m.className=ok?'ok':'err'; m.textContent=' '+text;}
+
+async function loadHist(){
+  const box=document.getElementById('histbox');
+  box.innerHTML='查询指标库…';
+  let j;
+  try{ const r=await fetch('/api/history'); j=await r.json(); }
+  catch(e){ box.innerHTML='<span class="err">查询失败: '+esc(e)+'</span>'; return; }
+  if(!j.available){
+    box.innerHTML='<span class="err">指标库不可用：'+esc(j.error||'未知')+
+      '　—— 编排照常可用，但无法自动剔除已跑过的格（压测窗口内指标库停着是常态）。</span>';
+    document.getElementById('histmatrix').innerHTML='';
+    document.getElementById('skipbox').textContent='';
+    HIST=null; return;
+  }
+  HIST=j;
+  const s=j.summary;
+  box.innerHTML='指标库已连接：<b>'+s.races+'</b> 场次 / <b>'+s.rows+'</b> 行 / <b>'+
+    s.campaigns+'</b> 个 campaign / <b>'+s.tracks+'</b> 条赛道 / <b>'+s.arms+'</b> 个臂';
+  paintMatrix();
+}
+function cellOf(arm,track,round){
+  if(!HIST) return null;
+  return HIST.cells[arm+'|'+track+'|'+round] || null;
+}
+function roundsOf(arm,track){
+  // 该格在库里出现过哪些轮次（全量，不受当前矩阵的轮次限制）
+  if(!HIST) return [];
+  const pre=arm+'|'+track+'|', out=[];
+  for(const k in HIST.cells){
+    if(k.indexOf(pre)===0) out.push(parseInt(k.slice(pre.length),10));
+  }
+  return out.sort(function(x,y){return x-y;});
+}
+function paintMatrix(){
+  if(!HIST){ document.getElementById('histmatrix').innerHTML=''; return; }
+  const m=matrix();
+  const selArms=new Set(m.arms), selTracks=new Set(m.tracks);
+  const arms=HIST.arms||[], tracks=HIST.tracks||[];
+  let h='<table class="hmatrix"><tr><th>臂 \\ 赛道</th>';
+  tracks.forEach(function(t){
+    const runnable = TRACKS.some(function(x){return x.name===t;});
+    h+='<th class="'+(selTracks.has(t)?'cur':'dim')+'">'+esc(t)+
+       (runnable?'':'<br><small style="font-weight:400">仅历史</small>')+'</th>';
+  });
+  h+='</tr>';
+  const skip=[];
+  arms.forEach(function(a){
+    const armDef=ARMS.find(function(x){return x.name===a;})||{};
+    const want=armDef.build? (a+'@'+armDef.build) : a;
+    h+='<tr><th class="'+(selArms.has(a)?'cur':'dim')+'">'+esc(a)+
+       '<br><small style="font-weight:400">'+esc(want)+'</small></th>';
+    tracks.forEach(function(t){
+      let cell='';
+      roundsOf(a,t).forEach(function(r){
+        const c=cellOf(a,t,r);
+        let v='UNKNOWN', title='未跑过';
+        if(c){
+          const pb=c.per_build||{};
+          if(pb[want]){ v=pb[want].verdict; title=(pb[want].campaigns||[]).join(',')+' '+v; }
+          else { v='UNKNOWN'; title='别的 build: '+(c.builds||[]).join(','); }
+        }
+        const inMatrix = selArms.has(a) && selTracks.has(t) && r<=m.rounds;
+        cell+='<td class="'+VC[v]+(inMatrix?'':' past')+'" title="'+esc(
+          a+' '+t+' r'+r+' · '+title+(inMatrix?'（在本次矩阵内）':'（本次矩阵外）'))+'">r'+r+' '+VT[v]+'</td>';
+        if(inMatrix && c && pb_covered(c,want)) skip.push(a+' '+t+' r'+r);
+      });
+      h+='<td>'+(cell||'<span class="v-none">—</span>')+'</td>';
+    });
+    h+='</tr>';
+  });
+  h+='</table>';
+  document.getElementById('histmatrix').innerHTML=h;
+  const incov=document.getElementById('incov').checked;
+  document.getElementById('skipbox').innerHTML = incov
+    ? '<b>已勾选"含已跑过的格"</b>：本次会重跑全部已跑过的格。'
+    : ('本次矩阵将<b>剔除</b> '+skip.length+' 格（指标库里当前 build 已跑过）：<br>'+
+       (skip.length? skip.join('、') : '（无）'));
+}
+function pb_covered(c,want){
+  const pb=(c.per_build||{})[want];
+  if(!pb) return false;
+  return pb.verdict==='VALID' || pb.verdict==='DEGRADED';
+}
+
 async function doRender(){ const {status,j}=await post('/api/render');
-  show('sched', status==200? j.schedule : '错误: '+j.error); setMsg(status==200,'生成 '+j.rows+' 场');}
+  if(status!=200){ show('sched','错误: '+(j.error||'未知')); setMsg(false,'生成失败'); return; }
+  show('sched', j.schedule); setMsg(true,'生成 '+j.rows+' 场'); }
 async function doPreview(){ setMsg(true,'dry-run 运行中…'); const {status,j}=await post('/api/preview');
-  if(status!=200){show('out','错误: '+j.error);setMsg(false,'dry-run 失败');return;}
+  if(status!=200){show('out','错误: '+(j.error||'未知'));setMsg(false,'dry-run 失败');return;}
   show('sched',j.schedule); show('out',j.dryrun); setMsg(j.rc==0, j.rc==0?'dry-run 通过，可起跑':'dry-run 非零，勿起跑');}
 async function doStart(){ if(!confirm('确认起跑？会占用压测集群。'))return;
   setMsg(true,'校验并起跑…'); const {status,j}=await post('/api/start');
-  if(status!=200){show('out','错误: '+j.error);setMsg(false,'未起跑');return;}
+  if(status!=200){show('out','错误: '+(j.error||'未知'));setMsg(false,'未起跑');return;}
   show('out',j.result); setMsg(true,'已起跑');}
-function setMsg(ok,text){const m=document.getElementById('msg');
-  m.className=ok?'ok':'err'; m.textContent=' '+text;}
 boot();
 </script></body></html>
 """ % json.dumps(DS_TIERS)
@@ -407,6 +669,29 @@ class ComposeState:
         self.arms = parse_arms(text)
         self.arms_src_text = text
         self.problems = validate_arms(self.arms)
+        self._hist = None
+        self._hist_at = 0.0
+        self._hist_lock = threading.Lock()
+
+    def history(self, max_age=30):
+        """指标库覆盖表（带 TTL 缓存，避免每次点按钮都打一次 ES）。
+
+        指标库不可用时返回 unavailable 表 —— 界面据此显示"未运行"，
+        不会把空表当成"什么都没跑过"。
+        """
+        with self._hist_lock:
+            now = time.time()
+            if self._hist is not None and (now - self._hist_at) < max_age:
+                return self._hist
+            self._hist = load_history(self.args)
+            self._hist_at = now
+            return self._hist
+
+    def build_of(self, arm_name):
+        for a in self.arms:
+            if a.name == arm_name:
+                return a.build
+        return ''
 
 
 def api_render(st, body):
@@ -419,12 +704,32 @@ def api_render(st, body):
         return 400, {'error': '；'.join(hard)}
     if not body['tracks']:
         return 400, {'error': '未选赛道'}
-    rows = interleave(arms, body['tracks'], max(1, int(body['rounds'])))
+    tracks = list(body['tracks'])
+    rounds = max(1, int(body['rounds']))
+    rows = interleave(arms, tracks, rounds)
+
+    # 已入库历史覆盖：默认剔除"当前 build 上已经跑过"的格
+    incov = bool(body.get('include_covered'))
+    cov = st.history()
+    plan = H.plan_cells(cov, arms, tracks, rounds, include_covered=incov)
+    if plan['skipped']:
+        rows = H.filter_rows(plan, rows)
+    if not rows:
+        return 400, {'error': '矩阵里的每一格都已在指标库跑过（当前 build），无事可排。'
+                             '要重跑请勾选"含已跑过的格"。',
+                     'plan': plan}
+
     tag = body.get('tag') or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
-    sched = render_schedule(rows, arms, tag, {}, int(body.get('est_default') or DEFAULT_EST),
+    # est：赛道清单的实测值 → 界面/CLI 的覆盖值
+    est_map = track_est_map()
+    est_over = body.get('est') or ''
+    if est_over:
+        est_map.update(parse_est_overrides([p for p in est_over.split(',') if p.strip()]))
+    sched = render_schedule(rows, arms, tag, est_map,
+                            int(body.get('est_default') or DEFAULT_EST),
                             recall=(body.get('recall') != 'norecall'))
-    st.last = {'arms': arms, 'schedule': sched, 'tag': tag}
-    return 200, {'schedule': sched, 'rows': len(rows)}
+    st.last = {'arms': arms, 'schedule': sched, 'tag': tag, 'plan': plan}
+    return 200, {'schedule': sched, 'rows': len(rows), 'plan': plan}
 
 
 def api_preview(st, body):
@@ -478,7 +783,16 @@ class Handler(BaseHTTPRequestHandler):
             st = self.server.state
             self._send(200, 'application/json', json.dumps({
                 'arms': [a._asdict() for a in st.arms],
-                'problems': st.problems, 'ds_tiers': DS_TIERS}, ensure_ascii=False))
+                'problems': st.problems, 'ds_tiers': DS_TIERS,
+                # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
+                'tracks': [{'name': k, 'label': v[0], 'est': v[1], 'group': v[2]}
+                           for k, v in TRACK_CATALOG.items()],
+                'track_groups': TRACK_GROUPS,
+            }, ensure_ascii=False))
+        elif self.path == '/api/history':
+            st = self.server.state
+            cov = st.history()
+            self._send(200, 'application/json', json.dumps(cov.to_dict(), ensure_ascii=False))
         else:
             self._send(404, 'text/plain', 'not found')
 
@@ -534,13 +848,25 @@ def main(argv=None):
     ap.add_argument('--est', action='append', default=[], help='赛道=est分钟，可重复')
     ap.add_argument('--est-default', type=int, default=DEFAULT_EST)
     ap.add_argument('--tag', default=None)
-    ap.add_argument('--what', default=DEFAULT_WHAT, help='runner 第一参数（排程模式默认 ds）')
+    ap.add_argument('--what', default=None,
+                    help='runner 的赛道分支参数；缺省按所选赛道自动推导'
+                         '（单赛道用它自己 / 全 ds-* 用 ds / 混排用 all）')
     ap.add_argument('--ds-hours', type=int, default=0)
     ap.add_argument('--camp-prefix', default=None)
     ap.add_argument('--root', default=DEFAULT_ROOT, help='远端 raceway 目录')
     ap.add_argument('--ssh', default=None, help='user@host；缺省操作本地')
     ap.add_argument('--port', type=int, default=8802)
     ap.add_argument('--yes', action='store_true')
+    ap.add_argument('--es-auth', default=None,
+                    help='指标库 basic auth（user:pass）；缺省读环境变量 RACEWAY_ES_AUTH。'
+                         '用于查已入库历史，自动剔除已跑过的格')
+    ap.add_argument('--es-url', default=None,
+                    help='指标库地址（默认 https://127.0.0.1:9237）。'
+                         '--ssh 模式下这个地址是**服务器那边**的地址')
+    ap.add_argument('--include-covered', action='store_true',
+                    help='把指标库里已跑过的格也排进去（默认剔除，避免重跑已做过的测试）')
+    ap.add_argument('--no-history', action='store_true',
+                    help='不查指标库历史（默认会查；查不到时编排照常，只是不剔除）')
     args = ap.parse_args(argv)
 
     if args.arms_file is None:

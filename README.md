@@ -114,6 +114,38 @@ python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out �
 ```
 
 
+## 队列观测与图形编排
+
+三个只读/半读的本地工具，把"队列"从散落的文件变成能看能排的东西：
+
+| 工具 | 干什么 |
+|---|---|
+| `bench-queue.py` | **队列观测台**（纯读）：把 campaign 目录里的 `PROGRESS.txt` / `RACES.md` / `STATE.txt` / 排程文件推导成队列视图，实时页 + 四类告警（判定矛盾 / STATE 行号错位 / 排程运行期被改 / 窗底漂移） |
+| `bench-history.py` | **已入库历史覆盖**（纯读）：把指标库 `bench-run` 索引读成「臂×赛道×轮次」覆盖表，回答"哪些格已经跑过、什么判定、哪个 build" |
+| `bench-compose.py` | **排程编排台**：矩阵勾选 → 生成排程 → dry-run 预览 → 互斥预检后起跑；**默认自动剔除指标库里已跑过的格** |
+
+```bash
+# 看队列（远端读 campaigns 目录）
+python3 bench-queue.py list --root /opt/raceway/campaigns --ssh root@HOST
+python3 bench-queue.py serve <campaign> --root /opt/raceway/campaigns --ssh root@HOST   # 实时页
+
+# 图形编排（本地起界面，通过 ssh 写文件、起跑；不占压测机）
+python3 bench-compose.py serve --port 8802 --ssh root@HOST \
+    --es-auth 'admin:xxx'          # 指标库口令：用于查已入库历史、剔除已跑过的格
+#   指标库口令也可走环境变量 RACEWAY_ES_AUTH；口令经 stdin 传给远端 curl，不出现在 argv
+#   指标库没起（压测窗口内是常态）时编排照常，只是无法自动剔除已跑过的格
+```
+
+`bench-compose.py` 的赛道清单是**全部可起跑的赛道**（不是只有 ds-*）：
+`ds-*` 维度扫描 7 档、`geo` + `gdef/gzstd/gbc` codec 变体、`hnsw`、`hv1024`、`nested`，
+每档带实测 est（分钟，来自各 campaign 的 `RACES.md`）。
+`hvtp200k-2s/3s` 只有历史数据（当前 runner 无对应分支），**能看不能排**。
+
+覆盖判定守住三条口径（见 `bench-history.py` 顶部注释）：
+**一场次两行**（写赛+查赛都 VALID 才算跑过）、**build 隔离**
+（`jdk25@3009` 跑过 ≠ `jdk25@3015` 跑过）、**指标库不可用 ≠ 什么都没跑过**。
+
+
 ## 快速开始
 
 ```bash
