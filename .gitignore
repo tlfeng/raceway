@@ -10,3 +10,8 @@ __pycache__/
 # Kibana 建板产物：随 bench-env 现场数据生成，含环境指纹与场次统计，
 # 每次生成都会随数据变化 → 不入库，按需本地重建（见 kibana/README.md）
 kibana/kibana-objects.ndjson
+
+# 内部资料目录：含压测环境细节与内部文档，不随公共库公开。
+# 臂定义排程用 --arms-file / RACEWAY_ARMS_FILE 指定本地留存副本。
+docs/
+schedules/
