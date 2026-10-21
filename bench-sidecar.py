@@ -282,6 +282,11 @@ def mb(v):
     return int(v / 1048576) if isinstance(v, (int, float)) else None
 
 
+def mbf(v):
+    """KB~MB 量级的小计数保留两位小数：int 截断会把 0.8MB 抹成 0，分不清"没报"和"很小\""""
+    return round(v / 1048576, 2) if isinstance(v, (int, float)) else None
+
+
 def gc_of(n):
     col = ((n.get("jvm") or {}).get("mem") or {}).get("gc", {}).get("collectors", {}) \
         or ((n.get("jvm") or {}).get("gc", {}) or {}).get("collectors", {})
@@ -302,6 +307,10 @@ def nodes_measured(info_text, stats_text):
         jvm_i, os_i = n.get("jvm") or {}, n.get("os") or {}
         jvm_s, os_s = s.get("jvm") or {}, s.get("os") or {}
         idx = (s.get("indices") or {}).get("docs") or {}
+        # 段内存只记仍在真实计数的 on-heap 三项：rally 经 index stats 采的 terms/norms/
+        # doc_values/points 等六项在新 Lucene（ES 8.19、ez240/250 实测）已衰减为恒 0
+        # （reader 挪到 mmap 堆外），index_writer/version_map/fixed_bit_set 仍是实值
+        seg = (s.get("indices") or {}).get("segments") or {}
         rec = {
             "name": n.get("name") or s.get("name"),
             "ip": n.get("host") or n.get("ip") or (s.get("host") or s.get("ip")),
@@ -317,6 +326,9 @@ def nodes_measured(info_text, stats_text):
             "heap_used_mb": mb(((jvm_s.get("mem") or {}).get("heap_used_in_bytes"))),
             "cpu_load_average_1m": (os_s.get("cpu") or {}).get("load_average"),
             "docs_total_measured": idx.get("count"),
+            "index_writer_memory_mb": mbf(seg.get("index_writer_memory_in_bytes")),
+            "version_map_memory_mb": mbf(seg.get("version_map_memory_in_bytes")),
+            "fixed_bit_set_memory_mb": mbf(seg.get("fixed_bit_set_memory_in_bytes")),
         }
         rec.update({k: v for k, v in gc_of(s).items() if v is not None})
         out.append(rec)
@@ -435,6 +447,9 @@ def main():
             "heap_max_measured_mb": [m["heap_max_mb"] for m in measured] or None,
             "cores_declared": num(args.cores),
             "available_processors_measured": [m["available_processors_measured"] for m in measured] or None,
+            "index_writer_memory_measured_mb": [m["index_writer_memory_mb"] for m in measured] or None,
+            "version_map_memory_measured_mb": [m["version_map_memory_mb"] for m in measured] or None,
+            "fixed_bit_set_memory_measured_mb": [m["fixed_bit_set_memory_mb"] for m in measured] or None,
             "shards": tm["shards"], "replicas": tm["replicas"],
             "bulk_size": tm["bulk_size"], "clients": tm["clients"],
             "params_source": tm["source"], "track_params_passed": args.track_params or None,
