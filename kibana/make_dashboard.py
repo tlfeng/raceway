@@ -583,9 +583,10 @@ def env_markdown():
     md = ['**Benchmark 结果总览** · 数据源 `bench-run` / `bench-metric`'
           '（raceway bench-export.py 离线入库，源 = rally race.json + sidecar）',
           '',
-          '每点 = 一场 race；曲线 = 实验臂(arm)，图例标签 = `引擎@版本@build@JDK`（如 ez@2.5.0@3015@graalvm25，'
-          'arm_label 字段）；同臂跨引擎 build 会自动拆成多条线（如 jdk26@3009 / jdk26@3015），'
-          '因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
+          '每点 = 一场压测；一条线 = 一套固定配置（引擎 + 版本 + build + JDK），'
+          '图例写成 `引擎@版本@build@JDK`（如 ez@2.5.0@3015@graalvm25）。'
+          '同一套配置换了引擎 build 会自动拆成多条线（如 ez@2.5.0@3009@openjdk26 / ez@2.5.0@3015@openjdk26），'
+          '因为不同 build 的绝对值不能直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
     try:
         r = es_get('/bench-env/_search?size=10')
         for hit in r['hits']['hits']:
@@ -628,16 +629,16 @@ def env_markdown():
                          if b['key'] not in truthy)
         md.append('')
         md.append('**场次体检** — 共 %d 场（VALID %d / 非 VALID %d）' % (total, n_valid, n_invalid))
-        md.append('实验臂: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
+        md.append('被测配置（代号）: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                          for b in aggs['arms']['buckets']))
-        # 臂名 → 图例标签对照（同一臂可能对应多个标签：跨 build 采集时各 build 一条线）
+        # 配置代号 → 图例标签对照（同一代号可能对应多个标签：换了引擎 build 就各画一条线）
         pairs = []
         for b in aggs['arms']['buckets']:
             labs = b.get('labels', {}).get('buckets') or []
             for lb in labs:
                 pairs.append('%s → %s（%d 场）' % (b['key'], lb['key'], lb['doc_count']))
         if pairs:
-            md.append('臂名 → 图例标签: ' + ' · '.join(pairs))
+            md.append('配置代号 → 图例标签: ' + ' · '.join(pairs))
         md.append('赛道: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                         for b in aggs['by_track']['buckets']))
     except Exception as e:                                   # noqa: BLE001
@@ -686,14 +687,14 @@ USAGE_MD = '''**看图指南**
   量纲不可比，所以不放在同一张图里对比 —— 对照 opensearch.org/benchmarks 的分页口径。
 - 看板内再按 **workload 分图**：同一赛道内不同 task（term 检索 / country 聚合 / sort /
   decay / KNN k 值）的吞吐与延迟量纲不同，混在一张图里同样是误读。
-- 每点 = 一场 race；曲线 = 实验臂(arm)，图例标签 = `引擎@版本@build@JDK`；同臂跨引擎 build 时自动拆成多条线（如 ez@2.5.0@3009@openjdk26 / ez@2.5.0@3015@openjdk26），因为不同 build 的绝对值不可直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
-- **图例标签怎么读**（`arm_label` 字段，格式 `引擎@版本@build@JDK`）：
-  - 引擎名：`ez` = EasySearch、`es` = Elasticsearch
-  - 版本号：引擎版本（2.4.0 / 2.5.0 / 8.19.23）
-  - build 号：引擎构建号（2975 / 3009 / 3015），无构建号时显示 `—`（如 ES 8.19.23）
-  - JDK 名：`graalvm21/25` = Oracle GraalVM 21/25、`kona25` = Tencent Kona 25、
-    `openjdk26/27` = OpenJDK 26/27（均为 sidecar 实测值，非臂名推测）
-  - 臂名（跑压时的 `ARM_LABEL`，如 jdk25）与标签的对应关系见「环境说明」面板的对照行。
+- 每点 = 一场压测；一条线 = 一套固定配置（引擎 + 版本 + build + JDK），图例写成 `引擎@版本@build@JDK`；换了引擎 build 会自动拆成多条线（如 ez@2.5.0@3009@openjdk26 / ez@2.5.0@3015@openjdk26），因为不同 build 的绝对值不能直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。
+- **图例怎么读**（`引擎@版本@build@JDK` 四段）：
+  - 引擎：`ez` = EasySearch、`es` = Elasticsearch
+  - 版本：引擎版本（2.4.0 / 2.5.0 / 8.19.23）
+  - build：引擎构建号（2975 / 3009 / 3015）；没有构建号时显示 `—`（如 ES 8.19.23）
+  - JDK：`graalvm21/25` = Oracle GraalVM 21/25、`kona25` = Tencent Kona 25、
+    `openjdk26/27` = OpenJDK 26/27（都是实测值，不是猜的）
+  - 配置代号（跑压时定的名字，如 jdk25）与图例的对应关系，见「环境说明」面板里的对照行。
 - **两层闸门，各管各的**：
   - `valid`（看板级，管所有面板）= 场次跑完了、且 RACES.md 记为 VALID。没记账的批次
     （早期 one-off 场次）没有这个标记，**默认不出图** —— 它们不可信，不能和正式批次同图比较。
@@ -702,7 +703,7 @@ USAGE_MD = '''**看图指南**
     它吐出的时延量的是"失败响应有多快"，混进来会把引擎显得更快。
     **错误率面板是唯一的例外**，它刻意不带 quality 闸门 ——
     它就是要显示失败场次。
-- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定实验臂: `arm:es819`；限定批次: `campaign:ds3-20261015-233223`
+- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定某套配置: `arm:es819`（代号见「环境说明」面板）；限定批次: `campaign:ds3-20261015-233223`
 - **时延三兄弟，别混用**：
   - **引擎时延** (family=service_time) = 服务端执行时间，**跨引擎比较看这个**
   - **端到端时延** (family=latency) = 含发压机积压；开环 task（设了 target-throughput）
