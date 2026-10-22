@@ -56,21 +56,52 @@ python3 make_dashboard.py --import \
 
 ## 产出
 
-`kibana-objects.ndjson` —— **270 个 saved object**（仅 python3 标准库）：
+`kibana-objects.ndjson` —— **191 个 saved object**（仅 python3 标准库）：
 
 - 3 个 **index-pattern**：bench-metric / bench-run / bench-env（字段从 ES mapping 实时读）
-- **10 个 dashboard**：
+- **7 个 dashboard**：
   - `bench-overview` 总览（环境说明 + 赛道导航 + 看图指南）
-  - `bench-<track>` **每个 esrally track 一个独立看板**，当前 9 个：
-    `geo`（geonames 文本检索）/ `hnsw`（HNSW 96 维）/ `nested`（嵌套文档）/
-    `ds-j512` `ds-j768` `ds-g960` `ds-j1024` `ds-g1920` `ds-j2048`（向量维度扫描）
-- **218 个 TSVB 面板**：按「赛道 × workload」动态生成，分四段：
+  - `bench-<track>` **每个 esrally track 一个独立看板**，当前 4 个：
+    `geo`（geonames 文本检索）/ `hnsw`（HNSW 96 维）/ `nested`（嵌套文档）/ `hv1024`
+  - **2 块维度扫描合并板**（2026-10-22 起，原来一页一维度档的 6 块 `bench-ds-*` 已合并）：
+    - `bench-dimsweep` **维度轴** —— 折线按 `track` 分线（一条线 = 一个维度档），横轴是时间；每台车一张维度对照表
+    - `bench-dimsweep-car` **车轴** —— 只收同一维度上有 ≥3 辆车（引擎@版本@build@JDK）的档，面板按 `series_key` 分线
+- **181 个 visualization** = **155 个 TSVB 时序图** + **26 个 markdown 文本面板**
+  （19 个段标题 + 4 张维度对照表 + 总览页 3 个）
+- TSVB 时序图按「赛道 × workload」动态生成，分四段：
   - **① 写入**：写入吞吐、索引总耗时、Merge/Refresh/Flush 耗时、索引限流时长、索引活动次数
   - **② 查询**：每 workload 一组 —— 吞吐 + **延迟分位 p50/p90/p99/p999** + **处理时间分位 p50/p90/p99**；外加错误率
   - **③ 资源与存储**：存储体积、段数、GC 耗时与次数（young/old）
   - **④ 环境健康度**（仅带 monitor 采集的赛道）：CPU steal、外来进程 CPU、换入次数
-- 3 个 **markdown**：环境说明（环境台账 + 场次体检）、**赛道导航**、看图指南
-- 36 个 **markdown 段标题**：每赛道 4 个（① 写入 ② 查询 ③ 资源与存储 ④ 环境健康度）
+
+### 哪些赛道不进看板
+
+赛道清单**从 ES 实算**（不硬编码），但有两类例外：
+
+| 例外 | 规则 | 原因 |
+|---|---|---|
+| 维度扫描档 `ds-*` | `DS_TRACK_RE` 匹配即跳过 | 已合并进 `bench-dimsweep` / `bench-dimsweep-car`，不再一页一档 |
+| 一次性对照场次 | `ONE_OFF_TRACKS` 显式列出 | 不是可复跑的赛道，是一次决策实验（详见下方注释） |
+
+`ONE_OFF_TRACKS` 当前是 `('hvtp200k-2s', 'hvtp200k-3s')` —— 2026-10-15「分片布局复测」的
+对照组（20 万条 × 1024 维，只测"2 主分片 vs 3 主分片"一个变量），结论已定稿进
+《向量场景控标技术指标-20261015.md》§五（3 主分片、吞吐阈值 ≥240 ops/s），**结论走文档不走看板**。
+不放的理由写在 `make_dashboard.py` 的 `ONE_OFF_TRACKS` 注释里（无 RACES.md 记账 → `valid` 为 null
+被闸门挡掉；按 task 过滤后每张面板只剩 1 个数据点、1d 桶粒度下连仅有的 2 点也并进同一日桶；
+`shards`/`clients`/`bulk_size`/`corpus`/`dims` 因无 sidecar 全为 null，读者无法验证两场同口径）。
+
+### 面板清单（机读生成）
+
+`panel-manifest.py` 从**实际导入 Kibana 的 saved objects** 反解出《KIBANA 看板面板清单》
+（每个图的标题 / saved object id / 过滤串 / 分线字段 / 聚合 / 数字格式 / 桶粒度）——
+清单是看板的地面真相，手写一次就漂一次：
+
+```bash
+python3 panel-manifest.py --in kibana-objects.ndjson --out 看板面板清单.md \
+        --source-note "结果入库/exports/<tag>/kibana-objects.ndjson"
+```
+
+只读 ndjson、**不连 Kibana** —— 产物即"这次导入到底建了什么"。改看板后要重新生成。
 
 ### 为什么按赛道拆看板
 
