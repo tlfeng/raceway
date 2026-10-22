@@ -6,7 +6,7 @@
   ssh root@<压测机> 'python3 - <campaigns 目录>' < scripts/car-compare.py < campaign 目录... --a kona25 --b jdk25
 
 说明: A 车（--a）与 B 车（--b）按 campaign×track 分组，给出逐轮实测、中位、差百分比，
-      并附每车轮间极差（dispersion）——本环境 5.5 倍超分，极差是判"差异是否可信"的第一道证据。
+      并附每车轮次间极差（dispersion）——本环境 5.5 倍超分，极差是判"差异是否可信"的第一道证据。
 """
 import glob
 import json

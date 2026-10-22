@@ -17,11 +17,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    car_label_mod = importlib.import_module('car_label')
+    identity_mod = importlib.import_module('identity')
 except ImportError:                                                    # 从别处 import 本文件时
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    car_label_mod = importlib.import_module('car_label')
-car_of = car_label_mod.car_of      # 文档里的车身份（兼容改名前的文档）
+    identity_mod = importlib.import_module('identity')
+car_of = identity_mod.car_of       # 车代号（user_tags.car；旧载荷顶层 car/arm 也读）
 
 DETAIL_CAMP = None   # 由 --campaign 推断
 KEEP_STAT = {"median", "min", "max", "p50", "p90", "p99", "p100", "value"}

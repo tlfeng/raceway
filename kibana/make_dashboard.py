@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 生成 Kibana Saved Objects 导入包(kibana-objects.ndjson), 模仿 opensearch.org/benchmarks:
-  * 每图一个指标族(family), series = series_key(身份分线键：引擎@版本@build@JDK), x 轴 = 场次时间(@timestamp)
+  * 每图一个指标族(family), series = series_key(图例标签：引擎@版本@build@JDK), x 轴 = 场次时间(@timestamp)
   * 面板: 写入吞吐 / 索引耗时 / 查询吞吐 / 查询延迟p90 / 服务时间p99 / 错误率
          / KNN 吞吐 / 向量维度扫描 / 存储 / 段数 / GC
   * 顶部 Markdown = 环境台账(bench-env) + 固定过滤说明; 底部 = 原始层回钻路径
@@ -436,26 +436,23 @@ IDX_PHASE_SPECS = [
 
 
 def track_mixed_builds(track):
-    """该赛道是否存在「同一套配置跨多个引擎 build」的场次。
+    """该赛道的数据是否横跨多个引擎 build。
 
-    ds3 首轮是 easysearch 2.5.0-3009、ds2 是 2.5.0-3015，车标签却都是
-    jdk25/jdk26/jdk27 —— 画在同一条线上就是跨 build 混线，结论会被误读。
+    ds3 首轮是 easysearch 2.5.0-3009、ds2 是 2.5.0-3015 —— 同一条线上混着两个
+    不同 build 的点，绝对值不可直接比，结论会被误读。
 
-    现在面板统一按 series_key 分线（键自带 build），这个判断已不需要参与分组，
-    但保留成体检项：返回 True 的赛道值得在图注里点一句"该赛道跨 build 采集"。
+    现在面板统一按 series_key 分线（标签自带 build），跨 build 自动拆成多条线，
+    这个判断已不需要参与分组，但保留成体检项：返回 True 的赛道值得在图注里
+    点一句"该赛道跨 build 采集"。
     """
     try:
         r = es_post('/bench-run/_search', {
             "size": 0,
             "query": {"term": {"track": track}},
-            "aggs": {"a": {"terms": {"field": "series_key", "size": 30},
-                           "aggs": {"b": {"terms": {"field": "engine_build", "size": 10}}}}}})
+            "aggs": {"b": {"terms": {"field": "engine_build", "size": 10}}}})
     except Exception:                                       # noqa: BLE001
         return False
-    for b in (r.get("aggregations", {}).get("a", {}).get("buckets") or []):
-        if len(b.get("b", {}).get("buckets") or []) > 1:
-            return True
-    return False
+    return len((r.get("aggregations", {}).get("b", {}).get("buckets") or [])) > 1
 
 
 def track_panel_specs(track, groups, interval):
@@ -471,8 +468,6 @@ def track_panel_specs(track, groups, interval):
     #   一是车名（ez250 / jdk25@3015）看不出引擎版本与 JDK 发行版，读者没法判断两条线能不能比；
     #   二是 series_key 自带 build，跨 build 自动分线 —— 以前靠 car_build/car 二选一来避免
     #   "jdk26 车跨 3009/3015 两个 build 混成一条线"（ds3 与 ds2 两批数据就是这么混起来的）。
-    #   指标行只带这一个身份字段（run 维度一律回 bench-run 查，方案 §1 修订），
-    #   而 TSVB 的 split-by 只吃一个字段 —— 所以身份必须在 series_key 里自洽。
     split = 'series_key'
     t = 'track:%s AND quality:ok' % track
     tq = 'track:%s' % track
@@ -609,17 +604,18 @@ def env_markdown():
         md.append('')
         md.append('(bench-env 读取失败: %s)' % e)
 
-    # 口径体检：valid / 被测配置（series_key）/ 赛道
+    # 口径体检：valid / 实验车 / 赛道
     try:
         r = es_post('/bench-run/_search', {
             'size': 0,
             'aggs': {
                 'by_valid': {'terms': {'field': 'valid', 'size': 5}},
-                # series_key = 引擎@版本@build@JDK（图例文案，也是看板分线键）。
-                # 车代号不再作顶层列（身份由 engine/version/build/jdk_vendor/jdk_version
-                # 表达，方案 §1 修订）—— 想看代号回 bench-run 的 user_tags。
+                # series_key 是身份的唯一键（引擎@版本@build@JDK）——
+                # 看板按它分线，体检也按它盘点配置
                 'series': {'terms': {'field': 'series_key', 'size': 30}},
                 'by_track': {'terms': {'field': 'track', 'size': 20}},
+                # 迁移状态：没有 series_key 的场次是改名前入库、还没重灌的
+                'no_series_key': {'filter': {'bool': {'must_not': {'exists': {'field': 'series_key'}}}}},
             }})
         aggs = r['aggregations']
         total = r['hits']['total']['value']
@@ -632,9 +628,15 @@ def env_markdown():
         md.append('')
         md.append('**场次体检** — 共 %d 场（VALID %d / 非 VALID %d）' % (total, n_valid, n_invalid))
         md.append('被测配置（series_key）: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
-                                                for b in aggs['series']['buckets']))
+                                         for b in aggs['series']['buckets']))
         md.append('赛道: ' + ' · '.join('%s=%d' % (b['key'], b['doc_count'])
                                         for b in aggs['by_track']['buckets']))
+        # 迁移状态：改名前入库的场次没有 series_key，看板按 series_key 分线时它们出不来。
+        # 出现非 0 说明还有场次没重灌（bench-pipeline.sh 重跑即可）。
+        _stale = (aggs.get('no_series_key') or {}).get('doc_count') or 0
+        if _stale:
+            md.append('⚠️ 有 %d 场还没有 series_key（改名前入库、尚未重灌）—— '
+                      '这些场次不会出现在按 series_key 分线的图里，重跑 bench-pipeline.sh 即可。' % _stale)
     except Exception as e:                                   # noqa: BLE001
         md.append('')
         md.append('(bench-run 体检读取失败: %s)' % e)
@@ -697,14 +699,14 @@ USAGE_MD = '''**看图指南**
     它吐出的时延量的是"失败响应有多快"，混进来会把引擎显得更快。
     **错误率面板是唯一的例外**，它刻意不带 quality 闸门 ——
     它就是要显示失败场次。
-- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；按引擎过滤: `series_key:es@*` / `series_key:ez@*`（**不要加引号** —— 带引号是精确短语，匹配 0 条）；限定批次: `campaign:ds3-20261015-233223`
+- 只看失败场次: 把 KQL 框改成 `valid: false` 或 `quality: degraded`；限定某套配置: `series_key: "es@8.19.23@—@openjdk27"`（配置清单见「环境说明」面板；按引擎粗筛写 `series_key: "ez@*"`）；限定批次: `campaign:ds3-20261015-233223`
 - **时延三兄弟，别混用**：
   - **引擎时延** (family=service_time) = 服务端执行时间，**跨引擎比较看这个**
   - **端到端时延** (family=latency) = 含发压机积压；开环 task（设了 target-throughput）
     饱和时会把 36ms 的引擎耗时放大成 1.4s
   - **发压机积压** (family=queue_time) = latency − service_time，看"是引擎慢还是发压机排队"
 - 每图一个 family（吞吐/延迟/服务时间/磁盘/GC…），单位已归一（时间 s、大小 GB、错误率 0~1）
-- series=series_key: `ez@2.5.0@3015@graalvm25`（easysearch 2.5.0-3015 + Oracle GraalVM 25）、`ez@2.5.0@3015@kona25`（同版本号、不同 JDK 发行版 —— 只有厂商能区分）、`es@8.19.23@—@openjdk27`
+- series=series_key: jdk25/kona25=easysearch2.5.0-3015+JDK25, ez240=easysearch2.4.0-2975, es819=ES8.19.23
 - **错误率说明**: rally 的 error_rate 本就是 0~1 比例，1.0 = 该 task 请求全失败（不要按 % 再除）
 - 原始层回钻: campaigns-local/<campaign>/results/<fid>-race.json'''
 
@@ -924,7 +926,7 @@ def es_track_facts():
         facts[b['key']] = {
             'metrics': b['doc_count'],
             'tasks': [x['key'] for x in (b.get('k') or {}).get('buckets') or []],
-            'series': [x['key'] for x in (b.get('a') or {}).get('buckets') or []],
+            'cars': [x['key'] for x in (b.get('a') or {}).get('buckets') or []],
             'lo': span.get('min'), 'hi': span.get('max'),
         }
     return facts
@@ -936,15 +938,15 @@ def es_track_runs(track):
         r = es_post('/bench-run/_search', {
             'size': 0, 'query': {'term': {'track': track}},
             'aggs': {'n': {'value_count': {'field': 'race_id'}},
-                     'series': {'terms': {'field': 'series_key', 'size': 50}},
+                     'cars': {'terms': {'field': 'series_key', 'size': 50}},
                      'span': {'stats': {'field': '@timestamp'}}}})
         a = r.get('aggregations', {})
         span = a.get('span') or {}
         return {'runs': (a.get('n') or {}).get('value', 0),
-                'series': [x['key'] for x in (a.get('series') or {}).get('buckets') or []],
+                'cars': [x['key'] for x in (a.get('cars') or {}).get('buckets') or []],
                 'lo': span.get('min'), 'hi': span.get('max')}
     except Exception:                                       # noqa: BLE001
-        return {'runs': 0, 'series': [], 'lo': None, 'hi': None}
+        return {'runs': 0, 'cars': [], 'lo': None, 'hi': None}
 
 
 def pick_interval(lo_ms, hi_ms):
@@ -1032,16 +1034,16 @@ def nav_markdown(track_info):
     md = ['**赛道导航** — 每个 esrally track 一个独立看板'
           '（对照 opensearch.org/benchmarks：HTTP logs / NYC taxis / PMC / Big5 / '
           'Vectorsearch-* … 各自独立页面，不同 workload 不混图）', '']
-    md.append('| 赛道 | 说明 | 场次 | 被测配置(series_key) | workload 分组 | 未出图面板 | 看板路径 |')
+    md.append('| 赛道 | 说明 | 场次 | 被测配置 | workload 分组 | 未出图面板 | 看板路径 |')
     md.append('|---|---|---|---|---|---|---|')
     for track, info in track_info:
         label = TRACK_LABEL.get(track, track)
-        series = ', '.join(info['series']) or '—'
+        cars = ', '.join(info['cars']) or '—'
         groups = ' / '.join(g[1] for g in info['groups']) or '—'
         nod = info.get('nodata') or []
         nodtxt = ('%d 个（%s）' % (len(nod), '、'.join(nod))) if nod else '0'
         md.append('| `%s` | %s | %d | %s | %s | %s | `/app/dashboards#/view/bench-%s` |'
-                  % (track, label, info['runs'], series, groups, nodtxt, track))
+                  % (track, label, info['runs'], cars, groups, nodtxt, track))
     md.append('')
     md.append('> **进各赛道看板**：把上表路径粘到地址栏，或左侧栏 ☰ → Analytics → '
               'Dashboard（`/app/dashboards/list`）点对应标题。')
@@ -1099,11 +1101,11 @@ def main():
         tf, tt = data_window(track)
         track_objs, dropped = build_track_dashboard(track, groups, interval, tf, tt)
         objs += track_objs
-        track_info.append((track, {'runs': runs['runs'], 'series': runs['series'],
+        track_info.append((track, {'runs': runs['runs'], 'cars': runs['cars'],
                                     'groups': groups,
                                     'nodata': [d[0] for d in dropped]}))
-        print('  track %-12s runs=%-4d series=%-28s groups=%s interval=%s 未出图面板=%d'
-              % (track, runs['runs'], ','.join(runs['series']),
+        print('  track %-12s runs=%-4d cars=%-28s groups=%s interval=%s 未出图面板=%d'
+              % (track, runs['runs'], ','.join(runs['cars']),
                  ','.join(g[0] for g in groups) or '-', interval, len(dropped)))
 
     objs.append(markdown_obj('bench-vis-head', '环境说明', env_markdown()))

@@ -181,6 +181,14 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
 declare -a CONF_LABELS CONF_PKGS
 if [ -n "${SCHEDULE_FILE:-}" ]; then
   # 排程模式：配置在排程推进时逐条注册（见主流程），此处只校验车定义文件存在
+  # 旧名兼容：排程命令里还指向 dimsweep-arms.conf 的，自动落到旧名文件上
+  if [ -n "$CARS_FILE" ] && [ ! -s "$CARS_FILE" ]; then
+    _leg="${CARS_FILE%cars.conf}arms.conf"
+    if [ "$_leg" != "$CARS_FILE" ] && [ -s "$_leg" ]; then
+      echo "提示: 车定义文件 $CARS_FILE 不存在，改用旧名 $_leg" >&2
+      CARS_FILE="$_leg"
+    fi
+  fi
   [ -s "$CARS_FILE" ] || die "排程模式需要车定义文件: CARS_FILE=$CARS_FILE"
   # CONFIGS 也必须清空：上面 else 分支留的单配置哨兵 ("") 还在，
   # 而 CONF_LABELS 是空的 → 写 PACKAGES.txt 时 "${CONF_LABELS[0]}"
@@ -654,8 +662,13 @@ env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw
 race_metric_ok() { # <fid> <w|q> —— 断言 race.json 真有非 null 的吞吐指标
   # rally rc=0 不等于有数据：写赛若整段落在 warmup 里，op_metrics 的 throughput
   # 全为 null，场会被静默判 VALID。
+  # race.json 缺失（raceId 没解析出来 / race store 没落文件）比"指标全 null"更糟
+  # —— 零机读数据 —— 同样不能放行，必须按断言失败计。
   local f="$CAMP_DIR/results/$1-$2-race.json"
-  [ -s "$f" ] || return 0
+  if [ ! -s "$f" ]; then
+    log "  警告: race.json 未落档 $1-$2，指标断言按失败计"
+    return 1
+  fi
   python3 - "$f" "$2" <<'PY' || return 1
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -882,7 +895,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   timeout "$(track_tmo_w "$tk")" "$RALLY" race --pipeline=benchmark-only \
     --target-hosts="$HOSTS" --track-path="$track" --challenge=write-only \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-    --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,arm:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
+    --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
     --report-format=markdown --report-file="$wrep" > "$wlog" 2>&1 || rc=$?
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid write race FAILED rc=$rc（尾部: $(tail -2 "$wlog" | head -1)）"
   capture_race_json "$fid" w "$wlog"
@@ -905,7 +918,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     timeout "$(track_tmo_q "$tk")" "$RALLY" race --pipeline=benchmark-only \
       --target-hosts="$HOSTS" --track-path="$track" --challenge=query-only \
       ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,arm:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
+      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
       --report-format=markdown --report-file="$qrep" > "$qlog" 2>&1 || rcq=$?
     [ $rcq -ne 0 ] && PROGSTEP "[$seq] $fid query race FAILED rc=$rcq"
     capture_race_json "$fid" q "$qlog"

@@ -18,7 +18,7 @@
 三个必须守住的口径
 ------------------
 1. **build 隔离**：jdk25@3009 跑过 ≠ jdk25@3015 跑过。跨 build 混线会让结论被
-   误读（make_dashboard 就是为此按 car_build 分线的）。覆盖判定必须带 build，
+   误读（make_dashboard 就是为此按 series_key 分线的）。覆盖判定必须带 build，
    否则"已跑过"会把不同引擎版本的数据当成同一格。
 2. **一场次两行**：写赛/查赛各一行（phase=w / q）。一场次要算"跑过"，两个相位
    都得判 VALID；只有写赛 VALID 而查赛没跑的，是**半场**，仍需重跑。
@@ -52,11 +52,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    car_label_mod = importlib.import_module('car_label')
+    identity_mod = importlib.import_module('identity')
 except ImportError:                                                    # 从别处 import 本文件时
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    car_label_mod = importlib.import_module('car_label')
-car_of = car_label_mod.car_of      # 文档里的车身份（兼容改名前的文档）
+    identity_mod = importlib.import_module('identity')
+car_of = identity_mod.car_of      # 文档里的车代号（user_tags.car）
 
 INDEX = 'bench-run'
 DEFAULT_ES_URL = 'https://127.0.0.1:9237'
@@ -69,10 +69,22 @@ PAGE_SIZE = 2000
 #   track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
 #   codec 相同，靠 codec 分不出，只能靠目录名）
 #   codec / source_reuse = 压缩与复用的两个独立维度
-_SOURCE_FIELDS = ['campaign', 'fid', 'car', 'arm', 'car_build', 'engine', 'engine_build',
+_SOURCE_FIELDS = ['campaign', 'fid', 'user_tags', 'engine', 'engine_build',
                   'build', 'track', 'track_raw', 'round', 'status', 'quality', 'phase',
-                  '@timestamp', 'caliber_warnings', 'jdk', 'dims', 'pkg',
-                  'challenge', 'codec', 'source_reuse']
+                  '@timestamp', 'caliber_warnings', 'dims', 'pkg',
+                  'challenge', 'codec', 'source_reuse',
+                  'series_key', 'jdk_vendor', 'jdk_version']
+
+
+def row_build_key(r):
+    """一行的 build 标识：`车@build`（无 build 号的车就是车名本身，如 es819）。
+
+    索引里不再存 car_build 字段（那是「车代号」的重复编码），这里用
+    user_tags.car + engine_build 合成 —— 与旧的 car_build 字段等价。
+    """
+    car = car_of(r)
+    b = r.get('engine_build')
+    return ('%s@%s' % (car, b)) if (car and b) else (car or '')
 
 # 判定失败的状态（与 bench-queue 的 STATUS_FAILS 对齐，只取库里真会出现的）
 FAIL_STATUSES = (
@@ -378,12 +390,11 @@ class Cell:
 
     @property
     def builds(self):
-        return sorted({(r.get('car_build') or car_of(r) or '') for r in self.rows})
+        return sorted({row_build_key(r) for r in self.rows})
 
     def rows_for(self, car_build):
         """某个 build 上的行。没有 build 号的车按车名匹配。"""
-        return [r for r in self.rows
-                if (r.get('car_build') or car_of(r) or '') == car_build]
+        return [r for r in self.rows if row_build_key(r) == car_build]
 
     def verdict_for(self, car_build):
         """该 build 上的判定（最坏）。"""
@@ -504,7 +515,7 @@ def build_coverage(rows, total=None):
     cov = Coverage(total_rows=total if total is not None else len(rows))
     camps, tracks, cars = set(), set(), set()
     for r in rows:
-        car = r.get('car') or ''
+        car = car_of(r)
         track = r.get('track') or ''
         rnd = r.get('round')
         if rnd is None:
@@ -552,10 +563,10 @@ def fetch_coverage(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
 
 # ------------------------------------------------------------------ 编排用
 def expected_car_build(car, build):
-    """该车在当前 build 下的 car_build 标识。
+    """该车在当前 build 下的 build 标识（与 row_build_key 同一口径）。
 
-    easysearch 车的 car_build 是 `car@build`（如 jdk25@3015）；
-    elasticsearch 车没有 build 号，car_build 就是车名本身（如 es819）。
+    easysearch 车是 `car@build`（如 jdk25@3015）；
+    elasticsearch 车没有 build 号，就是车名本身（如 es819）。
     """
     if not build:
         return car
