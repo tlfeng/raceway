@@ -1062,6 +1062,11 @@ def main(argv=None):
             args.cars_file = (os.environ.get('RACEWAY_CARS_FILE')
                                or os.path.join(here, 'schedules', 'dimsweep-cars.conf'))
             if not os.path.isfile(args.cars_file):
+                # 旧名兼容：改名前的文件叫 dimsweep-arms.conf
+                _leg = args.cars_file.replace('cars.conf', 'arms.conf')
+                if _leg != args.cars_file and os.path.isfile(_leg):
+                    args.cars_file = _leg
+            if not os.path.isfile(args.cars_file):
                 raise SystemExit(
                     '找不到车定义文件: %s\n'
                     '车定义属内部资料，未随公共库公开 —— 用 --cars-file 指定路径，'

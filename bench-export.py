@@ -84,32 +84,6 @@ CANON_UNITS = ("s", "ms", "ops/s", "docs/s", "pages/s", "MB/s", "GB", "MB", "byt
                "count", "ratio", "percent", "text", "")
 CANON_QUALITY = ("ok", "degraded", "unknown")
 CANON_LATENCY_MODE = ("open_loop", "closed_loop", "unknown")
-# ---------------------------------------------------------------------------
-# bench-metric 的字段白名单（方案 §1 修订「物化只给看板真正查得到的字段」+ §3.3）
-#
-# 指标行只保留三类东西：
-#   ① 指标事实：family / metric / stat / value / unit / 原值备查 / direction；
-#   ② 口径契约：quality / latency_mode / backlog_ratio（面板闸门要用）；
-#   ③ 看板真正用得到的维度：track（按赛道拆看板）、series_key（身份分线键）、
-#      valid（看板级闸门）、campaign（批次过滤）。
-# run 维度（车代号 / engine / version / build / JDK / dims / segment_form / env_id /
-# round / phase / codec / knn_params…）一律回 bench-run 查 —— 指标行上带一份只是重复：
-# 既白付体积（每行 20+ 个身份字段，7.9 万行就是几十 MB），又多一份漂移面。
-# 白名单是**导出期硬约束**：越界即判失败，脏载荷不进库（与 stat/unit 词表同级）。
-# ---------------------------------------------------------------------------
-METRIC_FIELDS = frozenset((
-    "_index", "_id",
-    "race_id", "@timestamp", "task", "operation", "family", "metric", "stat",
-    "value", "unit", "value_original", "unit_original", "value_text", "direction",
-    "quality", "latency_mode", "backlog_ratio",
-    "track", "series_key", "valid", "campaign",
-    "fid", "node",
-    # phase 只出现在 monitor 采样行上：那一行采自赛程的哪个相位（w/m/q），
-    # 它不是场次维度的重复（场次相位回 bench-run 查）
-    "phase",
-))
-METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
-                             "direction", "track", "series_key"))
 # 兜底别名（同一块里归一后撞名时用）：非致命，但必须在 manifest 里可见
 _STAT_ALIAS_RE = re.compile(r"^(?:value|mean|p50|p90|p99|p999|p9999|p100|min|max)_raw\d*$")
 STAT_MAP = {"50_0": "p50", "median": "p50", "90_0": "p90", "99_0": "p99",
@@ -243,45 +217,32 @@ def fid_of(d):
 # JDK 发行版（jdk25 车是 Oracle GraalVM 25，kona25 车是 Tencent Kona 25，
 # 两者主版本号都是 25，车名区分得开但看不出是两种发行版）。
 #
-# 标签口径（2026-10-21 sam 确认）：引擎名@版本号@build号@JDK名
+# 系列键口径（2026-10-21 sam 确认）：引擎名@版本号@build号@JDK名
 #   ez@2.4.0@2975@graalvm21     ez@2.5.0@3015@graalvm25
 #   ez@2.5.0@3015@kona25        es@8.19.23@—@openjdk27
-# 口径代码在 car_label.py（唯一来源），这里只做引用 —— 别在这里另写一份。
+# 口径代码在 identity.py（唯一来源），这里只做引用 —— 别在这里另写一份。
+#
+# 身份维度正交拆列（2026-10-21 sam 确认）：engine / version / engine_build /
+# jdk_vendor / jdk_version / series_key。索引里不再存 car / car_build / car_label /
+# arm* —— 那些都是「车代号」的重复编码，车代号只留在 user_tags.car。
+# jdk_vendor 必须单列：GraalVM 25 与 Kona 25 的完整版本号都是 25.0.4，
+# 只有厂商能区分，而 JDK 厂商对比正是本项目要回答的问题。
 
 try:
-    car_label_mod = importlib.import_module('car_label')
+    identity_mod = importlib.import_module('identity')
 except ImportError:                                                    # 从别处 import 本文件时
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    car_label_mod = importlib.import_module('car_label')
-CAR_FALLBACK = car_label_mod.CAR_FALLBACK
-BUILD_UNKNOWN = car_label_mod.BUILD_UNKNOWN
-ENGINE_SHORT = car_label_mod.ENGINE_SHORT
-JDK_VENDOR_PREFIX = car_label_mod.JDK_VENDOR_PREFIX
-car_label_of = car_label_mod.car_label_of
-jdk_short_of = car_label_mod.jdk_short_of
-jdk_vm_of = car_label_mod.jdk_vm_of
-
-
-def jdk_identity(side):
-    """sidecar → (jdk_vendor, jdk_version)：**只认实测，查不到就空**（方案 §3.2）
-
-    厂商与版本号必须成对看：GraalVM 25.0.4 与 TencentKonaJDK 25.0.4 的**版本号完全一样**
-    （实测两侧都是 25.0.4），只有厂商能区分 —— 而 JDK 厂商对比正是本项目的核心测试目标。
-
-    版本号为什么不能从车代号推：代号 jdk25 可能是 25.0.4 也可能是 25.0.5，
-    不知道就是不知道，不猜 —— 没有 sidecar 的早期批次这一列就是空的。
-    厂商取不到实测值时退回 sidecar 声明值（want.vendor，来自 java -version 厂商字串）。
-    """
-    j = (side or {}).get("jdk") or {}
-    vendor = None
-    for n in (j.get("per_node") or []):
-        if n.get("vendor_detected"):
-            vendor = n["vendor_detected"]
-            break
-    if not vendor:
-        vendor = (j.get("want") or {}).get("vendor")
-    versions = sorted({str(x) for x in (j.get("measured_nodes") or []) if x})
-    return vendor, (",".join(versions) if versions else None)
+    identity_mod = importlib.import_module('identity')
+CAR_FALLBACK = identity_mod.CAR_FALLBACK
+BUILD_UNKNOWN = identity_mod.BUILD_UNKNOWN
+ENGINE_SHORT = identity_mod.ENGINE_SHORT
+JDK_VENDOR_PREFIX = identity_mod.JDK_VENDOR_PREFIX
+series_key_of = identity_mod.series_key_of
+jdk_short_of = identity_mod.jdk_short_of
+jdk_vm_of = identity_mod.jdk_vm_of
+jdk_vendor_of = identity_mod.jdk_vendor_of
+jdk_major_of = identity_mod.jdk_major_of
+jdk_version_of = identity_mod.jdk_version_of
 
 
 # ---------------------------------------------------------------- 环境台账派生 (方案 §3.1)
@@ -416,9 +377,10 @@ def parse_deploy_logs(camp_dir):
 
 
 def parse_jdk_files(camp_dir):
-    """campaign/logs/jdk-<车>.txt 里的 java -version → {车: (vendor, major)}。
+    """campaign/logs/jdk-<车>.txt 里的 java -version → {车: {vendor, major, version}}。
 
     没有 sidecar 的批次靠它拿 JDK 身份（实测原文，不是从车名猜）。
+    version 是**完整**版本号（25.0.4 / 26.0.2.1 / 21.0.9），major 只取第一段。
     """
     out = {}
     for p in glob.glob(os.path.join(camp_dir, "logs", "jdk-*.txt")):
@@ -434,12 +396,11 @@ def parse_jdk_files(camp_dir):
             vendor = "GraalVM"
         elif "OpenJDK" in txt or "openjdk" in txt:
             vendor = "OpenJDK"
-        major = None
-        mm = re.search(r'(?:java version|openjdk version)\s+"([0-9]+)', txt)
-        if mm:
-            major = mm.group(1)
+        mm = re.search(r'(?:java version|openjdk version)\s+"([0-9][0-9.]*)', txt)
+        version = mm.group(1) if mm else None
+        major = version.split(".")[0] if version else None
         if vendor and major:
-            out[car] = (vendor, major)
+            out[car] = {"vendor": vendor, "major": major, "version": version}
     return out
 
 
@@ -766,23 +727,6 @@ def validate_payload(runs, metrics):
     if aliases:
         warnings.append("stat 归一后撞名，已用兜底别名区分（%d 行）: %s"
                         % (sum(aliases.values()), sorted(aliases)))
-    # ---- 字段白名单（方案 §1 修订）----
-    # run 维度回流到指标行 = 精简前功亏一篑：体积白付 + 多一份漂移面。
-    # 越界即判失败 —— 与 stat/unit 词表同级，都是"导出期就拦住脏载荷"。
-    extra_hits, missing_hits = {}, {}
-    for m in metrics:
-        extra = set(m.keys()) - METRIC_FIELDS
-        if extra:
-            k = ",".join(sorted(extra))
-            extra_hits[k] = extra_hits.get(k, 0) + 1
-        miss = METRIC_REQUIRED - set(m.keys())
-        if miss:
-            k = ",".join(sorted(miss))
-            missing_hits[k] = missing_hits.get(k, 0) + 1
-    for k, v in sorted(extra_hits.items()):
-        problems.append("bench-metric 行出现白名单外字段（run 维度回流?）: %s × %d 行" % (k, v))
-    for k, v in sorted(missing_hits.items()):
-        problems.append("bench-metric 行缺必填字段 %s: %d 行" % (k, v))
     # 同一 (场次, task) 的所有行 quality 必须一致
     # 注意必须用复合键：task 名在不同场次之间会重名（index-append 每个场次都有），
     # 只按 task 分组会把不同场次的质量标记混在一起比。
@@ -871,20 +815,34 @@ def main():
         seen_side = list(meta.get("sidecar", {}).values()) + list(meta.get("sidecar_by_race", {}).values())
         for s in seen_side:
             car = (s.get("run") or {}).get("car")
-            if not car or car in car_identity:
+            if not car:
                 continue
             se = s.get("engine") or {}
             base_pkg = os.path.basename(se.get("pkg") or "")
             eng = ("elasticsearch" if base_pkg.startswith("elasticsearch")
                    else "easysearch" if base_pkg.startswith("easysearch") else None)
             vm = se.get("version_measured_nodes") or []
+            jdk_nodes = (s.get("jdk") or {}).get("measured_nodes") or []
+            # 只取**实测**厂商（不走车代号兜底）—— 这一份是"同车其他场次实测"的凭据
+            _vm = jdk_vm_of(s.get("jdk") or {})
             if eng:
-                car_identity[car] = {
+                ident = {
                     "engine": eng, "pkg": se.get("pkg"),
                     "pkg_sha256": se.get("pkg_sha256"),
                     "version": vm[0] if vm else se.get("version_from_pkg"),
                     "build": re.sub(r"-linux.*$", "", se.get("pkg") or "") or None,
+                    "jdk_vendor": _vm[0] if _vm else None,
+                    "jdk_version": ",".join(sorted({str(x) for x in jdk_nodes})) or None,
                 }
+                # 车代号在整个测试期对应同一份包与同一个 JDK —— 但先到的那份 sidecar
+                # 可能没带 JDK 实测（早期批次）。已有实测身份时不要用后来的空值覆盖。
+                if car not in car_identity:
+                    car_identity[car] = ident
+                else:
+                    old = car_identity[car]
+                    for _k in ("jdk_vendor", "jdk_version"):
+                        if not old.get(_k) and ident.get(_k):
+                            old[_k] = ident[_k]
 
     envs, runs, metrics = {}, [], []
     counters = {}          # 导出期统计（口径来源分布等），进 manifest
@@ -893,11 +851,9 @@ def main():
     fid_valid = {}          # fid → 场次有效性；system 行靠它回填 valid（否则被 KQL 过滤）
     fid_quality = {}        # fid → 场次级 quality；system 行同样要带 quality，
                             #   否则看板上 quality:ok 的闸门会把整个环境健康度段落过滤空
-    fid_car = {}            # fid → 车代号（只作溯源用，不再进指标行）
-    fid_car_build = {}      # fid → 车@build（同上）
-    fid_series = {}         # fid → 分线键；system 行靠它回填（否则按 series 分线的
-                            # 环境健康度面板分不出桶 → 空面板）
-    fid_race = {}           # fid → race_id；system 行靠它回填外键（回钻得到具体场次）
+    fid_series_key = {}       # fid → 系列键（引擎@版本@build@JDK）；system 行也要回填，
+                            #   否则按 series_key 分线的 system 类面板（外来进程 CPU /
+                            #   换入次数…）分不出桶 → 空面板
     seen = set()
     unmatched = 0
     skipped_no_campaign = 0
@@ -1002,17 +958,27 @@ def main():
         if not build_no:
             _uv = ut.get("engine_ver") or ""
             build_no = (_uv.rsplit("-", 1)[-1] if "-" in _uv else None) or None
-        # 复合分组键：同一车的跨 build 场次（3009 与 3015）必须能分开画线，
-        # 否则看板上"jdk26"那条线里混着两个不同引擎 build 的点，结论会被误读。
-        car_build = ("%s@%s" % (car, build_no)) if (car and build_no) else car
-        # JDK 身份：sidecar 实测 → jdk-<车>.txt 的 java -version 原文 → 车兜底
-        jdk_vm = jdk_vm_of(sj, (meta.get("jdks") or {}).get(car))
-        # 分线键 / 图例标签：引擎@版本@build@JDK（car_build 只说了一半，看不出引擎版本与 JDK 发行版）。
-        # 字段名叫 series_key（方案 §3.2「系列键」）：看板按它分线，指标行只带这一个身份字段。
-        series_key = car_label_of(car, engine, version, build_no, side, jdk_vm=jdk_vm)
-        # JDK 厂商与完整版本号分列（方案 §3.2）：GraalVM 25.0.4 与 TencentKonaJDK 25.0.4
-        # 的版本号**一模一样**，只有厂商能区分 —— 而 JDK 厂商对比正是本项目的核心测试目标。
-        jdk_vendor, jdk_version = jdk_identity(side)
+        # ---- JDK 身份：实测优先，逐级降级（identity.py 口径）----
+        # ① sidecar 本场实测（vendor_detected + measured_nodes）
+        # ② campaign/logs/jdk-<车>.txt 的 java -version 原文
+        # ③ 同一辆车的其他场次实测（ident）
+        # ④ 车代号兜底表（CAR_FALLBACK）
+        # jdk_vendor 与 jdk_version 分开存：GraalVM 25 与 Kona 25 的完整版本号
+        # 都是 25.0.4，只有厂商能分 —— 而 JDK 厂商对比正是本项目要回答的问题。
+        jdk_file = (meta.get("jdks") or {}).get(car)
+        jdk_vm = jdk_vm_of(sj, jdk_file)
+        jdk_vendor = jdk_vendor_of(side, car, jdk_vm=jdk_vm, jdk_file=jdk_file)
+        jdk_major = jdk_major_of(side, car, jdk_vm=jdk_vm, jdk_file=jdk_file)
+        jdk_version = jdk_version_of(side, jdk_file=jdk_file)
+        if not jdk_vendor:
+            jdk_vendor = ident.get("jdk_vendor")
+        if not jdk_version:
+            jdk_version = ident.get("jdk_version")
+        if not jdk_major:
+            jdk_major = (str(jdk_version).split(".")[0] if jdk_version else None)
+        # 系列键（看板分线键 + 图例文案）：引擎@版本@build@JDK
+        # JDK 段查不到时按车代号写 unk-<车>，避免未实测的车塌成同一条 "?"
+        series_key = series_key_of(engine, version, build_no, jdk_vendor, jdk_major, car=car)
         heap_max = srp.get("heap_max_measured_mb") or []
         heap_gb = round(max(heap_max) / 1024, 2) if heap_max else None
         tp = d.get("track-params") or {}
@@ -1045,24 +1011,25 @@ def main():
         write_degraded = any(is_write_task(t) for t in degraded_tasks)
         race_row_quality = "degraded" if write_degraded else "ok"
 
-        # ---- 指标行（bench-metric）的字段集：只留「指标事实 + 口径契约 + 看板
-        # 真正用得到的维度」（方案 §1 修订 + §3.3）----
-        # run 维度（car/engine/version/build/JDK/dims/segment_form/env_id/round/phase/
-        # codec/knn_params…）在指标行上与 bench-run 完全重复：既白付体积（每行 20+
-        # 个身份字段，7.9 万行就是几十 MB），又多一份漂移面（bench-run 改了，指标行
-        # 里的旧值还在）。
-        # 核依据：269 个面板的 KQL 实测，指标行上被用作 run 维度过滤的只有
-        # valid（29 处）与 campaign（1 处），engine / version / jdk / dims /
-        # segment_form / env_id / round / phase 一次都没用；
-        # 要按引擎过滤写 series_key:ez@* 前缀匹配即可（**不要加引号**：带引号是精确短语）。
-        # series_key = 引擎@版本@build@JDK（car_label.py 的图例口径，方案 §3.2）：
-        # 看板的 split-by 只吃一个字段，身份必须在键里自洽 —— build 与 JDK 发行版
-        # 都在键里，跨 build、跨 JDK 厂商天然分开画线。
-        common = {"race_id": race_id, "campaign": camp, "series_key": series_key,
+        # ---- common = 场次级 + 指标行共用的维度 ----
+        # 身份维度只在 bench-run 存全套（engine/version/engine_build/jdk_vendor/
+        # jdk_version/series_key）；bench-metric 只带 series_key（看板分线的唯一依赖）。
+        # 车代号（car/arm/car_build/car_label）不再入库 —— 那是「车代号」的重复编码，
+        # 车代号只留在 user_tags.car，身份靠上面六个正交字段表达。
+        common = {"race_id": race_id, "campaign": camp,
+                  # series_key：看板分线键 + 图例文案（引擎@版本@build@JDK）
+                  "series_key": series_key,
+                  # 实验变量：这一场测的是什么（向量维度 / codec / 段形态）
+                  "dims": dims, "lineage": lineage, "segment_form": segment_form,
+                  "codec": codec_of(d, side),
+                  "source_reuse": source_reuse_of(d, side),
                   "quality": race_row_quality,
-                  # track 必须留在指标行：按赛道拆看板要求每行都带归一化后的赛道名
-                  "track": tr,
-                  "valid": (status == "VALID") if status else None}
+                  "knn_params": knn_params_of(side),
+                  # track 必须进 common：bench-metric 的指标行没有它就没法按赛道过滤，
+                  # 而按赛道拆看板要求每个指标行都带归一化后的赛道名
+                  "track": tr, "track_raw": d.get("track"), "phase": phase, "round": rnd,
+                  "challenge": d.get("challenge"), "env_id": side.get("env", {}).get("env_id"),
+                  "valid": (status == "VALID") if status else None, "status": status}
         fid_track[fid] = tr
         # fid → 场次时间：monitors 补的 system 行本身没有 @timestamp（它是按场次
         # 采集的摘要，不是时间序列），不回填时间戳的话 CPU steal 这类
@@ -1072,18 +1039,15 @@ def main():
         # 查询框整体过滤掉，CPU steal 这类面板就全空。
         fid_valid.setdefault(fid, (status == "VALID") if status else None)
         fid_quality.setdefault(fid, race_row_quality)
-        fid_car.setdefault(fid, car)
-        fid_car_build.setdefault(fid, car_build)
-        fid_series.setdefault(fid, series_key)
-        fid_race.setdefault(fid, race_id)
+        fid_series_key.setdefault(fid, series_key)
         runs.append({"_index": "bench-run", "_id": race_id, "race_id": race_id, "@timestamp": ts,
-                     "campaign": camp, "fid": fid, "engine": engine,
+                     "campaign": camp, "fid": fid,
+                     # ---- 身份维度（正交，唯一事实源在本索引）----
+                     "engine": engine,
                      "version": str(version) if version is not None else None, "build": build,
                      "engine_build": build_no,
-                     # 身份三件套 + 系列键（方案 §3.2）：车代号不再作顶层 typed 列 ——
-                     # 它只是编排时起的名字，身份由 engine / version / engine_build /
-                     # jdk_vendor / jdk_version 完整表达；车代号留在 user_tags 里便于回溯。
                      "jdk_vendor": jdk_vendor, "jdk_version": jdk_version,
+                     # series_key：看板分线键 + 图例文案（引擎@版本@build@JDK）
                      "series_key": series_key,
                      "heap_gb": heap_gb,
                      "dims": dims, "lineage": lineage, "segment_form": segment_form,
@@ -1094,7 +1058,7 @@ def main():
                      "environment": d.get("environment"), "user_tags": ut,
                      "track_params": d.get("track-params"),
                      # rally_car = Rally 自己的 car（客户端插件列表，如 ["external"]）——
-                     # 跟本项目的「车」（一套被测配置）不是一回事，单独存，别混进 car。
+                     # 跟本项目的「车」（一套被测配置）不是一回事，单独存。
                      "rally_car": d.get("car"),
                      "cluster": d.get("cluster"),
                      "version_from_pkg": (side.get("engine") or {}).get("version_from_pkg"),
@@ -1187,9 +1151,8 @@ def main():
                     sysrows += 1
                     metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                     "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
-                                    "race_id": fid_race.get(fid),
-                                    "series_key": fid_series.get(fid),
                                     "valid": fid_valid.get(fid),
+                                    "series_key": fid_series_key.get(fid),
                                     "quality": fid_quality.get(fid) or "ok",
                                     "phase": ph, "track": fid_track.get(fid),
                                     "family": "system", "metric": mk, "stat": "value",
@@ -1199,10 +1162,9 @@ def main():
                 sysrows += 1
                 metrics.append({"_index": "bench-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
                                 "@timestamp": fid_ts.get(fid), "campaign": camp, "fid": fid, "node": node,
-                                    "race_id": fid_race.get(fid),
-                                    "series_key": fid_series.get(fid),
-                                    "valid": fid_valid.get(fid),
-                                    "quality": fid_quality.get(fid) or "ok",
+                                "valid": fid_valid.get(fid),
+                                "series_key": fid_series_key.get(fid),
+                                "quality": fid_quality.get(fid) or "ok",
                                 "phase": ph, "track": fid_track.get(fid),
                                 "family": "system", "metric": mk, "stat": "value",
                                 "value": (mv / 100.0 if unit_of(mk) == "ratio" else mv),
@@ -1226,6 +1188,15 @@ def main():
     for w in warnings:
         print("   提示: %s" % w)
 
+    with open(os.path.join(args.out, "bench-run.jsonl"), "w", encoding="utf-8") as f:
+        for r in runs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with open(os.path.join(args.out, "bench-metric.jsonl"), "w", encoding="utf-8") as f:
+        for r in metrics:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with open(os.path.join(args.out, "bench-env.jsonl"), "w", encoding="utf-8") as f:
+        for r in envs.values():
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
     TPL = {"index_patterns": ["%s"], "template": {"settings": {"number_of_shards": 1,
              "number_of_replicas": 0}, "mappings": {
         "dynamic_templates": [
@@ -1248,12 +1219,16 @@ def main():
                        "heap_gb": {"type": "double"}, "vcpu": {"type": "integer"},
                        "mem_gb": {"type": "double"},
                        "lineage": {"type": "keyword"}, "segment_form": {"type": "keyword"},
+                       # ---- 身份维度（正交，2026-10-21 修订）----
                        "engine": {"type": "keyword"}, "version": {"type": "keyword"},
                        "engine_build": {"type": "keyword"},
-                       # 身份三件套 + 系列键（方案 §3.2）：车代号不再作顶层 typed 列，
-                       # 身份由 engine/version/engine_build/jdk_vendor/jdk_version 表达，
-                       # 看板分线键是 series_key（TSVB split-by 只吃一个字段）
-                       "jdk_vendor": {"type": "keyword"}, "jdk_version": {"type": "keyword"},
+                       # jdk_vendor：JDK 厂商（GraalVM/TencentKonaJDK/OpenJDK）——
+                       #   必须单列：GraalVM 25 与 Kona 25 的完整版本号都是 25.0.4，
+                       #   只有厂商能分，而 JDK 厂商对比正是本项目的核心测试目标。
+                       "jdk_vendor": {"type": "keyword"},
+                       # jdk_version：JDK 完整版本号（25.0.4 / 26.0.2.1），只认实测
+                       "jdk_version": {"type": "keyword"},
+                       # series_key：看板分线键 + 图例文案（引擎@版本@build@JDK）
                        "series_key": {"type": "keyword"},
                        # rally_car：Rally 自己的 car（客户端插件列表，如 ["external"]），
                        # 与本项目的「车」（一套被测配置）不是一回事，单独一个字段
@@ -1282,63 +1257,11 @@ def main():
                            "name": {"type": "keyword"}, "docs": {"type": "long"},
                            "spec_hash": {"type": "keyword"}}},
                        "disk_type": {"type": "keyword"}, "disk_path": {"type": "keyword"}}}}}
-    # bench-metric：独立模板 + dynamic strict（方案 §3.3）
-    # 指标行是**契约表**：字段集 = METRIC_FIELDS 白名单。白名单外的字段（run 维度回流）
-    # 在 ES 侧直接拒收 —— 精简靠机制保证，不靠"大家都记得别加"这种口头约定。
-    # 注意：改了字段集必须 bench-apply.py --drop 重建索引，旧 mapping 不会自动更新。
-    TPL_METRIC = {"index_patterns": ["bench-metric"], "template": {"settings": {
-                   "number_of_shards": 1, "number_of_replicas": 0},
-                   "mappings": {"dynamic": "strict", "properties": {
-                       "@timestamp": {"type": "date",
-                                     "format": "strict_date_optional_time||epoch_millis"},
-                       "race_id": {"type": "keyword"},
-                       "task": {"type": "keyword"}, "operation": {"type": "keyword"},
-                       "family": {"type": "keyword"}, "metric": {"type": "keyword"},
-                       "stat": {"type": "keyword"}, "unit": {"type": "keyword"},
-                       "direction": {"type": "keyword"},
-                       "value": {"type": "double"}, "value_original": {"type": "double"},
-                       "unit_original": {"type": "keyword"},
-                       "value_text": {"type": "keyword"},
-                       # 口径契约：quality 是面板闸门（degraded 行不能混进延迟曲线），
-                       # latency_mode / backlog_ratio 解释 latency 的口径
-                       "quality": {"type": "keyword"},
-                       "latency_mode": {"type": "keyword"},
-                       "backlog_ratio": {"type": "double"},
-                       # 看板维度：赛道（按赛道拆看板）、身份分线键、场次/批次过滤
-                       "track": {"type": "keyword"}, "series_key": {"type": "keyword"},
-                       "valid": {"type": "boolean"}, "campaign": {"type": "keyword"},
-                       # monitor 采样行专用：场次标识 / 节点 / 采样相位
-                       "fid": {"type": "keyword"}, "node": {"type": "keyword"},
-                       "phase": {"type": "keyword"}}}}}
     templates = {idx: json.loads(json.dumps(TPL).replace("%s", idx))
-                 for idx in ("bench-env", "bench-run")}
-    templates["bench-metric"] = TPL_METRIC
-    # 自检：strict 模板必须覆盖指标行的**全部文档字段** ——
-    # 漏声明一个字段，ES 侧会整批拒收（strict_dynamic_mapping_exception）：
-    # 载荷看着正常、库里却少几万行（实测漏 unit_original → 7.9 万行只进 2442 行）。
-    # 这种错不能留到入库时才发现 —— 这里先验后写。
-    _doc_fields = {k for m in metrics for k in m} - {"_index", "_id"}
-    _missing = sorted(_doc_fields - set(TPL_METRIC["template"]["mappings"]["properties"]))
-    if _missing:
-        print("!! bench-metric strict 模板漏声明字段（入库会被整批拒收）: %s" % ", ".join(_missing))
-        return 2
+                 for idx in ("bench-env", "bench-run", "bench-metric")}
     with open(os.path.join(args.out, "templates.json"), "w", encoding="utf-8") as f:
         json.dump(templates, f, ensure_ascii=False, indent=1)
 
-    with open(os.path.join(args.out, "bench-run.jsonl"), "w", encoding="utf-8") as f:
-        for r in runs:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    with open(os.path.join(args.out, "bench-metric.jsonl"), "w", encoding="utf-8") as f:
-        for r in metrics:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    with open(os.path.join(args.out, "bench-env.jsonl"), "w", encoding="utf-8") as f:
-        for r in envs.values():
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    # 系列键分布（看板分线口径的体检：几个系列、每系列多少场次）
-    series_runs = {}
-    for r in runs:
-        series_runs.setdefault(r.get("series_key"), []).append(r.get("fid"))
     with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"generated_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "races_scanned": len(seen), "bench_run": len(runs), "bench_metric": len(metrics),
@@ -1351,11 +1274,6 @@ def main():
                    "assertions": {"status": "pass" if not problems else "fail",
                                   "problems": problems, "warnings": warnings},
                    "coverage": cover,
-                   # 字段口径：bench-metric 的白名单与实测字段集（对照用）
-                   "metric_fields": {"allowed": sorted(METRIC_FIELDS),
-                                     "required": sorted(METRIC_REQUIRED),
-                                     "used": sorted({k for m in metrics for k in m})},
-                   "series_keys": {str(k): len(v) for k, v in sorted(series_runs.items(), key=str)},
                    "latency_mode_source": {k: v for k, v in (counters or {}).items()
                                            if k.startswith("latency_mode_")}},
                   f, ensure_ascii=False, indent=1)

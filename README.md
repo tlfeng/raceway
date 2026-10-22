@@ -2,7 +2,7 @@
 
 搜索引擎性能编排（easysearch / elasticsearch × esrally，2~N 节点，拓扑取自 ibs ip.txt）：**配置文件排程、轮内配对交错、卡点链、sidecar 元数据、ES 入库**。一次跑分在 esrally 语境里叫 a race——本工具就是排这些 race 的赛场。
 
-> 命名与生态：配置是车手，轮次是圈速，卡点是赛会检查，campaign 是一场大奖赛。
+> 命名与生态：配置是车，轮次是圈速，卡点是赛会检查，campaign 是一场大奖赛。
 
 ## 特性
 
