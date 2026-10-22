@@ -23,6 +23,7 @@ import base64
 import datetime
 import json
 import os
+import re
 import ssl
 import uuid
 from urllib import request as urlreq
@@ -905,6 +906,459 @@ def build_track_dashboard(track, groups, interval, time_from, time_to):
     return objs, dropped
 
 
+# ---------------------------------------------------------------- 维度扫描（合并看板）
+#
+# 为什么把 6 块 ds-* 板合并成 2 块：
+#   原来一页 = 一个**维度档**（ds-j512 / ds-j768 / ds-j1024 / ds-j2048 /
+#   ds-g960 / ds-g1920），但读者真正要对比的是**两个轴**：
+#     ① 维度轴（512 → 2048，量维度成本）
+#     ② 车轴（JDK 25/26/27 + ES 8.19.23，量谁强）
+#   ds-j1024 那块板把两件事缠在一起 —— 它既是维度曲线上的一个点，又是 7 辆车的
+#   横向战场（36 场里有 7 个 series_key）。改成 **一页 = 一个对比轴**：
+#     bench-dimsweep      维度曲线（横轴是维度）
+#     bench-dimsweep-car  车对比（固定维度，换车）
+#
+# 两套语料（血统）必须分面，绝不混进同一条曲线：
+#   j 系 = msmarco-jina（512/768 截断派生、1024 真实、2048 tile 扩展）
+#   g 系 = ann-benchmarks gist-960-euclidean（960 真实、1920 tile 扩展）
+#   绝对吞吐跨血统不可比（语料、向量稀疏度、维度分布都不同），
+#   而且两系的档位在维度轴上是**交错**的（512/768/960/1024/1920/2048），
+#   画在一起必然诱导出"960 vs 1024 是维度差"的错误读数。
+DS_TRACK_RE = re.compile(r'^ds-([a-z])(\d+)$')
+
+LINEAGE_LABEL = {
+    'j': 'jina 系 · msmarco-jina（官方 esrally 语料 1M 子集）',
+    'g': 'GIST 系 · ann-benchmarks gist-960-euclidean（1M × 960 维，官方真值）',
+}
+LINEAGE_SHORT = {'j': 'jina 系', 'g': 'GIST 系'}
+
+# 档位性质（方案 §三「数据集设计」）：
+#   真实 = 该维度有真实语料；截断 = Matryoshka 截断派生；tile = 保序维度扩展
+# 表里只放**短标签**（长说明会把 14 列表格挤到换行），全称见表下的图例。
+TIER_NOTE = {
+    512: '截断', 768: '截断', 960: '真实', 1024: '真实',
+    1920: 'tile 扩展', 2048: 'tile 扩展',
+}
+TIER_LEGEND = ('| 性质 | 全称 | 含义 |\n|---|---|---|\n'
+               '| 真实 | 真实语料 | 该维度就是语料原生维度（j1024 / gist-960） |\n'
+               '| 截断 | Matryoshka 截断派生 | jina 1024 截断到低维 + L2 重归一，'
+               '真值同基维 |\n'
+               '| tile 扩展 | 保序维度扩展 | normalize([v|v])，相似度矩阵恒等基维 —— '
+               '只度量维度成本，不是更高维的真实语料 |')
+
+# 维度对照表的 9 个指标：列名 → (family 过滤, 聚合口径, 单位)
+DS_TABLE_SPECS = [
+    ('write', '写入吞吐', 'family:throughput AND unit:"docs/s" AND stat:p50 AND quality:ok', 'docs/s', 1),
+    ('k10', 'k10 吞吐', 'family:throughput AND unit:"ops/s" AND stat:p50 AND task:knn-search-10-100 AND quality:ok', 'ops/s', 1),
+    ('k100', 'k100 吞吐', 'family:throughput AND unit:"ops/s" AND stat:p50 AND task:knn-search-100-1000 AND quality:ok', 'ops/s', 1),
+    ('k32', '32 并发稳态', 'family:throughput AND unit:"ops/s" AND stat:p50 AND task:knn-search-100-1000-x32 AND quality:ok', 'ops/s', 1),
+    ('p50', 'k10 引擎时延 p50', 'family:service_time AND stat:p50 AND task:knn-search-10-100 AND quality:ok', 'ms', 1000),
+    ('p99', 'k10 引擎时延 p99', 'family:service_time AND stat:p99 AND task:knn-search-10-100 AND quality:ok', 'ms', 1000),
+    ('disk', '存储占用', 'family:disk AND metric:store_size AND unit:GB AND quality:ok', 'GB', 1),
+    ('r10', 'Recall@10', 'family:recall AND stat:mean AND task:knn-search-10-100 AND quality:ok', '', 1),
+    ('r100', 'Recall@100', 'family:recall AND stat:mean AND task:knn-search-100-1000 AND quality:ok', '', 1),
+]
+
+# 一次性对照赛道：**不进看板**（2026-10-22 定）
+#   hvtp200k-2s / hvtp200k-3s —— 「分片布局复测」的对照组，20 万条 × 1024 维，
+#   只跑 1 组（ez 2.5.0-3009 / 8 核绑核），只测「2 主分片 vs 3 主分片」一个变量。
+#   结论已写进《向量场景控标技术指标-20261015.md》§五：条款定稿为 3 主分片、
+#   重档吞吐阈值 ≥240 ops/s（3 分片实测最优 252）。
+#
+# 不放的四条理由（实测核对过，不是想当然）：
+#   ① 这两场没有 RACES.md 记账 → bench-run 的 valid 为 null，被看板级
+#      `valid: true` 整体挡掉，每块板只剩一张「未出图面板」说明表 —— 是空占位。
+#   ② 即使放出来也画不出曲线：write race 与 query race 的 task 不同（index-append
+#      vs knn-*），按 task 过滤后每张面板只剩 1 个数据点；仅有的 2 点（存储/GC/
+#      merge 那几张）两场相隔 4 分 36 秒，在 1d 桶粒度下还落进同一个日桶 → 仍是单顶点。
+#   ③ 定义这次对照的字段全是 null（无 sidecar）：shards / clients / bulk_size /
+#      corpus / dims / heap_gb —— 读者无法验证两场是同口径可比。
+#   ④ 它不是可复跑的赛道：runner 的 track_dir 没有对应分支，编排台「能看不能排」。
+#
+# 结论要展示时走文档（控标技术指标 §五），不走看板。
+ONE_OFF_TRACKS = ('hvtp200k-2s', 'hvtp200k-3s')
+
+
+def ds_lineage_tracks(facts):
+    """从赛道事实里挑出维度扫描赛道，按血统分组、组内按维度升序"""
+    out = {}
+    for track in facts:
+        m = DS_TRACK_RE.match(track)
+        if not m:
+            continue
+        out.setdefault(m.group(1), []).append((int(m.group(2)), track))
+    for lin in out:
+        out[lin].sort()
+    return out
+
+
+def ds_main_car(cars):
+    """选"维度曲线主车"：覆盖维度档最多的那辆，其次场次最多的。
+
+    为什么要有主车：同一维度档上有多辆车（3009/3015 两个 build × 多个 JDK），
+    把它们平均成一条线 = 把"维度差"和"车差"混成一个数。维度曲线必须锁死一台车，
+    车与车之间的比较交给 bench-dimsweep-car 页。
+    """
+    if not cars:
+        return None
+    return sorted(cars, key=lambda c: (-c['tracks'], -c['runs']))[0]['series_key']
+
+
+def ds_collect():
+    """一次 ES 聚合拿全维度扫描的逐档 × 逐车指标 → {(track, series_key): {...}}"""
+    aggs = {"t": {"terms": {"field": "track", "size": 60},
+                  "aggs": {"s": {"terms": {"field": "series_key", "size": 60},
+                                 # cardinality 而不是 value_count：
+                                 # 指标行是「场次 × 指标」多行，value_count 数出来是指标行数
+                                 # （512 维那档会数出 314 行，其实只有 4 场）
+                                 "aggs": {"n": {"cardinality": {"field": "race_id"}}}}}}}
+    for key, _title, filt, _unit, _mul in DS_TABLE_SPECS:
+        aggs["t"]["aggs"]["s"]["aggs"][key] = {
+            "filter": {"query_string": {"query": filt}},
+            "aggs": {"v": {"stats": {"field": "value"}}}}
+    try:
+        r = es_post('/bench-metric/_search', {"size": 0,
+                                               "query": {"query_string": {"query": "track:ds-*"}},
+                                               "aggs": aggs})
+    except Exception:                                           # noqa: BLE001
+        return {}, []
+    rows, cars = {}, {}
+    for tb in (r.get('aggregations', {}).get('t', {}).get('buckets') or []):
+        track = tb['key']
+        for sb in (tb.get('s', {}).get('buckets') or []):
+            car = sb['key']
+            rec = {'runs': (sb.get('n') or {}).get('value', 0)}
+            for key, _t, _f, _u, mul in DS_TABLE_SPECS:
+                fb = (sb.get(key) or {}).get('v') or {}
+                avg = fb.get('avg')
+                rec[key] = (avg * mul) if (avg is not None and mul != 1) else avg
+            rows[(track, car)] = rec
+            c = cars.setdefault(car, {'series_key': car, 'runs': 0, 'tracks': set()})
+            c['runs'] += rec['runs']
+            c['tracks'].add(track)
+    for c in cars.values():
+        c['tracks'] = len(c['tracks'])
+    return rows, list(cars.values())
+
+
+def _fmt(v, nd=1):
+    if v is None:
+        return '—'
+    try:
+        return ('%%.%df' % nd) % float(v)
+    except (TypeError, ValueError):
+        return '—'
+
+
+def ds_table_markdown(lin, tracks, rows, car, title=None):
+    """建板时实算的「维度对照表」—— 合并看板的主表（每辆车一张）。
+
+    为什么是 markdown 而不是 TSVB 面板：
+      TSVB 的横轴只能是时间，"吞吐 vs 维度"做不出真正的维度轴；
+      而这张表是**逐档精确读数**的载体，还要带 TSVB 表达不了的列：
+      档位性质（真实 / 截断 / tile）、**当量吞吐**（吞吐 × d/1024，方案 §一 Q1 的判据口径）、
+      召回率（Recall@10 / @100，方案的硬护栏）。
+      趋势交给折线面板（TSVB），读数交给这张表。
+
+    一车一表的原因：同一维度档上有多辆车（3009/3015 两个 build × 多个 JDK），
+    混进一张表就成了"把车差和维度差平均成一个数"。
+    """
+    md = ['**%s** — %s%s' % (title or ('%s 维度对照表' % LINEAGE_SHORT.get(lin, lin)),
+                             LINEAGE_LABEL.get(lin, lin),
+                             ('；车 `%s`' % car) if car else ''), '']
+    # 表头压短：Kibana 的 markdown 表格不会按内容自适应列宽，
+    # 长表头会把整张表挤到换行（"档位性质" 竖着排）→ 单位一律放到表下说明里。
+    md.append('| 维度 | 场次 | 写入 | k10 | k100 | 32c | p50 | p99 | 存储 | '
+              'R@10 | R@100 | 写当量 | 32c当量 |')
+    md.append('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    for dims, track in tracks:
+        rec = rows.get((track, car)) or {}
+        if not rec:
+            continue
+        run = rec.get('runs', 0)
+        eq_w = (rec.get('write') * dims / 1024.0) if rec.get('write') is not None else None
+        eq_32 = (rec.get('k32') * dims / 1024.0) if rec.get('k32') is not None else None
+        md.append('| **%d** %s | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |'
+                  % (dims, TIER_NOTE.get(dims, ''), run,
+                     _fmt(rec.get('write'), 0), _fmt(rec.get('k10')), _fmt(rec.get('k100')),
+                     _fmt(rec.get('k32')), _fmt(rec.get('p50')), _fmt(rec.get('p99')),
+                     _fmt(rec.get('disk'), 2), _fmt(rec.get('r10'), 4), _fmt(rec.get('r100'), 4),
+                     _fmt(eq_w, 0), _fmt(eq_32)))
+    md.append('')
+    md.append('')
+    md.append('> **单位** — 维度=维（后缀是档位性质） · 写入=docs/s · k10/k100/32c=ops/s · '
+              'p50/p99=ms（k10 引擎时延 service_time）· 存储=GB · '
+              'R@10/R@100=平均召回率 · 当量=实测值 × d/1024')
+    md.append('')
+    md.append(TIER_LEGEND)
+    md.append('')
+    md.append('> **当量吞吐** = 实测吞吐 × d/1024（方案 §一 Q1 判据口径）：'
+              'HNSW 成本随维度近似线性，当量值平稳 = 缩放健康。')
+    md.append('> **Recall** 是方案的硬护栏（Recall@10 ≥ 0.95 / Recall@100 ≥ 0.99）；'
+              '召回塌了的性能数字不作数。')
+    return '\n'.join(md)
+
+
+def tsvb_multi_series(idx, terms_field, metrics_spec, formatter):
+    """一条 metrics 面板的 series：按 terms_field 分组，每组带多个指标（各带自己的过滤）
+
+    这是"维度对照表"的**活**版本：行 = 维度档（terms 分组），列 = 指标。
+    """
+    ms = []
+    for i, (label, mtype, field, filt) in enumerate(metrics_spec):
+        m = {'id': '%s%d' % (METRIC, i), 'type': mtype, 'field': field, 'label': label}
+        if filt:
+            m['filter'] = {'language': 'lucene', 'query': filt}
+        ms.append(m)
+    return {
+        'id': SERIES, 'color': COLORS[idx % len(COLORS)], 'split_mode': 'terms',
+        'field': 'value', 'metrics': ms,
+        'separate_axis': 0, 'axis_position': 'right', 'formatter': formatter,
+        'chart_type': 'line', 'line_width': 2, 'point_size': 1, 'fill': '0',
+        'stacked': 'none', 'terms_field': terms_field, 'terms_order_by': ms[0]['id'],
+    }
+
+
+def tsvb_metrics_panel(title, panel_filter, terms_field, metrics_spec, formatter,
+                       index_pattern='bench-metric', interval='2h'):
+    """TSVB metrics 面板（表格形态）：行=分组、列=指标"""
+    return {
+        'type': 'metrics', 'aggs': [],
+        'params': {
+            'id': PANEL, 'type': 'timeseries',
+            'series': [tsvb_multi_series(0, terms_field, metrics_spec, formatter)],
+            'time_field': '@timestamp', 'index_pattern': index_pattern,
+            'interval': interval,
+            'axis_position': 'left', 'axis_formatter': 'number',
+            'show_legend': 1, 'show_grid': 1, 'legend_position': 'right',
+            'filter': {'language': 'lucene', 'query': panel_filter},
+        },
+        'title': title,
+    }
+
+
+def build_dimsweep_dashboard(lin_tracks, rows, cars, main_car, interval, time_from, time_to):
+    """bench-dimsweep —— 向量维度扫描 · 维度曲线（一页一个对比轴：维度）
+
+    页面结构：按**语料血统**分面（j 系 / GIST 系），面内每辆车一张维度对照表
+    （逐档精确读数 + 档位性质 + 当量吞吐 + 召回率），表下面是活折线（TSVB）。
+    """
+    objs = []
+    panels, refs = [], []
+
+    def add(vis_id, x, y, w, h, ptype='visualization'):
+        i = str(len(panels) + 1)
+        panels.append({'embeddableConfig': {},
+                       'gridData': {'x': x, 'y': y, 'w': w, 'h': h, 'i': i},
+                       'id': vis_id, 'panelIndex': i, 'type': ptype, 'version': '7.10.0'})
+        refs.append({'id': vis_id, 'name': i, 'type': ptype})
+
+    def put(vis_id, title, params):
+        p = dict(params)
+        p['index_pattern_ref_name'] = IP_REF
+        objs.append({'id': vis_id, 'type': 'visualization',
+                     'attributes': vis_attributes(title, json.dumps(p)),
+                     'references': [{'id': IP_ID, 'name': IP_REF, 'type': 'index-pattern'}],
+                     'migrationVersion': {'visualization': '7.10.0'}})
+
+    y = 0
+    for lin, tracks in lin_tracks.items():
+        if not tracks:
+            continue
+        tlist = [t for _d, t in tracks]
+        tfilter = '(%s)' % ' OR '.join('track:%s' % t for t in tlist)
+        carflt = 'series_key:"%s"' % main_car if main_car else '*'
+        base = '%s AND %s AND quality:ok' % (tfilter, carflt)
+
+        # ---- 段① 维度曲线（血统分面）----
+        sec = 'bench-dimsweep-sec-%s' % lin
+        objs.append(section_obj(sec, '%s 维度曲线' % LINEAGE_SHORT.get(lin, lin),
+                                 '%s；折线锁死主车 %s，车与车比见「车对比」页'
+                                 % (LINEAGE_LABEL.get(lin, lin), main_car or '—')))
+        add(sec, 0, y, 48, 5)
+        y += 5
+
+        # ---- 段② 维度对照表：每辆车一张 ----
+        # 主车在前；其余车按"覆盖档数"排（覆盖 ≥2 档才单独成表，
+        # 只在一档上跑过的车属于车对比页的内容，不进维度表）。
+        lin_cars = []
+        for car in cars:
+            n = sum(1 for _d, t in tracks if rows.get((t, car['series_key'])))
+            if n:
+                lin_cars.append((car['series_key'], n))
+        lin_cars.sort(key=lambda x: (0 if x[0] == main_car else 1, -x[1], x[0]))
+        for car_key, n in lin_cars:
+            if n < 2 and car_key != main_car:
+                continue
+            tb = 'bench-dimsweep-tbl-%s-%s' % (lin, car_key.replace('@', '-').replace('.', '-'))
+            title = ('%s 维度对照表' % LINEAGE_SHORT.get(lin, lin) if car_key == main_car
+                     else '%s 维度对照表 · %s' % (LINEAGE_SHORT.get(lin, lin), car_key))
+            objs.append(markdown_obj(tb, title, ds_table_markdown(lin, tracks, rows, car_key, title)))
+            add(tb, 0, y, 48, 19)
+            y += 19
+
+        # ---- 段③ 吞吐趋势（一条线 = 一个维度档，横轴是时间）----
+        thr_specs = [
+            ('写入吞吐 · p50 docs/s', 'family:throughput AND unit:"docs/s" AND stat:p50', '0.0a'),
+            ('KNN k=10 · 吞吐 (ops/s)', 'family:throughput AND unit:"ops/s" AND stat:p50 '
+                                        'AND task:knn-search-10-100', '0.0a'),
+            ('KNN k=100 · 吞吐 (ops/s)', 'family:throughput AND unit:"ops/s" AND stat:p50 '
+                                         'AND task:knn-search-100-1000', '0.0a'),
+            ('KNN k=100 · 32 并发稳态 (ops/s)', 'family:throughput AND unit:"ops/s" AND stat:p50 '
+                                                'AND task:knn-search-100-1000-x32', '0.0a'),
+        ]
+        for key, (title, f, fmt) in enumerate(thr_specs):
+            vid = 'bench-dimsweep-%s-thr%d' % (lin, key)
+            put(vid, title, tsvb_timeseries(title, '%s AND %s' % (base, f), fmt,
+                                            terms_field='track', interval=interval))
+            add(vid, 24 * (key % 2), y, 24, 13)
+            if key % 2 == 1:
+                y += 13
+        if len(thr_specs) % 2:
+            y += 13
+
+        # ---- 段④ 时延（引擎时延 = service_time，不含发压机积压）----
+        lat_specs = [
+            ('k10 · 引擎时延 p50 (ms)', 'family:service_time AND stat:p50 '
+                                         'AND task:knn-search-10-100', '0.0[00]'),
+            ('k10 · 引擎时延 p99 (ms)', 'family:service_time AND stat:p99 '
+                                         'AND task:knn-search-10-100', '0.0[00]'),
+        ]
+        for key, (title, f, fmt) in enumerate(lat_specs):
+            vid = 'bench-dimsweep-%s-lat%d' % (lin, key)
+            put(vid, title, tsvb_timeseries(title, '%s AND %s' % (base, f), fmt,
+                                            terms_field='track', interval=interval))
+            add(vid, 24 * (key % 2), y, 24, 13)
+            if key % 2 == 1:
+                y += 13
+
+        # ---- 段⑤ 存储 ----
+        disk_specs = [
+            ('存储占用 (GB)', 'family:disk AND metric:store_size AND unit:GB', '0.0'),
+            ('段数量', 'family:disk AND metric:segment_count AND stat:value', '0.0a'),
+        ]
+        for key, (title, f, fmt) in enumerate(disk_specs):
+            vid = 'bench-dimsweep-%s-disk%d' % (lin, key)
+            put(vid, title, tsvb_timeseries(title, '%s AND %s' % (base, f), fmt,
+                                            terms_field='track', interval=interval))
+            add(vid, 24 * (key % 2), y, 24, 13)
+            if key % 2 == 1:
+                y += 13
+
+        # ---- 段⑥ 召回率（方案的硬护栏）----
+        rec_specs = [
+            ('Recall@10 · 平均召回率', 'family:recall AND stat:mean '
+                                        'AND task:knn-search-10-100', '0.0000'),
+            ('Recall@100 · 平均召回率', 'family:recall AND stat:mean '
+                                         'AND task:knn-search-100-1000', '0.0000'),
+        ]
+        for key, (title, f, fmt) in enumerate(rec_specs):
+            vid = 'bench-dimsweep-%s-rec%d' % (lin, key)
+            put(vid, title, tsvb_timeseries(title, '%s AND %s' % (base, f), fmt,
+                                            terms_field='track', interval=interval))
+            add(vid, 24 * (key % 2), y, 24, 13)
+            if key % 2 == 1:
+                y += 13
+
+    dash = _dashboard(panels, refs, 'bench-dimsweep',
+                      'Benchmark · 向量维度扫描 · 维度曲线',
+                      time_from, time_to,
+                      '向量维度扫描的**维度**对比页：横轴是维度，一条线 = 一个维度档，'
+                      '锁死同一台车（主车 %s）横向比维度成本。两套语料（jina 系 / GIST 系）'
+                      '分面呈现，不混线；车与车（build / JDK / ES）的比较在 '
+                      'bench-dimsweep-car 页。' % (main_car or '—'))
+    objs.append(dash)
+    return objs
+
+
+# 车对比页的面板集：只留**能回答"谁强"**的指标，
+# 不搬原赛道板的那 28 个面板（合并的初衷就是收窄，
+# 全搬过来等于把 6 块板塞进 1 块，没解决"翻 6 页"的问题）。
+CAR_PANEL_SPECS = [
+    ('wthr', '写入吞吐 · p50 docs/s',
+     'family:throughput AND unit:"docs/s" AND stat:p50', '0.0a', 'series_key'),
+    ('idx', '索引总耗时 (s)',
+     'family:indexing_time AND metric:total_time AND stat:value', '0.0[0]', 'series_key'),
+    ('qthr-k10', 'KNN k=10 · 吞吐 (ops/s)',
+     'family:throughput AND unit:"ops/s" AND stat:p50 AND task:knn-search-10-100', '0.0a', 'series_key'),
+    ('qthr-k100', 'KNN k=100 · 吞吐 (ops/s)',
+     'family:throughput AND unit:"ops/s" AND stat:p50 AND task:knn-search-100-1000', '0.0a', 'series_key'),
+    ('qthr-k32', 'KNN k=100 · 32 并发稳态 (ops/s)',
+     'family:throughput AND unit:"ops/s" AND stat:p50 AND task:knn-search-100-1000-x32', '0.0a', 'series_key'),
+    ('qlat-k10-p50', 'k10 · 引擎时延 p50 (ms)',
+     'family:service_time AND stat:p50 AND task:knn-search-10-100', '0.0[00]', 'series_key'),
+    ('qlat-k10-p99', 'k10 · 引擎时延 p99 (ms)',
+     'family:service_time AND stat:p99 AND task:knn-search-10-100', '0.0[00]', 'series_key'),
+    ('qe2e-k10-p99', 'k10 · 端到端时延 p99 (ms)',
+     'family:latency AND stat:p99 AND task:knn-search-10-100', '0.0[00]', 'series_key'),
+    ('rec-k10', 'Recall@10 · 平均召回率',
+     'family:recall AND stat:mean AND task:knn-search-10-100', '0.0000', 'series_key'),
+    ('rec-k100', 'Recall@100 · 平均召回率',
+     'family:recall AND stat:mean AND task:knn-search-100-1000', '0.0000', 'series_key'),
+    ('err', '错误率 (0-1)', 'family:error_rate AND stat:value', '0.000', 'series_key'),
+    ('disk', '存储占用 (GB)', 'family:disk AND metric:store_size AND unit:GB', '0.0', 'series_key'),
+    ('steal', 'CPU steal (avg/max) · 数据可信度',
+     'family:system AND metric:(cpu_steal_avg OR cpu_steal_max) AND stat:value', '0.000', 'metric'),
+    ('engcpu', '被测引擎 CPU 占用 (avg/max)',
+     'family:system AND metric:(bench_cpu_avg OR bench_cpu_max) AND stat:value', '0.000', 'metric'),
+]
+
+
+def build_dimsweep_car_dashboard(car_tracks, facts, interval, time_from, time_to):
+    """bench-dimsweep-car —— 向量维度扫描 · 车对比（一页一个对比轴：车）
+
+    固定维度、换车：同一维度档上横向比 JDK 25/26/27 与 ES 8.19.23。
+    每个维度一节（1024 维 / 1920 维）—— 不同维度的绝对值不可比，
+    同一维度上不同车才可比。
+    """
+    objs = []
+    panels, refs = [], []
+
+    def add(vis_id, x, y, w, h, ptype='visualization'):
+        i = str(len(panels) + 1)
+        panels.append({'embeddableConfig': {},
+                       'gridData': {'x': x, 'y': y, 'w': w, 'h': h, 'i': i},
+                       'id': vis_id, 'panelIndex': i, 'type': ptype, 'version': '7.10.0'})
+        refs.append({'id': vis_id, 'name': i, 'type': ptype})
+
+    y = 0
+    for track, dims, lineage in car_tracks:
+        ids = []
+        for key, title, f, fmt, terms in CAR_PANEL_SPECS:
+            filt = 'track:%s AND quality:ok AND %s' % (track, f)
+            if key == 'err':
+                filt = 'track:%s AND %s' % (track, f)      # 错误率面板刻意不放行 quality
+            if not panel_has_data(filt):
+                continue
+            vid = 'bench-dimsweep-car-%s-%s' % (track, key)
+            objs.append(visualization_obj(vid, title, filt, fmt, terms_field=terms,
+                                          metric_type='avg', interval=interval))
+            ids.append(vid)
+        if not ids:
+            continue
+        sec = 'bench-dimsweep-car-sec-%s' % track
+        objs.append(section_obj(sec, '%d 维 · %s' % (dims, LINEAGE_SHORT.get(lineage, lineage)),
+                                 '固定 %d 维横向比各台车（引擎@版本@build@JDK）；'
+                                 '不同维度的绝对值不可比' % dims))
+        add(sec, 0, y, 48, 5)
+        y += 5
+        for n, vid in enumerate(ids):
+            add(vid, 24 * (n % 2), y, 24, 13)
+            if n % 2 == 1:
+                y += 13
+        if len(ids) % 2:
+            y += 13
+
+    dash = _dashboard(panels, refs, 'bench-dimsweep-car',
+                      'Benchmark · 向量维度扫描 · 车对比',
+                      time_from, time_to,
+                      '向量维度扫描的**车**对比页：固定维度横向比各台车'
+                      '（引擎@版本@build@JDK，含 ES 8.19.23 参照与 JDK 25/26/27 对比）。'
+                      '维度之间的比较在 bench-dimsweep 页。')
+    objs.append(dash)
+    return objs
+
+
 def es_track_facts():
     """读出每个赛道的：场次数 / 实验车 / task 集合 / 时间范围。
 
@@ -990,6 +1444,25 @@ def data_window(track=None, pad_days=1):
         return 'now-90d', 'now'
 
 
+def data_window_span(lo_ms, hi_ms, pad_days=1):
+    """跨多个赛道的合并看板用的时间窗（按给定的起止跨度算）
+
+    与 data_window(track) 的区别：后者按单个赛道算，这里按一批赛道的并集算 ——
+    合并看板（如维度扫描）覆盖多个赛道，窗口必须罩住全部场次，
+    否则打开看板时默认时间窗把大部分场次挡在窗外。
+    """
+    try:
+        if not lo_ms or not hi_ms:
+            return 'now-90d', 'now'
+        lo = datetime.datetime.fromtimestamp(lo_ms / 1000, datetime.timezone.utc)
+        hi = datetime.datetime.fromtimestamp(hi_ms / 1000, datetime.timezone.utc)
+        lo = lo - datetime.timedelta(days=pad_days)
+        hi = hi + datetime.timedelta(days=pad_days)
+        return lo.strftime('%Y-%m-%dT%H:%M:%S.000Z'), hi.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    except Exception:                                       # noqa: BLE001
+        return 'now-90d', 'now'
+
+
 def overview_dashboard(track_info):
     """总览页：环境说明 + 看图指南 + 赛道导航（各赛道的独立看板链接）。
 
@@ -1021,7 +1494,7 @@ def overview_dashboard(track_info):
                       '源 = raceway bench-export.py 导出的 bench-run/bench-metric）')
 
 
-def nav_markdown(track_info):
+def nav_markdown(track_info, ds_info=None):
     """赛道导航表：每个 track 一行，列出它自己的独立看板入口
 
     导航方式说明（Kibana 8.1 实测）：markdown 面板里的 [文字](url) 链接点击后
@@ -1034,6 +1507,20 @@ def nav_markdown(track_info):
     md = ['**赛道导航** — 每个 esrally track 一个独立看板'
           '（对照 opensearch.org/benchmarks：HTTP logs / NYC taxis / PMC / Big5 / '
           'Vectorsearch-* … 各自独立页面，不同 workload 不混图）', '']
+    if ds_info:
+        md.append('**向量维度扫描（6 个维度档合并成 2 块板）** — 一页一个**对比轴**：'
+                  '维度轴看 `bench-dimsweep`，车轴（build / JDK / ES）看 `bench-dimsweep-car`。')
+        md.append('')
+        md.append('| 板 | 说明 | 场次 | 被测配置 | 维度档 | 看板路径 |')
+        md.append('|---|---|---|---|---|---|')
+        for key, title, path in (('curve', '维度曲线 · 同一台车横向比维度', 'bench-dimsweep'),
+                                 ('car', '车对比 · 固定维度横向比各台车', 'bench-dimsweep-car')):
+            info = ds_info.get(key) or {}
+            md.append('| `%s` | %s | %d | %s | %s | `/app/dashboards#/view/%s` |'
+                      % (info.get('label') or key, title, info.get('runs', 0),
+                         ', '.join(info.get('cars') or []) or '—',
+                         ' / '.join(info.get('dims') or []) or '—', path))
+        md.append('')
     md.append('| 赛道 | 说明 | 场次 | 被测配置 | workload 分组 | 未出图面板 | 看板路径 |')
     md.append('|---|---|---|---|---|---|---|')
     for track, info in track_info:
@@ -1090,7 +1577,51 @@ def main():
     # 赛道从 ES 实算，不硬编码：新增一场新赛道的压测后，跑一次脚本就多一个看板
     facts = es_track_facts()
     track_info = []
+
+    # ---- 向量维度扫描（ds-*）：合并成 2 块板，不再一页一档 ----
+    # 一页 = 一个对比轴：维度轴（bench-dimsweep）/ 车轴（bench-dimsweep-car）。
+    ds_tracks = ds_lineage_tracks(facts)
+    ds_info = None
+    if ds_tracks:
+        rows, cars = ds_collect()
+        main_car = ds_main_car(cars)
+        lo = min([facts[t]['lo'] for lst in ds_tracks.values() for _d, t in lst
+                  if facts.get(t, {}).get('lo')] or [None])
+        hi = max([facts[t]['hi'] for lst in ds_tracks.values() for _d, t in lst
+                  if facts.get(t, {}).get('hi')] or [None])
+        interval = pick_interval(lo, hi)
+        tf, tt = data_window_span(lo, hi)
+        objs += build_dimsweep_dashboard(ds_tracks, rows, cars, main_car, interval, tf, tt)
+        # 车对比页：只收"同一维度上有 2 辆以上车"的档（单车的档放进维度曲线页即可）
+        car_tracks = []
+        for lin, lst in ds_tracks.items():
+            for dims, track in lst:
+                ncars = len(facts.get(track, {}).get('cars') or [])
+                # ≥3 辆车才算"车对比"（JDK 25/26/27 + ES 参照）；
+                # 只有 2 辆车的档（3009 vs 3015 两个 build）是**发版对比**，
+                # 它们的逐档数值已经进了维度曲线页的每车一张表，不必再占一页。
+                if ncars >= 3:
+                    car_tracks.append((track, dims, lin))
+        if car_tracks:
+            objs += build_dimsweep_car_dashboard(car_tracks, facts, interval, tf, tt)
+        ds_runs = sum((facts.get(t, {}) or {}).get('metrics', 0)
+                      for lst in ds_tracks.values() for _d, t in lst)
+        ds_info = {
+            'curve': {'label': '维度扫描', 'runs': ds_runs,
+                      'cars': [c['series_key'] for c in cars],
+                      'dims': ['%d 维' % d for lst in ds_tracks.values() for d, _t in lst]},
+            'car': {'label': '维度扫描 · 车对比', 'runs': ds_runs,
+                    'cars': [c['series_key'] for c in cars],
+                    'dims': ['%d 维' % d for _t, d, _l in car_tracks]},
+        }
+        print('  维度扫描合并：%d 档 → 2 块板（主车 %s，%d 台车）'
+              % (sum(len(v) for v in ds_tracks.values()), main_car, len(cars)))
+
     for track in sorted(facts.keys()):
+        if DS_TRACK_RE.match(track):
+            continue                      # 维度扫描已合并，不再单独建板
+        if track in ONE_OFF_TRACKS:
+            continue                      # 一次性对照场次，不进看板（见 ONE_OFF_TRACKS）
         info = facts[track]
         groups = group_tasks(info['tasks'])
         if not groups:
@@ -1109,15 +1640,16 @@ def main():
                  ','.join(g[0] for g in groups) or '-', interval, len(dropped)))
 
     objs.append(markdown_obj('bench-vis-head', '环境说明', env_markdown()))
-    objs.append(markdown_obj('bench-vis-nav', '赛道导航', nav_markdown(track_info)))
+    objs.append(markdown_obj('bench-vis-nav', '赛道导航', nav_markdown(track_info, ds_info)))
     objs.append(markdown_obj('bench-vis-guide', '看图指南', USAGE_MD))
     objs.append(overview_dashboard(track_info))
 
     ndjson = '\n'.join(json.dumps(o, ensure_ascii=False) for o in objs) + '\n'
     with open(args.out, 'w', encoding='utf-8') as f:
         f.write(ndjson)
+    _ndash = sum(1 for o in objs if o['type'] == 'dashboard')
     print('wrote %s: %d objects (%d dashboards + %d panels)'
-          % (args.out, len(objs), len(track_info) + 1, len(objs) - len(track_info) - 4))
+          % (args.out, len(objs), _ndash, len(objs) - _ndash))
 
     if args.do_import:
         # 先清掉本次不再生成的旧对象（改造前的单板面板），再导入
