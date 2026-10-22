@@ -84,6 +84,38 @@ CANON_UNITS = ("s", "ms", "ops/s", "docs/s", "pages/s", "MB/s", "GB", "MB", "byt
                "count", "ratio", "percent", "text", "")
 CANON_QUALITY = ("ok", "degraded", "unknown")
 CANON_LATENCY_MODE = ("open_loop", "closed_loop", "unknown")
+# ---------------------------------------------------------------------------
+# bench-metric 的字段白名单（方案 §1 修订「物化只给看板真正查得到的字段」+ §3.3）
+#
+# 指标行只保留三类东西：
+#   ① 指标事实：family / metric / stat / value / unit / 原值备查 / direction；
+#   ② 口径契约：quality / latency_mode / backlog_ratio（面板闸门要用）；
+#   ③ 看板真正用得到的维度：track（按赛道拆看板）、series_key（身份分线键）、
+#      valid（看板级闸门）、campaign（批次过滤）。
+# run 维度（车代号 / engine / version / build / JDK / dims / segment_form / env_id /
+# round / phase / codec / knn_params…）一律回 bench-run 查 —— 指标行上带一份只是重复：
+# 既白付体积（每行 20+ 个身份字段，7.9 万行就是几十 MB），又多一份漂移面。
+# 白名单是**导出期硬约束**：越界即判失败，脏载荷不进库（与 stat/unit 词表同级）。
+#
+# ⚠️ 2026-10-22 修复：c8f341b 只移植了 20da15e 的 kibana 适配，把本白名单与
+# bench-metric 的 strict 模板一起丢了 —— 导出器又变回「common 全量展开」，
+# 指标行 33 字段、模板 dynamic 不再 strict。重导会把已入库的 21 字段契约打回
+# 旧形状（体积 +30%，且白名单护栏失效）。此处按 20da15e 补回，并在 ES 侧
+# 用 dynamic:strict 让越界行直接被拒收。
+# ---------------------------------------------------------------------------
+METRIC_FIELDS = frozenset((
+    "_index", "_id",
+    "race_id", "@timestamp", "task", "operation", "family", "metric", "stat",
+    "value", "unit", "value_original", "unit_original", "value_text", "direction",
+    "quality", "latency_mode", "backlog_ratio",
+    "track", "series_key", "valid", "campaign",
+    "fid", "node",
+    # phase 只出现在 monitor 采样行上：那一行采自赛程的哪个相位（w/m/q），
+    # 它不是场次维度的重复（场次相位回 bench-run 查）
+    "phase",
+))
+METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
+                             "direction", "track", "series_key"))
 # 兜底别名（同一块里归一后撞名时用）：非致命，但必须在 manifest 里可见
 _STAT_ALIAS_RE = re.compile(r"^(?:value|mean|p50|p90|p99|p999|p9999|p100|min|max)_raw\d*$")
 STAT_MAP = {"50_0": "p50", "median": "p50", "90_0": "p90", "99_0": "p99",
@@ -565,10 +597,86 @@ def latency_semantics(lat_blk, svc_blk, gt_mode):
     return ("open_loop" if ratio > 0.01 else "closed_loop"), ratio, "inferred"
 
 
+# ---------------------------------------------------------------------------
+# 召回率（recall）探针结果
+# ---------------------------------------------------------------------------
+# 召回率是方案 §一 的硬护栏（Recall@10 ≥ 0.95 / Recall@100 ≥ 0.99），
+# 但探针（hv-recall-self.py）是查询跑完之后离线跑的，结果落在
+# campaigns/<campaign>/results/recall-<fid>[-k<k>].json ——
+# 既不在 race.json 里，也没进 sidecar，于是导出器的 recall 分支（读 sidecar["recall"]）
+# 一直是空的：全库 family 分布里查不到 recall，护栏形同虚设。
+#
+# 这里把它接进导出：campaign + fid 对上该场**查询** race，就随该场一起出指标行，
+# 于是 recall 行与查询曲线同 race_id、同 series_key、同 track，能在面板里对齐。
+#
+# k → esrally task 名：探针的 num_candidates 就是赛道里 KNN 的 ef 值
+# （k=10/ef=100 → knn-search-10-100，k=100/ef=1000 → knn-search-100-1000），
+# 对齐后 recall 才能按 task 与吞吐/时延面板并排比。
+RECALL_TASK_BY_K = {10: "knn-search-10-100", 100: "knn-search-100-1000"}
+
+
+def load_recall_index(campaigns_dir):
+    """扫 campaigns/*/results/recall-*.json → {(campaign, fid): {task: {stat: value}}}"""
+    idx = {}
+    for camp in sorted(glob.glob(os.path.join(campaigns_dir, "*"))):
+        if not os.path.isdir(camp):
+            continue
+        camp_name = os.path.basename(camp)
+        best = {}
+        for p in sorted(glob.glob(os.path.join(camp, "results", "recall-*.json"))):
+            # 同一个 (fid,k) 可能有两个文件：合并版 recall-<fid>.json 与拆分版
+            # recall-<fid>-k<k>.json（探针跑过两遍，值略有差异）。拆分版粒度更细，优先取它。
+            prio = 2 if re.search(r"-k\d+\.json$", os.path.basename(p)) else 1
+            try:
+                txt = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            for line in txt.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                tag = d.get("tag") or ""
+                k = d.get("k")
+                avg = d.get("avg_recall")
+                if k is None or avg is None:
+                    continue
+                # tag 形态有两种：合并版写 "<fid>-k<k>"，拆分版写 "<fid>"（k 在字段里）
+                m = re.match(r"^(?P<fid>.+)-k(?P<k>\d+)$", tag)
+                if m:
+                    fid = m.group("fid")
+                    k = int(m.group("k"))
+                else:
+                    fid = tag
+                key = (fid, int(k))
+                cur = best.get(key)
+                if cur is None or prio >= cur[0]:
+                    mn = d.get("min_recall")
+                    best[key] = (prio, float(avg),
+                                 (float(mn) if mn is not None else None))
+        for (fid, k), (_prio, avg, mn) in best.items():
+            task = RECALL_TASK_BY_K.get(k)
+            if not task:
+                continue
+            slot = idx.setdefault((camp_name, fid), {}).setdefault(task, {})
+            slot["mean"] = avg
+            if mn is not None:
+                slot["min"] = mn
+    return idx
+
+
 def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counters=None):
     """race.json → bench-metric 行"""
     res = d.get("results") or {}
     gt_modes = ((side or {}).get("run_params") or {}).get("latency_modes") or {}
+
+    def _push(row):
+        """指标行只留白名单字段（run 维度回 bench-run 查）—— 见 METRIC_FIELDS 注释"""
+        out.append({k: v for k, v in row.items() if k in METRIC_FIELDS})
+
     for om in res.get("op_metrics") or []:
         task = om.get("task") or om.get("operation") or "?"
         q = quality_of(om) if quality_of is not None else task_quality(om, task)
@@ -601,7 +709,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
                     n += 1
                 seen_stat[stat] = True
                 nv, nu = norm_value(v, unit)
-                out.append({"_index": "bench-metric", "_id": "%s|%s|%s|%s" % (run_id, task, family, stat),
+                _push({"_index": "bench-metric", "_id": "%s|%s|%s|%s" % (run_id, task, family, stat),
                             "@timestamp": ts, "task": task, "operation": om.get("operation"),
                             "family": family, "metric": family, "stat": stat,
                             "value": nv, "unit": nu, "value_original": v, "unit_original": unit,
@@ -629,7 +737,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
                     n += 1
                 qseen[stat] = True
                 nv, nu = norm_value(diff, lat_u)
-                out.append({"_index": "bench-metric", "_id": "%s|%s|queue_time|%s" % (run_id, task, stat),
+                _push({"_index": "bench-metric", "_id": "%s|%s|queue_time|%s" % (run_id, task, stat),
                             "@timestamp": ts, "task": task, "operation": om.get("operation"),
                             "family": "queue_time", "metric": "queue_time", "stat": stat,
                             "value": nv, "unit": nu, "value_original": diff, "unit_original": lat_u,
@@ -644,7 +752,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
             # duration: rally 给毫秒，归一到秒。
             raw_unit = "ratio" if key == "error_rate" else "ms"
             nv, nu = norm_value(v, raw_unit)
-            out.append({"_index": "bench-metric", "_id": "%s|%s|%s|value" % (run_id, task, fam),
+            _push({"_index": "bench-metric", "_id": "%s|%s|%s|value" % (run_id, task, fam),
                         "@timestamp": ts, "task": task, "operation": om.get("operation"),
                         "family": fam, "metric": key, "stat": "value", "value": nv, "unit": nu,
                         "value_original": v, "unit_original": raw_unit,
@@ -662,7 +770,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
         else:
             stat = "value"
         nv, nu = norm_value(v, unit)
-        out.append({"_index": "bench-metric", "_id": "%s||%s|%s" % (run_id, fam + "_" + key, stat),
+        _push({"_index": "bench-metric", "_id": "%s||%s|%s" % (run_id, fam + "_" + key, stat),
                     "@timestamp": ts, "task": None, "operation": None,
                     "family": fam, "metric": key, "stat": stat, "value": nv, "unit": nu,
                     "value_original": v, "unit_original": unit,
@@ -679,7 +787,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
             except (TypeError, ValueError):
                 continue
             stat = STAT_MAP.get(label, label)
-            out.append({"_index": "bench-metric", "_id": "%s|%s|recall|%s" % (run_id, task, stat),
+            _push({"_index": "bench-metric", "_id": "%s|%s|recall|%s" % (run_id, task, stat),
                         "@timestamp": ts, "task": task, "operation": None,
                         "family": "recall", "metric": "recall", "stat": stat,
                         "value": fv, "unit": "ratio", "value_original": fv, "unit_original": "ratio",
@@ -727,6 +835,23 @@ def validate_payload(runs, metrics):
     if aliases:
         warnings.append("stat 归一后撞名，已用兜底别名区分（%d 行）: %s"
                         % (sum(aliases.values()), sorted(aliases)))
+    # ---- 字段白名单（方案 §1 修订）----
+    # run 维度回流到指标行 = 精简前功亏一篑：体积白付 + 多一份漂移面。
+    # 越界即判失败 —— 与 stat/unit 词表同级，都是"导出期就拦住脏载荷"。
+    extra_hits, missing_hits = {}, {}
+    for m in metrics:
+        extra = set(m.keys()) - METRIC_FIELDS
+        if extra:
+            k = ",".join(sorted(extra))
+            extra_hits[k] = extra_hits.get(k, 0) + 1
+        miss = METRIC_REQUIRED - set(m.keys())
+        if miss:
+            k = ",".join(sorted(miss))
+            missing_hits[k] = missing_hits.get(k, 0) + 1
+    for k, v in sorted(extra_hits.items()):
+        problems.append("bench-metric 行出现白名单外字段（run 维度回流?）: %s × %d 行" % (k, v))
+    for k, v in sorted(missing_hits.items()):
+        problems.append("bench-metric 行缺必填字段 %s: %d 行" % (k, v))
     # 同一 (场次, task) 的所有行 quality 必须一致
     # 注意必须用复合键：task 名在不同场次之间会重名（index-append 每个场次都有），
     # 只按 task 分组会把不同场次的质量标记混在一起比。
@@ -806,6 +931,10 @@ def main():
     for c in sorted(glob.glob(os.path.join(args.campaigns, "*"))):
         if os.path.isdir(c):
             metas[os.path.basename(c)] = load_campaign_meta(c)
+
+    # 召回率探针结果（results/recall-*.json）—— 与 race.json 无关，按 (campaign, fid) 索引
+    recall_idx = load_recall_index(args.campaigns)
+    _recall_fids = sorted({f for (_c, f) in recall_idx})
 
     # 预扫 sidecar：学出 car -> 引擎身份（实测包名/版本/JDK）。
     # 有些场次没有 sidecar（早期 campaign），但同一实验车的包是同一份 ——
@@ -1096,6 +1225,26 @@ def main():
                      "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
                      "fingerprint": hashlib.sha1(("%s|%s|%s" % (race_id, status, d["_path"])).encode()).hexdigest()})
         emit_metrics(d, race_id, ts, common, metrics, side=side, counters=counters)
+        # ---- 召回率行：挂到该场**查询** race 上 ----
+        # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
+        # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
+        if phase == "q":
+            _rec = recall_idx.get((camp, fid))
+            if not _rec:
+                for (_c2, f2), r2 in recall_idx.items():
+                    if _c2 == camp and fid.startswith(f2 + "-"):
+                        _rec = r2
+                        break
+            for _task, _stats in (_rec or {}).items():
+                for _stat, _v in _stats.items():
+                    metrics.append({"_index": "bench-metric",
+                                    "_id": "%s|%s|recall|%s" % (race_id, _task, _stat),
+                                    "@timestamp": ts, "task": _task, "operation": None,
+                                    "family": "recall", "metric": "recall", "stat": _stat,
+                                    "value": _v, "unit": "ratio",
+                                    "value_original": _v, "unit_original": "ratio",
+                                    "direction": "higher-better",
+                                    **{k: v for k, v in common.items() if k in METRIC_FIELDS}})
         if side:
             e = side.get("env") or {}
             eid = e.get("env_id")
@@ -1257,8 +1406,46 @@ def main():
                            "name": {"type": "keyword"}, "docs": {"type": "long"},
                            "spec_hash": {"type": "keyword"}}},
                        "disk_type": {"type": "keyword"}, "disk_path": {"type": "keyword"}}}}}
+    # bench-metric：独立模板 + dynamic strict（方案 §3.3）
+    # 指标行是**契约表**：字段集 = METRIC_FIELDS 白名单。白名单外的字段（run 维度回流）
+    # 在 ES 侧直接拒收 —— 精简靠机制保证，不靠"大家都记得别加"这种口头约定。
+    # 注意：改了字段集必须 bench-apply.py --drop 重建索引，旧 mapping 不会自动更新。
+    TPL_METRIC = {"index_patterns": ["bench-metric"], "template": {"settings": {
+                   "number_of_shards": 1, "number_of_replicas": 0},
+                   "mappings": {"dynamic": "strict", "properties": {
+                       "@timestamp": {"type": "date",
+                                     "format": "strict_date_optional_time||epoch_millis"},
+                       "race_id": {"type": "keyword"},
+                       "task": {"type": "keyword"}, "operation": {"type": "keyword"},
+                       "family": {"type": "keyword"}, "metric": {"type": "keyword"},
+                       "stat": {"type": "keyword"}, "unit": {"type": "keyword"},
+                       "direction": {"type": "keyword"},
+                       "value": {"type": "double"}, "value_original": {"type": "double"},
+                       "unit_original": {"type": "keyword"},
+                       "value_text": {"type": "keyword"},
+                       # 口径契约：quality 是面板闸门（degraded 行不能混进延迟曲线），
+                       # latency_mode / backlog_ratio 解释 latency 的口径
+                       "quality": {"type": "keyword"},
+                       "latency_mode": {"type": "keyword"},
+                       "backlog_ratio": {"type": "double"},
+                       # 看板维度：赛道（按赛道拆看板）、身份分线键、场次/批次过滤
+                       "track": {"type": "keyword"}, "series_key": {"type": "keyword"},
+                       "valid": {"type": "boolean"}, "campaign": {"type": "keyword"},
+                       # monitor 采样行专用：场次标识 / 节点 / 采样相位
+                       "fid": {"type": "keyword"}, "node": {"type": "keyword"},
+                       "phase": {"type": "keyword"}}}}}
     templates = {idx: json.loads(json.dumps(TPL).replace("%s", idx))
-                 for idx in ("bench-env", "bench-run", "bench-metric")}
+                 for idx in ("bench-env", "bench-run")}
+    templates["bench-metric"] = TPL_METRIC
+    # 自检：strict 模板必须覆盖指标行的**全部文档字段** ——
+    # 漏声明一个字段，ES 侧会整批拒收（strict_dynamic_mapping_exception）：
+    # 载荷看着正常、库里却少几万行（实测漏 unit_original → 7.9 万行只进 2442 行）。
+    # 这种错不能留到入库时才发现 —— 这里先验后写。
+    _doc_fields = {k for m in metrics for k in m} - {"_index", "_id"}
+    _missing = sorted(_doc_fields - set(TPL_METRIC["template"]["mappings"]["properties"]))
+    if _missing:
+        print("!! bench-metric strict 模板漏声明字段（入库会被整批拒收）: %s" % ", ".join(_missing))
+        return 2
     with open(os.path.join(args.out, "templates.json"), "w", encoding="utf-8") as f:
         json.dump(templates, f, ensure_ascii=False, indent=1)
 
