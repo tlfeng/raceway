@@ -30,6 +30,8 @@ doctor.sh                    新环境体检（六组只读检查：工具/env/�
 vm-bench-lib.sh              公共函数库（被 source）
 vm-bench.env.example         共享配置模板（复制为 vm-bench.env 填写；真身不入库）
 reset-env.sh                 环境还原（停/清/卸载）
+stop-campaign.sh             停掉指定 campaign 的 runner/esrally 进程，停完补结束行
+close-campaign.sh            给中途停止的 campaign 补「campaign 结束」行（进度台不再显示运行中）
 precheck.sh                  赛前静默负载卡点
 load-monitor.sh              虚机侧零依赖采样器（纯 /proc，5s；按 w/m/q 相位分 tag）
 cpu-affinity.sh              引擎绑核（模拟小规格招标环境）
@@ -181,7 +183,7 @@ python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
 | 标签 | 干什么 |
 |---|---|
 | ① 启动排程 | 矩阵勾选 → 自动剔除指标库已跑过的格 → 生成排程 → dry-run 预览 → 互斥预检后起跑；**生成时显示预计总耗时，超出 DS_HOURS 窗口当场预警**（放不下的场次会被 DEADLINE-SKIP）；勾选记 localStorage；起跑成功自动跳到进度页 |
-| ② 运行进度 | 自动选中最新没收尾的 campaign：进度条、总/有效/失败/待跑卡片、剩余分钟与预计完成时刻；**当前场次 + 相位（write/query/recall）+ 已进行时长**；PROGRESS.txt 实时日志尾；标签页标题当状态栏（`▶ 场次 · 相位`，切走也能瞄）；完成时可弹系统通知；进度文件长期无更新会提示"runner 可能已停止"；可一键停止（远端 stop-campaign.sh，二次确认） |
+| ② 运行进度 | 自动选中最新没收尾的 campaign：进度条、总/有效/失败/待跑卡片、剩余分钟与预计完成时刻；**当前场次 + 相位（write/query/recall）+ 已进行时长**；PROGRESS.txt 实时日志尾；标签页标题当状态栏（`▶ 场次 · 相位`，切走也能瞄）；完成时可弹系统通知；进度文件长期无更新会提示"runner 可能已停止"；可一键停止（远端 stop-campaign.sh，二次确认，停完自动补结束行） |
 | ③ 历史与结果 | 全部 campaign 清单（一次远端调用取摘要）+ 关键字筛选；任一场「看进度」复看逐场明细；「按此重排」把该场的 车×赛道×轮次 预填进启动排程；**两场对比**（远端跑 car-compare：A 车 vs B 车逐轮实测、中位差值 Δ、轮间极差——车代号留空自动取）；外链 Kibana 看板（Kibana 只听远端 127.0.0.1 时先 `ssh -L 5601:127.0.0.1:5601 …`） |
 
 配套的只读 CLI 仍在：`bench-queue.py`（list / status / plan / html / serve，campaign 队列观测）、
@@ -189,6 +191,19 @@ python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
 
 历史短排程复用一例：历史页挑一场满意的 campaign →「按此重排」→ 启动页自动勾好
 车/赛道/轮次并填上 tag 前缀 → 调整 → 生成排程 → dry-run → 起跑，全程不碰 ssh 命令行。
+
+**中途停止的 campaign 怎么收尾**：进度台判"已结束"只认 `PROGRESS.txt` 里最后一次
+`启动:` 之后的 `campaign 结束: N/M 场有效` 行。runner 被 TERM/INT/HUP 或 `die` 掉时
+会自己补这一行（括号里标"中止"，历史页显示「已中止」）；被 `kill -9`、虚机重启等拦不住的
+情况由 `stop-campaign.sh` 停完兜底补写，或手动跑：
+
+```bash
+./close-campaign.sh --dry-run          # 预演：列出所有没收尾的（活着的 runner 自动跳过）
+./close-campaign.sh                    # 全部补结束行；N/M 取 RACES.md 实测计数，mtime 不变
+./close-campaign.sh ds2-20261021-021151 --reason "宿主机重启"   # 只收尾指定的
+```
+
+补的只是一行文本，`RACES.md` / `STATE.txt` 不动，`CAMP_ID=<id>` 断点续跑照常。
 
 三个只读/半读的本地工具，把"队列"从散落的文件变成能看能排的东西：
 

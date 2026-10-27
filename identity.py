@@ -26,12 +26,16 @@
 
   ① sidecar 实测（bench-sidecar.py 落的 java -version 原文 + 节点 JVM 版本）
   ② campaign/logs/jdk-<车>.txt 的 java -version 原文
-  ③ 同一辆车的其他场次实测（车代号在整个测试期对应同一份包与同一个 JDK）
+  ③ JDK 版本登记表 JDK_MEASURED_BY_CAR（车级跨批次实测背书，见下）
   ④ 车代号兜底表（CAR_FALLBACK，只在上面都没有时用）
 
 ⛔ 批次清单（PACKAGES.txt）不参与身份推导 —— 它是"这批装了哪些包"，
    不是"这个车跑的哪个包"（旧口径造成过三处真实错标，见 ENV 文档 §7.8）。
 ⛔ 不知道就是不知道，不猜：查不到来源的写 None（不写值），不拿车代号反推。
+⛔ **不设跨场次回填池**：不再从"同车其他场次的 sidecar"借用包/JDK 身份——
+   那是 campaign 作为证据池的残余语义，且池随导出范围漂移（同样的场次换个
+   导出范围值就变，破坏确定性）。JDK 的跨批次事实改走 ③ 的显式登记表；
+   包指纹（pkg_sha256）无本场实测就写 null，绝不借用。
 
 术语：**车（car）= 一套固定的被测配置**（引擎 + 引擎版本 + 引擎 build + JDK + 堆）。
 沿用 Rally 的原生词汇 —— Rally 官方定义：a Rally "car" is a specific configuration
@@ -75,6 +79,31 @@ BUILD_UNKNOWN = "—"     # 无 build 号的配置（ez250 发行包 / ES 8.19�
 # 源头没有就是没有 → 显示 "—"（如 ES 8.19.23、ez250 发行包），
 # 不从车代号里抠数字猜 —— 车代号是人起的，不是包的事实。
 
+# ---------------------------------------------------------------------------
+# JDK 版本登记表：车代号 → (厂商, 主版本, 完整版本号)
+#
+# 这是**补充的车级原始数据**，替代已删除的跨场次回填池：每个条目都有 sidecar
+# 的 java -version 实测背书（多个批次的场次一致），且只利用了一条不对称性——
+#   **JDK 与车代号绑定，跨部署期不变；引擎 build 才会跨批次更换。**
+#   （实测：jdk25 车在 2.5.0-3009 与 2.5.0-3015 两个部署期的 sidecar 实测
+#    都是 GraalVM 25.0.4 —— 所以 JDK 版本可以按车登记，包指纹不可以。）
+# 引擎版本 / build / 包 sha256 **不进**本表：那些随部署更换，逐场查源头。
+# 没有实测背书的车（ez250 / jdk21）不登记 —— 不知道就是不知道。
+#
+# 实测背书明细（DESIGN §2.5.2 有完整计数）：es819×26、ez240×18、jdk25×62、
+# jdk26×6、jdk27×6、kona25×42（本地 402 场 store 口径；服务器全量只多不少）。
+JDK_MEASURED_BY_CAR = {
+    "es819":      ("OpenJDK", "27", "27"),
+    "ez240":      ("GraalVM", "21", "21.0.9"),
+    "jdk25":      ("GraalVM", "25", "25.0.4"),
+    # jdk25-3009 是 jdk25 车在 3009 部署期的代号，JDK 同 jdk25（25.0.4 跨
+    # 3009/3015 实测一致）；本车代号自身无独立 java -version 记录。
+    "jdk25-3009": ("GraalVM", "25", "25.0.4"),
+    "jdk26":      ("OpenJDK", "26", "26.0.2.1"),
+    "jdk27":      ("OpenJDK", "27", "27"),
+    "kona25":     ("TencentKonaJDK", "25", "25.0.4"),
+}
+
 # java -version 原文里的完整版本号（openjdk version "25.0.4" 2025-01-21）
 _VERSION_RE = re.compile(r'(?:java version|openjdk version)\s+"([0-9][0-9.]*)')
 
@@ -101,12 +130,13 @@ def jdk_vm_of(side_jdk, jdk_file=None):
     return None
 
 
-def jdk_version_of(side, jdk_file=None):
+def jdk_version_of(side, jdk_file=None, car=None):
     """JDK **完整**版本号（25.0.4 / 26.0.2.1 / 21.0.9 / 27）—— 只认实测。
 
     ① sidecar 的节点 JVM 版本（jdk.measured_nodes）
     ② sidecar 落的 java -version 原文（jdk.java_version_raw_per_node）
     ③ logs/jdk-<车>.txt 的 java -version 原文
+    ④ JDK 版本登记表（JDK_MEASURED_BY_CAR，车级跨批次实测背书）
 
     查不到就返回 None：车代号推不出完整版本号（jdk25 可能是 25.0.4 也可能是 25.0.5），
     **不知道就是不知道，不猜**。
@@ -123,7 +153,13 @@ def jdk_version_of(side, jdk_file=None):
         v = jdk_file.get("version") if isinstance(jdk_file, dict) else None
         if v:
             return str(v)
-    return None
+    return jdk_version_fallback(car)
+
+
+def jdk_version_fallback(car):
+    """JDK 版本登记表反查：车代号 → 实测背书的完整版本号（无背书返回 None）。"""
+    e = JDK_MEASURED_BY_CAR.get(car or "")
+    return e[2] if e else None
 
 
 def _fallback_jdk_vm(car):
