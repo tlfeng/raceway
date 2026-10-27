@@ -602,6 +602,7 @@ _PAGE = """<!doctype html>
  .st-skip{color:#b80}.st-bad{color:#b00;font-weight:600}
  .chip-run{background:#dbeafe;color:#1d4ed8;font-size:11px;border-radius:4px;padding:1px 6px;white-space:nowrap}
  .chip-end{background:#e5e7eb;color:#4b5563;font-size:11px;border-radius:4px;padding:1px 6px;white-space:nowrap}
+ .chip-abort{background:#fef3c7;color:#92400e;font-size:11px;border-radius:4px;padding:1px 6px;white-space:nowrap}
  .warn{background:#fff7e6;border:1px solid #e7c98a;border-left:3px solid #d97706;border-radius:6px;padding:6px 12px;margin:6px 0;color:#7c4a03;font-size:13px}
  select,input{font:inherit}
  /* ---- ① 启动排程（沿用编排台样式） ---- */
@@ -961,6 +962,15 @@ function switchTab(name){
   if(name==='history') loadCampaigns();   // 回历史页顺带刷新活动状态
 }
 
+// 已结束里再分一档"已中止"：结束行是 trap / close-campaign.sh 补写的（括号里带"中止"），
+// 不是 runner 自然跑完 —— 历史页一眼能看出哪些批次没跑全。
+function endState(c){ return !c.ended?'运行中':(/中止/.test(c.last||'')?'已中止':'已结束'); }
+function endChip(c){
+  const s=endState(c);
+  const cls=s==='运行中'?'chip-run':s==='已中止'?'chip-abort':'chip-end';
+  return '<span class="'+cls+'">'+s+'</span>';
+}
+
 async function loadCampaigns(selectCid){
   let j;
   try{ const r=await fetch('/api/campaigns',{cache:'no-store'}); j=await r.json(); }
@@ -969,7 +979,7 @@ async function loadCampaigns(selectCid){
   const sel=document.getElementById('pcamp');
   sel.innerHTML=CAMPS.map(function(c){
     return '<option value="'+esc(c.cid)+'">'+esc(c.cid)+'（'+
-      (c.ended?'已结束':'运行中')+' '+c.valid+'/'+c.total+'）</option>';
+      endState(c)+' '+c.valid+'/'+c.total+'）</option>';
   }).join('');
   if(selectCid) CURCID=selectCid;
   if(!CURCID) CURCID=j.active||(CAMPS[0]?CAMPS[0].cid:null);
@@ -1044,7 +1054,7 @@ function renderProgress(d){
     const staleMin=(Date.now()/1000-camp.mtime)/60;
     if(staleMin>30)
       warns.unshift('进度文件已 '+Math.round(staleMin)+' 分钟无更新 —— runner 可能已停止'
-        +'（杀掉不写结束行；确认没人跑可用 stop-campaign.sh 清场后断点续跑）');
+        +'（确认没人跑后：./close-campaign.sh '+d.campaign+' 补结束行收尾，或 CAMP_ID='+d.campaign+' 断点续跑）');
   }
   document.getElementById('pwarns').innerHTML=warns
     .map(function(w){return '<div class="warn">⚠ '+esc(w)+'</div>';}).join('');
@@ -1075,7 +1085,7 @@ function renderHistory(){
   const f=document.getElementById('hfilter').value.trim().toLowerCase();
   const list=f?CAMPS.filter(function(c){return c.cid.toLowerCase().indexOf(f)>=0;}):CAMPS;
   document.getElementById('hrows').innerHTML=list.map(function(c){
-    const chip=c.ended?'<span class="chip-end">已结束</span>':'<span class="chip-run">运行中</span>';
+    const chip=endChip(c);
     const t=c.mtime?new Date(c.mtime*1000).toLocaleString():'-';
     return '<tr><td>'+esc(c.cid)+'</td><td>'+chip+'</td><td>'+c.valid+' / '+c.total+'</td>'+
       '<td>'+esc(t)+'</td><td style="white-space:normal;max-width:340px">'+esc(c.last||'')+'</td>'+

@@ -341,6 +341,25 @@ PROG="$CAMP_DIR/PROGRESS.txt"; RACES="$CAMP_DIR/RACES.md"
 STATE="$CAMP_DIR/STATE.txt"
 PROGSTEP() { echo "[$(date '+%F %T')] $*" | tee -a "$PROG"; }
 
+# 中止收尾：进度台判"已结束"只认 PROGRESS.txt 的 "campaign 结束: N/M 场有效" 行，而这行
+# 以前只有自然跑完才写 —— 被 TERM/INT/HUP 或 die 掉的 campaign 永远显示"运行中"。
+# 这里兜住：EXIT trap 在没写过自然结束行时补一条（N/M 取当前计数，不编数）。
+# KILL -9 拦不住，那条路由 stop-campaign.sh → close-campaign.sh 兜底。
+# RUNNER.pid 给 close-campaign.sh 判活用；退出时删掉，免得 pid 复用误判。
+echo $$ > "$CAMP_DIR/RUNNER.pid"
+CAMPAIGN_CLOSED=0; ABORT_REASON=''
+_close_on_exit() {
+  local rc=$?
+  rm -f "$CAMP_DIR/RUNNER.pid"
+  [ "$CAMPAIGN_CLOSED" = 1 ] && return 0
+  [ -f "$PROG" ] || return 0
+  echo "[$(date '+%F %T')] campaign 结束: ${okcnt:-0}/${total:-0} 场有效（中止: ${ABORT_REASON:-退出码 $rc}；续跑 CAMP_ID=${CAMP_ID}）" >> "$PROG"
+}
+trap _close_on_exit EXIT
+trap 'ABORT_REASON=SIGTERM; exit 143' TERM
+trap 'ABORT_REASON=SIGINT; exit 130' INT
+trap 'ABORT_REASON=SIGHUP; exit 129' HUP
+
 # ---------- 引擎映射（ibs 承载部署；路径/服务按 ENGINE_NAME 取） -----------------
 EZ_DIR="$IBS_BASE/easysearch"
 ES_DIR="$IBS_BASE/elasticsearch"
@@ -1157,6 +1176,7 @@ fi
 
 env_summary_csv   # monitors/*-summary.txt → ENV-SUMMARY.csv（benchmark-result-env/benchmark-result-metric 可直接吃）
 PROGSTEP "campaign 结束: $okcnt/$total 场有效。报告: $CAMP_DIR/results/；汇总: $RACES"
+CAMPAIGN_CLOSED=1   # 自然结束行已写，EXIT trap 不再补
 if [ -n "${NOTIFY_URL:-}" ]; then
   curl -sk --max-time 10 -X POST -H 'Content-Type: application/json' \
     -d "{\"campaign\":\"$CAMP_ID\",\"valid\":$okcnt,\"total\":$total,\"races\":\"$RACES\"}" "$NOTIFY_URL" \

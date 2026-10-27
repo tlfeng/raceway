@@ -327,10 +327,6 @@ try:
 except ImportError:                                                    # 从别处 import 本文件时
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     identity_mod = importlib.import_module('identity')
-CAR_FALLBACK = identity_mod.CAR_FALLBACK
-BUILD_UNKNOWN = identity_mod.BUILD_UNKNOWN
-ENGINE_SHORT = identity_mod.ENGINE_SHORT
-JDK_VENDOR_PREFIX = identity_mod.JDK_VENDOR_PREFIX
 series_key_of = identity_mod.series_key_of
 jdk_short_of = identity_mod.jdk_short_of
 jdk_vm_of = identity_mod.jdk_vm_of
@@ -1016,42 +1012,6 @@ def main():
     recall_idx = load_recall_index(args.campaigns)
     _recall_fids = sorted({f for (_c, f) in recall_idx})
 
-    # 预扫 sidecar：学出 car -> 引擎身份（实测包名/版本/JDK）。
-    # 有些场次没有 sidecar（早期 campaign），但同一实验车的包是同一份 ——
-    # 用别的场次实测到的身份回填，比留空或按车名猜要准。
-    car_identity = {}
-    for meta in metas.values():
-        seen_side = list(meta.get("sidecar", {}).values()) + list(meta.get("sidecar_by_race", {}).values())
-        for s in seen_side:
-            car = (s.get("run") or {}).get("car")
-            if not car:
-                continue
-            se = s.get("engine") or {}
-            base_pkg = os.path.basename(se.get("pkg") or "")
-            eng = ("elasticsearch" if base_pkg.startswith("elasticsearch")
-                   else "easysearch" if base_pkg.startswith("easysearch") else None)
-            vm = se.get("version_measured_nodes") or []
-            jdk_nodes = (s.get("jdk") or {}).get("measured_nodes") or []
-            # 只取**实测**厂商（不走车代号兜底）—— 这一份是"同车其他场次实测"的凭据
-            _vm = jdk_vm_of(s.get("jdk") or {})
-            if eng:
-                ident = {
-                    "engine": eng, "pkg": se.get("pkg"),
-                    "pkg_sha256": se.get("pkg_sha256"),
-                    "version": vm[0] if vm else se.get("version_from_pkg"),
-                    "jdk_vendor": _vm[0] if _vm else None,
-                    "jdk_version": ",".join(sorted({str(x) for x in jdk_nodes})) or None,
-                }
-                # 车代号在整个测试期对应同一份包与同一个 JDK —— 但先到的那份 sidecar
-                # 可能没带 JDK 实测（早期批次）。已有实测身份时不要用后来的空值覆盖。
-                if car not in car_identity:
-                    car_identity[car] = ident
-                else:
-                    old = car_identity[car]
-                    for _k in ("jdk_vendor", "jdk_version"):
-                        if not old.get(_k) and ident.get(_k):
-                            old[_k] = ident[_k]
-
     envs, runs, metrics = {}, [], []
     counters = {}          # 导出期统计（口径来源分布等），进 manifest
     # (campaign, fid) → 场次回填材料（track/时间/valid/quality/series_key），
@@ -1127,10 +1087,13 @@ def main():
             warn.append("no-RACES.md：valid 未知（campaign 目录不在或该场未记账）")
 
         # ---- 实测身份（方案 §3.2「引擎(实测)」+ §3.2「实验变量 typed promote」）----
+        # 身份只认**本场/本车/本race 的源头证据**：sidecar 实测 > 部署日志 >
+        # revision 指纹 > distribution-flavor/版本 > 车名兜底。
+        # 不设跨场次回填池（campaign 不是证据池）：包指纹无本场实测就是 null，
+        # JDK 完整版本走 identity.py 的车级实测登记表（JDK 与车代号绑定、跨部署期不变）。
         se = side.get("engine") or {}
         sj = side.get("jdk") or {}
         srp = side.get("run_params") or {}
-        ident = car_identity.get(car) or {}
         # 身份来源按可信度排队：sidecar 实测 > 部署日志 > revision 指纹 > 批次清单 > 车名兜底。
         # 批次清单（PACKAGES.txt）排最后：它是"这批装了哪些包"，不是"这个车跑的哪个包"。
         deploys = meta.get("deploys") or {}
@@ -1153,7 +1116,6 @@ def main():
         if not engine:
             engine = ("easysearch" if (car or "").startswith("ez")
                       else "elasticsearch" if (car or "").startswith("es") else None)
-        engine = engine or ident.get("engine")
         # 引擎级部署记录（ibs-deploy-easysearch.log / deploy-elasticsearch.log）：
         # 该批所有同引擎的车共用一份部署
         deploy_eng = deploys.get(engine) if engine else None
@@ -1162,7 +1124,6 @@ def main():
                    or (deploy[1] if deploy else None)
                    or (deploy_eng[1] if deploy_eng else None)
                    or (rev_id[1] if rev_id else None)
-                   or ident.get("version")
                    or (d.get("cluster") or {}).get("distribution-version"))
         # build（包名主干）与 version_from_pkg 已裁撤（2026-10-27 定稿）：
         # 与 pkg / version / engine_build 完全冗余且全仓零消费方 —— 不再产出。
@@ -1186,19 +1147,14 @@ def main():
         # ---- JDK 身份：实测优先，逐级降级（identity.py 口径）----
         # ① sidecar 本场实测（vendor_detected + measured_nodes）
         # ② campaign/logs/jdk-<车>.txt 的 java -version 原文
-        # ③ 同一辆车的其他场次实测（ident）
-        # ④ 车代号兜底表（CAR_FALLBACK）
+        # ③ 车代号兜底表（CAR_FALLBACK：厂商/主版本）+ JDK 版本登记表（完整版本号）
         # jdk_vendor 与 jdk_version 分开存：GraalVM 25 与 Kona 25 的完整版本号
         # 都是 25.0.4，只有厂商能分 —— 而 JDK 厂商对比正是本项目要回答的问题。
         jdk_file = (meta.get("jdks") or {}).get(car)
         jdk_vm = jdk_vm_of(sj, jdk_file)
         jdk_vendor = jdk_vendor_of(side, car, jdk_vm=jdk_vm, jdk_file=jdk_file)
         jdk_major = jdk_major_of(side, car, jdk_vm=jdk_vm, jdk_file=jdk_file)
-        jdk_version = jdk_version_of(side, jdk_file=jdk_file)
-        if not jdk_vendor:
-            jdk_vendor = ident.get("jdk_vendor")
-        if not jdk_version:
-            jdk_version = ident.get("jdk_version")
+        jdk_version = jdk_version_of(side, jdk_file=jdk_file, car=car)
         if not jdk_major:
             jdk_major = (str(jdk_version).split(".")[0] if jdk_version else None)
         # 系列键（看板分线键 + 图例文案）：引擎@版本@build@JDK
@@ -1291,7 +1247,9 @@ def main():
                      # 不等于本车跑的包（ez240 车在 jdk3-20261016-* 跑的是 2.4.0-2975，
                      # 那批清单里写的却是默认包 2.5.0-3015）。
                      "pkg_inventory": (meta.get("pkg_own") or {}).get(engine) or None,
-                     "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256") or ident.get("pkg_sha256"),
+                     # 包 sha256 只认本场 sidecar 实测 —— 无实测就是 null，
+                     # 不从其他批次/场次借用（campaign 不是证据池）
+                     "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256"),
                      "jdk_want": (side.get("jdk") or {}).get("want"),
                      "jdk_measured": (side.get("jdk") or {}).get("measured_nodes"),
                      "jdk_match_want": (side.get("jdk") or {}).get("match_want"),
