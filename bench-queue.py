@@ -198,6 +198,18 @@ class Source:
         except OSError:
             return None
 
+    def tail(self, camp, rel, n=60):
+        """读 campaign 里一个文件的最后 n 行（进度页的实时日志尾）。"""
+        if self.ssh:
+            p = shlex.quote(self._join(self.root, camp, rel))
+            return self._ssh('tail -n %d %s 2>/dev/null' % (int(n), p)) or ''
+        try:
+            with open(os.path.join(self.root, camp, rel), 'r',
+                      encoding='utf-8', errors='replace') as f:
+                return ''.join(f.readlines()[-int(n):])
+        except OSError:
+            return ''
+
 
 # ------------------------------------------------------------------ 模型
 @dataclass
@@ -216,6 +228,8 @@ class Field:
     recall: str = ''
     est: int = 0
     conflicts: list = field(default_factory=list)   # 互相矛盾的判定
+    phase: str = ''                                 # 运行中相位：write / query / recall
+    elapsed_min: float = 0.0                        # 运行中场次已进行分钟数（快照时算）
 
 
 @dataclass
@@ -292,13 +306,8 @@ class Campaign:
     @property
     def est_remaining_min(self):
         """剩余场次的预计耗时（分钟）：有 est 用 est，否则用已完成场的均值。"""
-        vals = []
-        for f in self.fields:
-            if f.duration and f.duration.endswith('min'):
-                try:
-                    vals.append(float(f.duration[:-3]))
-                except ValueError:
-                    pass
+        vals = [_duration_min(f.duration) for f in self.fields]
+        vals = [v for v in vals if v]
         avg = (sum(vals) / len(vals)) if vals else None
         total = 0.0
         for f in self.fields:
@@ -327,6 +336,8 @@ RE_FIELD_DEADLINE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+DEADLINE
 RE_RETRY = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+第\s*(\d+)/(\d+)\s*次尝试')
 RE_GIVEUP = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+已达最大重试次数')
 RE_PHASE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+(write race 开始|query race 开始|recall 探针开始)')
+# RE_PHASE 第 4 组 → 展示词（进度页的"当前相位"）
+PHASE_LABEL = {'write race 开始': 'write', 'query race 开始': 'query', 'recall 探针开始': 'recall'}
 RE_CAMPAIGN_END = re.compile(r'^\[([\d\-: ]+)\]\s+campaign 结束:\s*(\d+)/(\d+)\s*场有效')
 
 
@@ -345,6 +356,12 @@ def order_for_round(r, n):
 def base_fid(fid):
     """去掉重试后缀：jdk26-ds-j1024-r1-try2 → jdk26-ds-j1024-r1"""
     return re.sub(r'-try\d+$', '', fid)
+
+
+def _duration_min(duration):
+    """'26min' / '26 分钟' → 26.0；解析不出返回 None。"""
+    m = re.match(r'^([\d.]+)\s*(?:min|分钟)?', (duration or '').strip())
+    return float(m.group(1)) if m and m.group(1) else None
 
 
 def split_fid(fid, cars, tracks):
@@ -615,15 +632,22 @@ def build_campaign(src, cid, schedule_override=None):
             f.status = STATUS_RUNNING
             f.started = ts.strip()
             f.detail = ''
+            f.phase = ''
         elif kind == 'done':
             f.status = g[3]
             f.ended = ts.strip()
             f.duration = g[4]
             f.detail = ''
+            f.phase = ''
         elif kind == 'fail':
             f.status = g[3]
             f.ended = ts.strip()
             f.detail = (g[4] or '').strip()
+            f.phase = ''
+        elif kind == 'phase':
+            # 相位事件只对"正在跑"的场有意义（重跑新开始时 start 已清零）
+            if f.status == STATUS_RUNNING:
+                f.phase = PHASE_LABEL.get(g[3], '')
         elif kind == 'skip':
             txt = (g[3] or '').strip()
             if '已有' in txt:          # 续跑跳过：历史已有结论，别覆盖
@@ -764,6 +788,135 @@ def _parse_ts(s):
     return None
 
 
+# ------------------------------------------------------------------ campaign 摘要
+# 进度页/历史页都要一份"全部 campaign 的轻量清单"。逐个 build_campaign 在 ssh
+# 模式下是每场 3+ 次远端调用（52 个 campaign 就是上百次 ssh），列表页吃不消 ——
+# 这里一次调用/一次扫描拿全部：cid、PROGRESS.txt mtime、RACES 行数、VALID 数、
+# 最后一行（判定"是否已结束"用），细节留给点开后的 build_campaign。
+
+def _summary_from_parts(cid, mtime, raw_rows, valid_rows, n_start, n_end, last_line):
+    """摘要元组 → dict。RACES 行数含表头+分隔线两行，数据行要减掉。
+
+    「已结束」判定与 build_campaign 同语义：campaign 结束行出现在**最后一次**
+    起跑头之后才算真结束 —— 用行数近似（结束行数 ≥ 起跑头行数）。
+    runner 被杀后没有结束行，标"运行中"偏安全。
+    """
+    try:
+        mtime = int(mtime or 0)
+    except (TypeError, ValueError):
+        mtime = 0
+    try:
+        total = max(0, int(raw_rows or 0) - 2)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        valid = int(valid_rows or 0)
+    except (TypeError, ValueError):
+        valid = 0
+    try:
+        n_start = int(n_start or 0)
+    except (TypeError, ValueError):
+        n_start = 0
+    try:
+        n_end = int(n_end or 0)
+    except (TypeError, ValueError):
+        n_end = 0
+    last = (last_line or '').strip()
+    return {
+        'cid': cid,
+        'mtime': mtime,
+        'total': total,
+        'valid': valid,
+        'ended': n_end > 0 and n_end >= n_start,
+        'last': last,
+    }
+
+
+_RACES_VALID_RE = r'^\\|[^|]*\\|[[:space:]]*VALID[[:space:]]*\\|'
+
+
+def remote_summaries_script(root):
+    """campaign 摘要的远端采集脚本：一次 bash 循环，TSV 输出七列。
+
+    抽成函数是为了可测（bash -n 语法检查 / 本地 bash 直接执行比对）。
+    """
+    return (
+        'cd ' + shlex.quote(root) + ' 2>/dev/null || exit 0\n'
+        'for d in */; do\n'
+        '  p="${d}PROGRESS.txt"; r="${d}RACES.md"\n'
+        '  [ -f "$p" ] || continue\n'
+        '  cid="${d%/}"\n'
+        '  last=$(grep -v "^[[:space:]]*$" "$p" 2>/dev/null | tail -n 1 | cut -c1-120)\n'
+        '  raw=$(grep -c "^|" "$r" 2>/dev/null)\n'
+        '  valid=$(grep -cE "' + _RACES_VALID_RE + '" "$r" 2>/dev/null)\n'
+        '  ns=$(grep -c "启动:" "$p" 2>/dev/null)\n'
+        '  ne=$(grep -c "campaign 结束" "$p" 2>/dev/null)\n'
+        '  mt=$(stat -c %Y "$p" 2>/dev/null)\n'
+        '  printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$cid" "$mt" "$raw" "$valid" "$ns" "$ne" "$last"\n'
+        'done\n')
+
+
+def campaign_summaries(src):
+    """全部 campaign 的轻量摘要，按 mtime 新→旧返回。
+
+    ssh 模式下是一次远端 bash 循环（不是逐 campaign 一次 ssh）；本地模式直接读。
+    RACES.md 的一致性细节（矛盾判定等）不在这里查 —— 那是 build_campaign 的活。
+    """
+    if src.ssh:
+        out = src._ssh(remote_summaries_script(src.root))
+        parts = [(x.split('\t') + [''] * 7)[:7] for x in (out or '').splitlines() if '\t' in x]
+    else:
+        parts = []
+        for cid in src.list_campaigns():
+            prog_path = os.path.join(src.root, cid, 'PROGRESS.txt')
+            if not os.path.isfile(prog_path):
+                continue
+            last = ''
+            n_start = n_end = 0
+            try:
+                with open(prog_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        if '启动:' in line:
+                            n_start += 1
+                        elif 'campaign 结束' in line:
+                            n_end += 1
+                with open(prog_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in reversed(f.readlines()):
+                        if line.strip():
+                            last = line
+                            break
+            except OSError:
+                pass
+            races_path = os.path.join(src.root, cid, 'RACES.md')
+            raw = valid = 0
+            try:
+                with open(races_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        if line.startswith('|'):
+                            raw += 1
+                            if re.match(r'^\|[^|]*\|\s*VALID\s*\|', line):
+                                valid += 1
+            except OSError:
+                pass
+            try:
+                mt = os.path.getmtime(prog_path)
+            except OSError:
+                mt = 0
+            parts.append([cid, str(int(mt)), str(raw), str(valid),
+                          str(n_start), str(n_end), last.rstrip('\n')])
+    sums = [_summary_from_parts(*p) for p in parts]
+    sums.sort(key=lambda s: (s['mtime'], s['cid']), reverse=True)
+    return sums
+
+
+def pick_active(summaries):
+    """默认该看哪个 campaign：最新的没收尾的；全收尾了就看最新的（当历史用）。"""
+    for s in summaries:
+        if not s['ended']:
+            return s['cid']
+    return summaries[0]['cid'] if summaries else None
+
+
 # ------------------------------------------------------------------ 输出
 STATUS_STYLE = {
     STATUS_VALID: 'ok',
@@ -811,7 +964,8 @@ def render_summary(c):
     run = c.running
     if run:
         f = run[0]
-        out.append('  进行中：[%d] %s（起 %s）' % (f.seq, f.fid, f.started))
+        extra = ('，相位 %s' % f.phase) if f.phase else ''
+        out.append('  进行中：[%d] %s（起 %s%s）' % (f.seq, f.fid, f.started, extra))
     if c.deadline:
         out.append('  窗底守卫截止 %s' % c.deadline)
     if c.pending:
@@ -822,6 +976,12 @@ def render_summary(c):
 
 
 def campaign_json(c):
+    now = datetime.datetime.now()
+    for f in c.fields:
+        if f.status == STATUS_RUNNING and f.started:
+            st = _parse_ts(f.started)
+            if st:
+                f.elapsed_min = max(0.0, (now - st).total_seconds() / 60.0)
     return {
         'campaign': c.cid,
         'mode': c.mode,

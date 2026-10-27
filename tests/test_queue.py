@@ -16,8 +16,10 @@ import importlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -314,6 +316,175 @@ class TestRealCampaigns(unittest.TestCase):
         self.assertGreater(checked, 0, '没有可比对的 campaign')
         self.assertGreater(untrusted, 0,
                            '真实数据里应当存在"推导不可信"的旧版 campaign（否则校验形同虚设）')
+
+
+class TestPhaseTracking(unittest.TestCase):
+    """进度页的"当前相位"：write/query/recall 只对正在跑的场有意义。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _camp(self, cid, lines):
+        write(os.path.join(self.root, cid, 'PROGRESS.txt'),
+              '\n'.join(lines) + '\n')
+        return Q.build_campaign(Q.Source(self.root), cid)
+
+    def test_running_field_shows_latest_phase(self):
+        c = self._camp('ph1', [
+            '[2026-10-20 10:00:00] campaign ph1 启动: cars=[a] tracks=geo rounds=1',
+            '[2026-10-20 10:01:00] ===== [1] a-geo-r1 开始 =====',
+            '[2026-10-20 10:05:00] [1] a-geo-r1 write race 开始',
+            '[2026-10-20 10:12:00] [1] a-geo-r1 query race 开始',
+        ])
+        f = c.fields[0]
+        self.assertEqual(f.status, 'RUNNING')
+        self.assertEqual(f.phase, 'query')
+
+    def test_phase_clears_when_field_done(self):
+        c = self._camp('ph2', [
+            '[2026-10-20 10:00:00] campaign ph2 启动: cars=[a] tracks=geo rounds=1',
+            '[2026-10-20 10:01:00] ===== [1] a-geo-r1 开始 =====',
+            '[2026-10-20 10:05:00] [1] a-geo-r1 write race 开始',
+            '[2026-10-20 10:30:00] [1] a-geo-r1 完成: VALID（29 分钟）',
+        ])
+        f = c.fields[0]
+        self.assertEqual(f.status, 'VALID')
+        self.assertEqual(f.phase, '')
+
+    def test_campaign_json_has_elapsed_for_running_field(self):
+        c = self._camp('ph3', [
+            '[2026-10-20 10:00:00] campaign ph3 启动: cars=[a] tracks=geo rounds=1',
+            '[2026-10-20 10:01:00] ===== [1] a-geo-r1 开始 =====',
+            '[2026-10-20 10:05:00] [1] a-geo-r1 write race 开始',
+        ])
+        d = Q.campaign_json(c)
+        f = d['fields'][0]
+        self.assertEqual(f['status'], 'RUNNING')
+        self.assertGreater(f['elapsed_min'], 0.0)
+
+
+class TestSourceTail(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_tail_returns_last_n_lines(self):
+        lines = ['line-%02d' % i for i in range(100)]
+        write(os.path.join(self.root, 'c1', 'PROGRESS.txt'), '\n'.join(lines) + '\n')
+        src = Q.Source(self.root)
+        self.assertEqual(src.tail('c1', 'PROGRESS.txt', 5).split(), lines[-5:])
+        self.assertEqual(src.tail('c1', 'PROGRESS.txt', 200).split(), lines)
+
+    def test_tail_missing_file_is_empty(self):
+        self.assertEqual(Q.Source(self.root).tail('nope', 'PROGRESS.txt', 5), '')
+
+
+class TestCampaignSummaries(unittest.TestCase):
+    """列表页/进度页默认选中：一次扫描拿全部 campaign 的轻量摘要。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _camp(self, cid, ended, valid_rows):
+        races = ['# RACES — %s' % cid,
+                 '| 场次 | 状态 | 赛前卡点 | 用时 |', '|---|---|---|---|']
+        for fid, st in valid_rows:
+            races.append('| %s | %s | precheck=PASS | 26min |' % (fid, st))
+        prog = ['[2026-10-20 10:00:00] campaign %s 启动: cars=[a] tracks=geo rounds=1' % cid]
+        if ended:
+            prog.append('[2026-10-20 11:00:00] campaign 结束: %d/%d 场有效。'
+                        % (sum(1 for _, s in valid_rows if s == 'VALID'), len(valid_rows)))
+        else:
+            prog.append('[2026-10-20 10:30:00] [1] a-geo-r1 write race 开始')
+        write(os.path.join(self.root, cid, 'PROGRESS.txt'), '\n'.join(prog) + '\n')
+        write(os.path.join(self.root, cid, 'RACES.md'), '\n'.join(races) + '\n')
+
+    def test_summary_from_parts(self):
+        s = Q._summary_from_parts('c1', '1770000000', '4', '2', '1', '1',
+                                  '[2026-10-20 11:00:00] campaign 结束: 2/2 场有效。')
+        self.assertEqual(s['cid'], 'c1')
+        self.assertEqual(s['total'], 2)      # 4 行 - 表头 + 分隔线 2 行
+        self.assertEqual(s['valid'], 2)
+        self.assertTrue(s['ended'])
+        s2 = Q._summary_from_parts('c2', 'x', '0', '', '1', '0',
+                                   '[2026-10-20 10:30:00] [1] x write race 开始')
+        self.assertEqual((s2['total'], s2['valid'], s2['ended']), (0, 0, False))
+        self.assertEqual(Q._summary_from_parts('c3', None, None, None, None, None, '')['mtime'], 0)
+
+    def test_ended_needs_end_line_after_last_header(self):
+        """收尾判定：结束行数 ≥ 起跑头行数才算完 —— runner 收尾后还有
+        「已停集群并清理数据」等后继行，不能只看最后一行。"""
+        # 1 次起跑 + 1 次结束 → 已结束（哪怕最后一行是清理信息）
+        s = Q._summary_from_parts('c1', '1', '0', '0', '1', '1',
+                                  '[…] 已停集群并清理数据（安装与 jdk.bundled* 归档保留）')
+        self.assertTrue(s['ended'])
+        # 重启过 2 次但只收尾 1 次 → 运行中
+        s2 = Q._summary_from_parts('c2', '1', '0', '0', '2', '1', 'x')
+        self.assertFalse(s2['ended'])
+
+    def test_local_summaries_sorted_and_counted(self):
+        self._camp('a-old', True, [('a-geo-r1', 'VALID'), ('a-geo-r2', 'VALID')])
+        self._camp('b-new', False, [('b-geo-r1', 'VALID')])
+        write(os.path.join(self.root, 'not-a-camp', 'README'), 'x')
+        # mtime 决定排序：把 a-old 拨老
+        old = time.time() - 100000
+        os.utime(os.path.join(self.root, 'a-old', 'PROGRESS.txt'), (old, old))
+        sums = Q.campaign_summaries(Q.Source(self.root))
+        self.assertEqual([s['cid'] for s in sums], ['b-new', 'a-old'])
+        by = {s['cid']: s for s in sums}
+        self.assertEqual((by['a-old']['total'], by['a-old']['valid'], by['a-old']['ended']),
+                         (2, 2, True))
+        self.assertEqual((by['b-new']['total'], by['b-new']['valid'], by['b-new']['ended']),
+                         (1, 1, False))
+
+    def test_pick_active(self):
+        self._camp('a-old', True, [('a-geo-r1', 'VALID')])
+        self._camp('b-new', False, [('b-geo-r1', 'VALID')])
+        old = time.time() - 100000
+        os.utime(os.path.join(self.root, 'a-old', 'PROGRESS.txt'), (old, old))
+        sums = Q.campaign_summaries(Q.Source(self.root))
+        self.assertEqual(Q.pick_active(sums), 'b-new')
+        # 全部收尾 → 默认看最新的（当历史浏览入口）：把 b-new 也收尾并拨得更老
+        self._camp('b-new', True, [('b-geo-r1', 'VALID')])
+        os.utime(os.path.join(self.root, 'b-new', 'PROGRESS.txt'),
+                 (old - 1000, old - 1000))
+        sums = Q.campaign_summaries(Q.Source(self.root))
+        self.assertTrue(all(s['ended'] for s in sums))
+        self.assertEqual(Q.pick_active(sums), 'a-old')
+
+    def test_remote_script_bash_syntax(self):
+        bash = shutil.which('bash')
+        if not bash:
+            self.skipTest('本机没有 bash')
+        p = subprocess.run([bash, '-n'], input=Q.remote_summaries_script('/opt/raceway/campaigns'),
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_remote_script_executes_against_fixture(self):
+        """远端脚本不在 ssh 环境也能跑对：直接用本地 bash 执行同一份脚本比对输出。"""
+        bash = shutil.which('bash')
+        if not bash:
+            self.skipTest('本机没有 bash')
+        self._camp('a-old', True, [('a-geo-r1', 'VALID'), ('a-geo-r2', 'VALID')])
+        p = subprocess.run([bash], input=Q.remote_summaries_script(self.root),
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = {x.split('\t')[0]: x.split('\t') for x in p.stdout.splitlines() if x}
+        self.assertIn('a-old', rows)
+        r = rows['a-old']
+        self.assertEqual(r[2], '4')    # raw 行数（含表头+分隔线）
+        self.assertEqual(r[3], '2')    # VALID 行数
+        self.assertEqual(r[4], '1')    # 起跑头行数
+        self.assertEqual(r[5], '1')    # 结束行数
+        self.assertIn('campaign 结束', r[6])
 
 
 if __name__ == '__main__':
