@@ -28,7 +28,7 @@ H = importlib.import_module('bench-history')  # noqa: E402
 def row(campaign='c1', fid='jdk25-ds-j1024-r1', car='jdk25', car_build='jdk25@3015',
         track='ds-j1024', rnd=1, status='VALID', quality='ok', phase='w',
         challenge=None, ts='2026-10-21T02:30:00Z', warnings=None):
-    """一行 bench-run 文档（2026-10-21 字段终态）。
+    """一行 benchmark-result-race 文档（2026-10-21 字段终态）。
 
     身份不再有顶层 car / car_build 字段 —— 车代号在 user_tags.car，
     构建号在 engine_build，bench-history 用 row_build_key 合成 `车@build`。

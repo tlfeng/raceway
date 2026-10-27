@@ -12,7 +12,7 @@
 - **运维全托管**：部署/冷启动/卡点/卸载统一走 [ibs](https://github.com/tlfeng/ibs) CLI；堆由部署统一设定（内存/2）
 - **拓扑单事实源**：节点列表/数量/部署范围全部从 ibs `ip.txt` 派生（集群节点=主机名非 esrally 行），2~N 节点免改代码
 - **省心件**：`--dry-run` 排程预览 · 断点续跑（已 VALID 场自动跳过）· `list` 子命令 · 收尾 webhook 通知
-- **结果入库**：一键导出 `bench-env / bench-run / bench-metric` 三索引载荷（单位归一、幂等 upsert），Kibana/Grafana 直接建板
+- **结果入库**：一键导出 `benchmark-result-env / benchmark-result-race / benchmark-result-metric` 三索引载荷（单位归一、幂等 upsert），Kibana/Grafana 直接建板
 
 ## 架构
 
@@ -77,18 +77,18 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 > **stat 归一后 `_id` 会变**（rally 的 `median`→`p50`、`99_99`→`p9999`），
 > 旧索引里的同一条会变成两条 —— 改词表后必须 `bench-apply.py --drop` 重建。
 
-三索引：`bench-env`（环境台账）/ `bench-run`（一场一条主维度表）/ `bench-metric`(一指标一行长表，单位归一)。
+三索引：`benchmark-result-env`（环境台账）/ `benchmark-result-race`（一场一条主维度表）/ `benchmark-result-metric`（一指标一行长表，单位归一）。三张表各自独立 strict 模板 + 导出期字段白名单。
 
 口径要点：
 
 - **error_rate 按 rally 语义 0~1 原样入库**（`1.0` = 该 task 请求全失败），不按百分比再折算
 - 实验变量 `dims` / `lineage` 从 user-tags 提升为 typed 列，可 range/排序
-- **bench-metric 带 `track` 列**（归一化赛道名）：按赛道拆看板的前提 —— 指标行没有
+- **benchmark-result-metric 带 `track` 列**（归一化赛道名）：按赛道拆看板的前提 —— 指标行没有
   track 就没法按赛道过滤
-- **bench-metric 只带一个身份字段 `series_key`**（引擎@版本@build@JDK，如
+- **benchmark-result-metric 只带一个身份字段 `series_key`**（引擎@版本@build@JDK，如
   `ez@2.5.0@3015@graalvm25`）：run 维度（engine/version/jdk/dims/segment_form/
-  env_id/round/phase/车代号…）在指标行上与 bench-run 完全重复，既白付体积又多一份漂移面，
-  全部回 bench-run 查（方案 §1 修订）。看板按 `series_key` 分线，TSVB 的 split-by 只吃一个字段；
+  env_id/round/phase/车代号…）在指标行上与 benchmark-result-race 完全重复，既白付体积又多一份漂移面，
+  全部回 benchmark-result-race 查（方案 §1 修订）。看板按 `series_key` 分线，TSVB 的 split-by 只吃一个字段；
   按引擎过滤写 `series_key:ez@*`（**不加引号** —— 带引号是精确短语，实测匹配 0 条）
 - **身份只认实测**：`jdk_vendor` / `jdk_version` 取 sidecar 的 `java -version` 原文与节点 JVM 版本，
   查不到就空 —— 车代号推不出 patch 号（jdk25 可能是 25.0.4 也可能是 25.0.5），不知道就不猜；
@@ -99,7 +99,7 @@ python3 kibana/make_dashboard.py --import --es <url> --kibana <url>
 - 引擎身份 `engine`（easysearch/elasticsearch）从**包名**推导，不信 sidecar 的 `name` 字段
 - 幂等：文档 `_id` 固定（`race_id` / `race_id|task|family|stat`），重复执行是覆盖不是翻倍
 - 改了 index template 必须 `--drop` 重建索引，旧 mapping 不会自动更新
-- **bench-metric 的索引模板是 `dynamic: strict`**：字段集 = 导出器的白名单，白名单外的字段
+- **三张索引的模板都是 `dynamic: strict`**：字段集 = 导出器的白名单（metric/race/env 各一份），白名单外的字段
   （run 维度回流）在 ES 侧直接拒收 —— 精简靠机制保证，不靠口头约定
 
 看板对照 [opensearch.org/benchmarks](https://opensearch.org/benchmarks/) 的分页口径：
@@ -195,7 +195,7 @@ python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
 | 工具 | 干什么 |
 |---|---|
 | `bench-queue.py` | **队列观测台**（纯读）：把 campaign 目录里的 `PROGRESS.txt` / `RACES.md` / `STATE.txt` / 排程文件推导成队列视图，实时页 + 四类告警（判定矛盾 / STATE 行号错位 / 排程运行期被改 / 窗底漂移） |
-| `bench-history.py` | **已入库历史覆盖**（纯读）：把指标库 `bench-run` 索引读成「车×赛道×轮次」覆盖表，回答"哪些格已经跑过、什么判定、哪个 build" |
+| `bench-history.py` | **已入库历史覆盖**（纯读）：把指标库 `benchmark-result-race` 索引读成「车×赛道×轮次」覆盖表，回答"哪些格已经跑过、什么判定、哪个 build" |
 | `bench-compose.py` | **控制台**：① 启动排程（矩阵勾选 → 生成排程 → dry-run 预览 → 互斥预检后起跑，**默认自动剔除指标库里已跑过的格**）② 运行进度（当前场次/相位/耗时、进度条、实时日志、停止）③ 历史与结果（campaign 清单、按此重排、Kibana 外链）——见上节 |
 
 ```bash

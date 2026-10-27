@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""bench-history.py —— 已入库历史覆盖（指标库 bench-run 的只读视图）
+"""bench-history.py —— 已入库历史覆盖（指标库 benchmark-result-race 的只读视图）
 
 为什么需要它
 ------------
 编排台（bench-compose）只会排新活：矩阵勾什么就排什么，**不知道哪些格已经跑过**。
-指标库里躺着几百行 bench-run（三十多个 campaign、上百个 车×赛道×轮次 组合），
+指标库里躺着几百行 benchmark-result-race（三十多个 campaign、上百个 车×赛道×轮次 组合），
 用户却要在编排界面里凭记忆避开已做过的组合 —— 结果要么重复跑已经跑过的场次
 （白烧几小时机器，还把轮间时序摊薄的前提搞脏），要么漏掉没跑的那一格。
 
-本模块把指标库 bench-run 索引读成一张**覆盖表**：
+本模块把指标库 benchmark-result-race 索引读成一张**覆盖表**：
 
     一格 = (车 car, 赛道 track, 轮次 round)
 
@@ -58,19 +58,19 @@ except ImportError:                                                    # 从别�
     identity_mod = importlib.import_module('identity')
 car_of = identity_mod.car_of      # 文档里的车代号（user_tags.car）
 
-INDEX = 'bench-run'
+INDEX = 'benchmark-result-race'
 DEFAULT_ES_URL = 'https://127.0.0.1:9237'
 
 # 一次读走的行数上限（不够就再翻页）
 PAGE_SIZE = 2000
 
-# bench-run 里要取的字段（只取覆盖判定用得到的，省带宽也省内存）
+# benchmark-result-race 里要取的字段（只取覆盖判定用得到的，省带宽也省内存）
 # 注意 track_raw / codec / source_reuse 都要取：
 #   track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
 #   codec 相同，靠 codec 分不出，只能靠目录名）
 #   codec / source_reuse = 压缩与复用的两个独立维度
 _SOURCE_FIELDS = ['campaign', 'fid', 'user_tags', 'engine', 'engine_build',
-                  'build', 'track', 'track_raw', 'round', 'status', 'quality', 'phase',
+                  'track', 'track_raw', 'round', 'status', 'quality', 'phase',
                   '@timestamp', 'caliber_warnings', 'dims', 'pkg',
                   'challenge', 'codec', 'source_reuse',
                   'series_key', 'jdk_vendor', 'jdk_version']
@@ -191,7 +191,7 @@ def variant_of(track, codec, sr):
 
 
 def variant_id_of(row):
-    """一行 bench-run → 变体 id（覆盖判定的 key 维度）。
+    """一行 benchmark-result-race → 变体 id（覆盖判定的 key 维度）。
 
     **按 track_raw（变体目录名）判定，不用 codec 字段反推** —— 因为基座赛道
     与它的 default 变体实测出来的 index.codec 是一样的（引擎默认就是 LZ4），
@@ -275,7 +275,7 @@ def es_query(ssh, body, auth=None, es_url=DEFAULT_ES_URL, path=None, timeout=90)
 
 def fetch_rows(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
                timeout=90, max_rows=20000):
-    """读 bench-run 全部行（精简字段）。返回 (rows, total)。
+    """读 benchmark-result-race 全部行（精简字段）。返回 (rows, total)。
 
     行数超过单页就用 scroll 继续翻，翻不动就抛 HistoryUnavailable ——
     宁可报错，也不能只拿到前半截就当成"全部历史"。
@@ -511,7 +511,7 @@ class Coverage:
 
 
 def build_coverage(rows, total=None):
-    """把 bench-run 的行折叠成覆盖表。"""
+    """把 benchmark-result-race 的行折叠成覆盖表。"""
     cov = Coverage(total_rows=total if total is not None else len(rows))
     camps, tracks, cars = set(), set(), set()
     for r in rows:

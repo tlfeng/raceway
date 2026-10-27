@@ -3,7 +3,7 @@
 """bench-apply.py —— 把 bench-export.py 的产物灌进任意 ES/Easysearch 集群（纯标准库，无需 client）
 
   python3 bench-apply.py --dir exports/<tag> \
-      --es https://127.0.0.1:9200 --auth admin:CHANGE_ME [--insecure] [--only bench-run,bench-metric]
+      --es https://127.0.0.1:9200 --auth admin:CHANGE_ME [--insecure] [--only benchmark-result-race,benchmark-result-metric]
   python3 bench-apply.py --dir exports/<tag> --es http://localhost:9200        # 无鉴权集群
   python3 bench-apply.py --dir exports/<tag> --es http://localhost:9200 --drop # 先删索引再重建
 
@@ -25,7 +25,7 @@ import sys
 import urllib.error
 import urllib.request
 
-IDX = ("bench-env", "bench-run", "bench-metric")
+IDX = ("benchmark-result-env", "benchmark-result-race", "benchmark-result-metric")
 
 
 def flatten_fields(template):
