@@ -10,8 +10,9 @@
 # 采样间隔 MON_INTERVAL（默认 5s；probe 固定 1s）。summary 只消费 avg/max，
 # 5s 已够，且把采样器自身 fork 噪声降到 1/5（其进程不匹配 ENGINE_MARK，
 # 本会计入 foreign——被测指标里含采样器自己）。编排按相位分 tag 采集
-# （<fid>-w 写入 / -m 合并 / -q 查询），分相位 summary 即"写入/合并/查询
-# 时的系统占用"画像；整场拍成一份均值无法区分相位。
+# （<fid>-w 写入 / -q 查询；merge 相位不采——forcemerge 的 HTTP 调用是同步的、
+# 秒级完成，5s 间隔一次都赶不上，实测 -m CSV 全部只有表头），
+# 分相位 summary 即"写入/查询时的系统占用"画像；整场拍成一份均值无法区分相位。
 #
 # ENGINE_MARK：进程归因标记。cmdline 含此串的进程计入 bench 列（被测引擎），
 # 其余计入 foreign 列（外来负载）。注意 merge 写回是内核线程（kworker 无
@@ -27,8 +28,8 @@
 set -u
 MON_DIR=${RACEWAY_MON_DIR:-/opt/raceway/monitor}   # CSV/pid 落位（与编排侧 BENCH_BASE 一致）
 INTERVAL=${MON_INTERVAL:-5}
-# 赛后判定阈值（独立运行时的默认值）。steal 与赛前卡点 GATE_STEAL 同口径：
-# 任一采样达标即 CONTAMINATED。阈值经 ssh 不透传，改默认值直接改这里。
+# 赛后判定阈值（独立运行时的回退默认）。主旋钮在 vm-bench.env 的 VERDICT_*，
+# runner 会经 ssh 显式传入（缺键时才落到这里的默认值）——一处改，赛前卡点同口径生效。
 VERDICT_STEAL_MAX=${VERDICT_STEAL_MAX:-2.0}
 VERDICT_FOREIGN_MAX=${VERDICT_FOREIGN_MAX:-5}
 mkdir -p "$MON_DIR"

@@ -34,7 +34,7 @@
 #       → ibs wipe 冷启动 → 集群卡点(含端口属主) → heap_assert → cpu_affinity_assert
 #       → write race → 段数卡点 → query race → ENV 判定 → sidecar/监控归档
 # 口径：堆由 ibs 部署统一设定（内存/2=16g）；负载卡点按 PRECHECK_MODE（each 每场 / once 起跑前）；
-#   场中 load-monitor 分相位采集（w 写入/m 合并/q 查询，5s）仅记录不判成败。codec 是索引设置维度，靠赛道变体承载（gdef/gzstd/gbc）。
+#   场中 load-monitor 分相位采集（w 写入/q 查询，5s）仅记录不判成败（merge 相位太短采不到，不采）。codec 是索引设置维度，靠赛道变体承载（gdef/gzstd/gbc）。
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -60,6 +60,10 @@ case "$PRECHECK_MODE" in each|once) ;; *) die "PRECHECK_MODE 必须是 each|once
 PCTAG=$([ "$PRECHECK_MODE" = once ] && echo campaign-once || echo PASS)
 FP_DIR=""; LAST_RACE_ID=""; ENV_ID=${ENV_ID:-bench-3node-32c32g}
 CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默卡点阈值内置默认在 precheck.sh）
+# 赛后 ENV 判定阈值（主旋钮在 vm-bench.env；缺键回退脚本内置默认）。
+# 经 ssh 显式传给虚机侧 load-monitor summary —— 不透传的话虚机侧只能用它的内置默认，
+# 用户在 env 里改了也不生效（这正是当年 VERDICT_* 没法放进 env 的原因）。
+: "${VERDICT_STEAL_MAX:=2.0}"; : "${VERDICT_FOREIGN_MAX:=5}"
 
 # ds-*（维度扫描）赛道超时：≥1536 维写入给 14400s，其余 10800s；查询统一 5400s
 : "${TIMEOUT_DS_W:=10800}"; : "${TIMEOUT_DS_W_HI:=14400}"; : "${TIMEOUT_DS_Q:=5400}"
@@ -570,11 +574,16 @@ monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/（分相位时
     vm "$ip" "$MON_DIR/load-monitor.sh stop $fid" >/dev/null 2>&1
     vm "$ip" "cat $MON_DIR/mon-$fid.csv" > "$mondir/$fid-${VM_NAMES[$k]}.csv" 2>/dev/null
     { echo "node=${VM_NAMES[$k]} ip=$ip"
-      vm "$ip" "$MON_DIR/load-monitor.sh summary $MON_DIR/mon-$fid.csv" 2>/dev/null; } \
+      vm "$ip" "VERDICT_STEAL_MAX='$VERDICT_STEAL_MAX' VERDICT_FOREIGN_MAX='$VERDICT_FOREIGN_MAX' $MON_DIR/load-monitor.sh summary $MON_DIR/mon-$fid.csv" 2>/dev/null; } \
       > "$mondir/$fid-${VM_NAMES[$k]}-summary.txt" 2>/dev/null
     vm "$ip" "rm -f $MON_DIR/mon-$fid.csv" >/dev/null 2>&1
   done
-  PROGSTEP "  监控摘要 $fid: $(grep -h 'steal_avg' "$mondir/$fid"-*-summary.txt 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^steal_(avg|max)=/) printf "%s ",$i}' | tr -d '\n')"
+  # PROGRESS 里的监控摘要：只报三节点最坏的 steal_max（逐节点明细在
+  # monitors/*-summary.txt，重复 3 组数字没法一眼判读"脏没脏"）
+  local worst
+  worst=$(grep -ho 'steal_max=[0-9.]*' "$mondir/$fid"-*-summary.txt 2>/dev/null \
+          | cut -d= -f2 | sort -g | tail -1)
+  PROGSTEP "  监控摘要 $fid: steal_max=${worst:-无数据}%(三节点最坏)"
 }
 
 env_summary_csv() { # campaign 收尾：把各场 summary 拍平成一张 CSV（bench-env/bench-metric 可直接吃）
@@ -878,7 +887,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     PROGSTEP "[$seq] $fid CLUSTER-NOT-READY（logs/ibs-ready-$fid.log）"; return 1; }
   heap_assert "$eng" "$HEAP" "$(eng_dir_of "$eng")" "$(svc2_of "$eng")" || { echo "| $fid | HEAP-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid HEAP-ASSERT-FAIL（实际堆≠声明 heap:$HEAP）"; return 1; }
   cpu_affinity_assert "$eng" || { echo "| $fid | CPU-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-ASSERT-FAIL"; return 1; }
-  monitor_start "$fid-w" "$eng"   # 分相位被动采集：w=写入 m=合并 q=查询（summary 即分相位占用画像），不参与判定
+  monitor_start "$fid-w" "$eng"   # 分相位被动采集：w=写入 q=查询（merge 相位不采，见段数卡点处注释），不参与判定
 
   # 4) write-only race
   PROGSTEP "[$seq] $fid write race 开始（timeout $(track_tmo_w "$tk")s）"
@@ -903,11 +912,13 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   monitor_stop "$fid-w"
 
   # 5) 段数卡点
+  #    （merge 相位不再起监控：forcemerge 的 HTTP 调用是同步的，秒级完成，
+  #     5s 采样间隔一次都赶不上 —— 实测三个 campaign 的 -m CSV 全部只有表头，
+  #     ENV-SUMMARY 里约 1/3 的行是 NO-DATA 噪声。要 merge 期占用画像得换
+  #     1s 间隔或事后读 /proc，有需要再加。）
   local segok=1
   if [ $rc -eq 0 ]; then
-    monitor_start "$fid-m" "$eng"
     force_merge_to_one "$idx" 1200 || segok=0
-    monitor_stop "$fid-m"
   fi
 
   # 6) query-only race

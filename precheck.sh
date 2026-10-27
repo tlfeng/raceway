@@ -17,9 +17,11 @@ load_topology
 
 # 静默卡点阈值（vm-bench.env 可覆盖；缺键时用内置默认，旧 env 不用改也能跑）
 QUIET_LOAD1=${QUIET_LOAD1:-3}              # 虚机 1 分钟负载
-QUIET_STEAL=${QUIET_STEAL:-2}              # cpu steal %（赛后 ENV 判定同口径：verdict 默认值在 load-monitor.sh 内）
+QUIET_STEAL=${QUIET_STEAL:-${VERDICT_STEAL_MAX:-2}}
+#   ^ cpu steal %：与赛后 ENV 判定**同源**（主旋钮 VERDICT_STEAL_MAX，vm-bench.env 一处改两边生效）
 QUIET_BENCH_CPU=${QUIET_BENCH_CPU:-1}      # 被测引擎进程 CPU %（>0 即残留引擎或 ENGINE_MARK 错位）
-QUIET_FOREIGN_CPU=${QUIET_FOREIGN_CPU:-5}  # 非被测引擎进程 CPU %
+QUIET_FOREIGN_CPU=${QUIET_FOREIGN_CPU:-${VERDICT_FOREIGN_MAX:-5}}
+#   ^ 外来进程 CPU %：同上，继承 VERDICT_FOREIGN_MAX
 QUIET_FREE_GB=${QUIET_FREE_GB:-20}         # 磁盘可用 GB
 
 # 宿主旁路负载：指标库(9237) / 协议适配层(9202) / Kibana(5601)
