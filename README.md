@@ -26,6 +26,7 @@
 
 ```
 run-bench.sh                 唯一编排入口（配置×赛道×轮次；list/--dry-run/断点续跑）
+doctor.sh                    新环境体检（六组只读检查：工具/env/拓扑/连通/语料/指标库）
 vm-bench-lib.sh              公共函数库（被 source）
 vm-bench.env.example         共享配置模板（复制为 vm-bench.env 填写；真身不入库）
 reset-env.sh                 环境还原（停/清/卸载）
@@ -167,7 +168,27 @@ python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out �
 的同名函数），`tests/test_codec_variants.py` 直接执行 bash 那套与 python 侧逐项比对。
 
 
-## 队列观测与图形编排
+## 控制台：启动 · 进度 · 历史（一个页面搞定）
+
+```bash
+python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
+#   --ssh 缺省读环境变量 RACEWAY_SSH；--es-auth 缺省读 RACEWAY_ES_AUTH
+#   起来后自动开浏览器（--no-open 关掉），默认 http://127.0.0.1:8802
+```
+
+`bench-compose.py serve` 是**三合一控制台**（原"排程编排台"扩容）：
+
+| 标签 | 干什么 |
+|---|---|
+| ① 启动排程 | 矩阵勾选 → 自动剔除指标库已跑过的格 → 生成排程 → dry-run 预览 → 互斥预检后起跑；**生成时显示预计总耗时，超出 DS_HOURS 窗口当场预警**（放不下的场次会被 DEADLINE-SKIP）；勾选记 localStorage；起跑成功自动跳到进度页 |
+| ② 运行进度 | 自动选中最新没收尾的 campaign：进度条、总/有效/失败/待跑卡片、剩余分钟与预计完成时刻；**当前场次 + 相位（write/query/recall）+ 已进行时长**；PROGRESS.txt 实时日志尾；标签页标题当状态栏（`▶ 场次 · 相位`，切走也能瞄）；完成时可弹系统通知；进度文件长期无更新会提示"runner 可能已停止"；可一键停止（远端 stop-campaign.sh，二次确认） |
+| ③ 历史与结果 | 全部 campaign 清单（一次远端调用取摘要）+ 关键字筛选；任一场「看进度」复看逐场明细；「按此重排」把该场的 车×赛道×轮次 预填进启动排程；**两场对比**（远端跑 car-compare：A 车 vs B 车逐轮实测、中位差值 Δ、轮间极差——车代号留空自动取）；外链 Kibana 看板（Kibana 只听远端 127.0.0.1 时先 `ssh -L 5601:127.0.0.1:5601 …`） |
+
+配套的只读 CLI 仍在：`bench-queue.py`（list / status / plan / html / serve，campaign 队列观测）、
+`bench-history.py`（指标库覆盖表）。进度页的推导就来自 `bench-queue.build_campaign`。
+
+历史短排程复用一例：历史页挑一场满意的 campaign →「按此重排」→ 启动页自动勾好
+车/赛道/轮次并填上 tag 前缀 → 调整 → 生成排程 → dry-run → 起跑，全程不碰 ssh 命令行。
 
 三个只读/半读的本地工具，把"队列"从散落的文件变成能看能排的东西：
 
@@ -175,17 +196,15 @@ python3 bench-report.py --export exports/<tag> --echarts echarts.min.js --out �
 |---|---|
 | `bench-queue.py` | **队列观测台**（纯读）：把 campaign 目录里的 `PROGRESS.txt` / `RACES.md` / `STATE.txt` / 排程文件推导成队列视图，实时页 + 四类告警（判定矛盾 / STATE 行号错位 / 排程运行期被改 / 窗底漂移） |
 | `bench-history.py` | **已入库历史覆盖**（纯读）：把指标库 `bench-run` 索引读成「车×赛道×轮次」覆盖表，回答"哪些格已经跑过、什么判定、哪个 build" |
-| `bench-compose.py` | **排程编排台**：矩阵勾选 → 生成排程 → dry-run 预览 → 互斥预检后起跑；**默认自动剔除指标库里已跑过的格** |
+| `bench-compose.py` | **控制台**：① 启动排程（矩阵勾选 → 生成排程 → dry-run 预览 → 互斥预检后起跑，**默认自动剔除指标库里已跑过的格**）② 运行进度（当前场次/相位/耗时、进度条、实时日志、停止）③ 历史与结果（campaign 清单、按此重排、Kibana 外链）——见上节 |
 
 ```bash
 # 看队列（远端读 campaigns 目录）
 python3 bench-queue.py list --root /opt/raceway/campaigns --ssh root@HOST
 python3 bench-queue.py serve <campaign> --root /opt/raceway/campaigns --ssh root@HOST   # 实时页
 
-# 图形编排（本地起界面，通过 ssh 写文件、起跑；不占压测机）
-python3 bench-compose.py serve --port 8802 --ssh root@HOST \
-    --es-auth 'admin:xxx'          # 指标库口令：用于查已入库历史、剔除已跑过的格
-#   指标库口令也可走环境变量 RACEWAY_ES_AUTH；口令经 stdin 传给远端 curl，不出现在 argv
+# 控制台（详见上节；口令经 stdin 传给远端 curl，不出现在 argv）
+python3 bench-compose.py serve --port 8802 --ssh root@HOST --es-auth 'admin:xxx'
 #   指标库没起（压测窗口内是常态）时编排照常，只是无法自动剔除已跑过的格
 ```
 
@@ -206,12 +225,22 @@ cp vm-bench.env.example vm-bench.env && vi vm-bench.env   # 填 IP/凭据/路径
 scp *.sh *.py vm-bench.env 驱动宿主机:/opt/raceway/       # 脚本在驱动宿主机上运行
 # 拓扑在 ibs ip.txt 里规划（如 1 台 esrally 驱动 + N 台集群节点）
 
+./doctor.sh                                               # 新环境体检：六组检查告诉你离能起跑
+                                                          # 还差什么（工具/env/拓扑/连通/语料/指标库），
+                                                          # 失败项带修法提示；也可在控制台点「🩺 环境体检」
+
 ./run-bench.sh list                                       # 看赛道/近期 campaign
 ./run-bench.sh --dry-run geo 3 my3.conf                   # 排程预览（不执行，秒回）
 ./run-bench.sh geo 1                                      # 单场冒烟（会真跑 ~26 分钟）
 setsid nohup ./run-bench.sh all 3 > run.log 2>&1 &        # 全量（夜间窗口）
 ./run-bench.sh geo 3 my3.conf                             # 多配置：轮内右旋配对交错
 ```
+
+新环境最小上手路径：装 python3 + esrally(≥2.12) + ibs → 配好到虚机的 root 免密 →
+`cp vm-bench.env.example vm-bench.env` 按注释填写（拓扑从 ibs ip.txt 派生，不用手抄 IP）→
+`./doctor.sh` 把 ✘ 修完 → `./run-bench.sh geo 1` 冒烟。卡点阈值默认值即开即用；
+要调只改一处：vm-bench.env 的 `VERDICT_STEAL_MAX` / `VERDICT_FOREIGN_MAX`
+（赛后 CONTAMINATED 判定与赛前静默卡点同口径继承，赛前专属项另有 `QUIET_LOAD1` 等）。
 
 多配置文件每行一个配置（模板见 `campaign-configs.example.conf`）：
 
