@@ -4,7 +4,7 @@
 
   python3 bench-relabel.py --dir exports/<tag> [--out exports/<tag>-relabel]
 
-做什么：把 bench-metric.jsonl / bench-run.jsonl 里**缺** series_key 的文档补一个
+做什么：把 benchmark-result-metric.jsonl / benchmark-result-race.jsonl 里**缺** series_key 的文档补一个
 （引擎@版本@build@JDK，见 identity.py），其余字段原样保留。
 
 为什么需要它：完整载荷（402 场）依赖本机的 rally race store 副本才能导全；
@@ -27,9 +27,9 @@ import sys
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", required=True, help="载荷目录（含 bench-metric.jsonl / bench-run.jsonl）")
+    ap.add_argument("--dir", required=True, help="载荷目录（含 benchmark-result-metric.jsonl / benchmark-result-race.jsonl）")
     ap.add_argument("--out", default=None, help="输出目录；缺省 = <dir>-relabel")
-    ap.add_argument("--only", default="bench-metric,bench-run")
+    ap.add_argument("--only", default="benchmark-result-metric,benchmark-result-race")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -91,8 +91,8 @@ def main():
                 n += 1
         print("%s: %d 条，系列键补缺 %d 条 → %s" % (idx, n, changed, out_path))
 
-    # 键分布：给人看一眼，确认没有 ? / 空段（--only 不含 bench-metric 时跳过）
-    path = os.path.join(dst, "bench-metric.jsonl")
+    # 键分布：给人看一眼，确认没有 ? / 空段（--only 不含 benchmark-result-metric 时跳过）
+    path = os.path.join(dst, "benchmark-result-metric.jsonl")
     if os.path.isfile(path):
         dist = {}
         with open(path, encoding="utf-8") as f:

@@ -5,7 +5,7 @@
   * 每图一个指标族(family), series = series_key(图例标签：引擎@版本@build@JDK), x 轴 = 场次时间(@timestamp)
   * 面板: 写入吞吐 / 索引耗时 / 查询吞吐 / 查询延迟p90 / 服务时间p99 / 错误率
          / KNN 吞吐 / 向量维度扫描 / 存储 / 段数 / GC
-  * 顶部 Markdown = 环境台账(bench-env) + 固定过滤说明; 底部 = 原始层回钻路径
+  * 顶部 Markdown = 环境台账(benchmark-result-env) + 固定过滤说明; 底部 = 原始层回钻路径
   * 仪表盘级过滤: 顶部 KQL 查询框(默认 valid: true), 用户可直接改表达式
 
 用法:
@@ -16,7 +16,7 @@
 依赖: 仅 python3 标准库; 面板为 TSVB(Visualize->Metrics), 图表过滤用 Lucene 语法。
 
 产物 kibana-objects.ndjson 是本地生成物, 不入库(.gitignore): 其"环境说明"面板由
-bench-env 现场读出渲染, 内嵌真实环境指纹与场次统计, 随每次入库数据变化。
+benchmark-result-env 现场读出渲染, 内嵌真实环境指纹与场次统计, 随每次入库数据变化。
 """
 import argparse
 import base64
@@ -160,9 +160,14 @@ def prune_stale(keep_ids):
     ⚠️ 必须**分页遍历**：_find 的 per_page 有上限（200），对象数超过一页时
     后面那些根本不会被返回 → 永远清不掉。实测看板面板数超过 200 之后，
     26 个该删的旧面板只删掉了 2 个，剩下 24 个成了没人引用的孤儿。
+
+    ⚠️ 类型列表必须含 **index-pattern**：改了索引名之后，旧的 index-pattern
+    指向的索引已被删掉，但 Kibana 的导入只覆盖同名对象、不删旧的 → 它们会
+    永远留在 Kibana 里当孤儿（指向不存在的索引，聚合直接 404）。
+    不删也不会让面板出错（没看板引用它们），但列表页会一直挂着几个死对象。
     """
     removed = 0
-    for stype in ('visualization', 'dashboard', 'link'):
+    for stype in ('visualization', 'dashboard', 'link', 'index-pattern'):
         page = 1
         while True:
             try:
@@ -173,7 +178,9 @@ def prune_stale(keep_ids):
             sos = r.get('saved_objects') or []
             for so in sos:
                 sid = so.get('id') or ''
-                if sid.startswith('bench-') and sid not in keep_ids:
+                # 前缀两条都匹配：旧的 bench-* 与改名后的 benchmark-result-*。
+                # keep_ids 兜底 —— 本次生成的对象一律不删。
+                if (sid.startswith('bench-') or sid.startswith('benchmark-')) and sid not in keep_ids:
                     try:
                         kibana_delete('/api/saved_objects/%s/%s' % (stype, sid))
                         removed += 1
@@ -248,7 +255,7 @@ METRIC = '61ca57f2-469d-11e7-af02-69e470af7417'
 # index pattern 引用名。Kibana 8 的 saved object 用 references 关联 index-pattern，
 # 少了它前端会在请求里丢掉 interval（退化成 auto），面板的桶粒度就随时间跨度漂移。
 IP_REF = 'metrics_0_index_pattern'
-IP_ID = 'bench-metric'
+IP_ID = 'benchmark-result-metric'
 
 COLORS = ['rgba(104,188,0,1)', 'rgba(255,128,0,1)', 'rgba(0,161,255,1)',
           'rgba(212,0,255,1)', 'rgba(255,0,0,1)', 'rgba(0,161,128,1)']
@@ -269,14 +276,18 @@ def tsvb_series(idx, terms_field, metric_type, metric_field, formatter):
 
 
 def tsvb_timeseries(title, panel_filter, formatter, terms_field='series_key',
-                    metric_type='avg', metric_field='value', index_pattern='bench-metric',
+                    metric_type='avg', metric_field='value', index_pattern='benchmark-result-metric',
                     interval='1d'):
     return {
         'type': 'metrics', 'aggs': [],
         'params': {
             'id': PANEL, 'type': 'timeseries',
             'series': [tsvb_series(0, terms_field, metric_type, metric_field, formatter)],
-            'time_field': '@timestamp', 'index_pattern': index_pattern,
+            # x 轴用 run_start（批次锚点）而非 @timestamp（D5/D11 定稿）：
+            # 同一批次的所有行共享同一个 run_start → 一批恒画一个点，跨 UTC 午夜的
+            # 批次不会被日界切成两段（写入/查询分家、日均值塌陷都是按 @timestamp
+            # 分桶的产物）。看"这台机某天跑了多少"的容量口径仍可用 @timestamp 查。
+            'time_field': 'run_start', 'index_pattern': index_pattern,
             # interval 必须固定成日粒度：interval='auto' 在 now-1y 的跨度下会选 7 天桶，
             # 而压测场次集中在 6 天内 → 所有数据落进唯一一个桶 = 一个数据点，
             # 折线只有一个顶点画不出来（表现为 y 轴 0~0 的空图，ES 侧其实有数据）。
@@ -377,7 +388,7 @@ def group_tasks(tasks):
 def _count(q):
     """按 Lucene 查命中数；查询失败返回 None（调用方按"有数据"处理，不因查询失败丢面板）"""
     try:
-        r = es_post('/bench-metric/_count', {'query': {'query_string': {'query': q}}})
+        r = es_post('/benchmark-result-metric/_count', {'query': {'query_string': {'query': q}}})
         return r.get('count', 0)
     except Exception:                                       # noqa: BLE001
         return None
@@ -447,7 +458,7 @@ def track_mixed_builds(track):
     点一句"该赛道跨 build 采集"。
     """
     try:
-        r = es_post('/bench-run/_search', {
+        r = es_post('/benchmark-result-race/_search', {
             "size": 0,
             "query": {"term": {"track": track}},
             "aggs": {"b": {"terms": {"field": "engine_build", "size": 10}}}})
@@ -577,8 +588,8 @@ def visualization_obj(vis_id, title, panel_filter, formatter,
 # ---------------------------------------------------------------- markdown 面板
 
 def env_markdown():
-    """环境台账（bench-env）+ 口径体检（方案 §6 底部环境说明）"""
-    md = ['**Benchmark 结果总览** · 数据源 `bench-run` / `bench-metric`'
+    """环境台账（benchmark-result-env）+ 口径体检（方案 §6 底部环境说明）"""
+    md = ['**Benchmark 结果总览** · 数据源 `benchmark-result-race` / `benchmark-result-metric`'
           '（raceway bench-export.py 离线入库，源 = rally race.json + sidecar）',
           '',
           '每点 = 一场压测；一条线 = 一套固定配置（引擎 + 版本 + build + JDK），'
@@ -586,7 +597,7 @@ def env_markdown():
           '同一套配置换了引擎 build 会自动拆成多条线（如 ez@2.5.0@3009@openjdk26 / ez@2.5.0@3015@openjdk26），'
           '因为不同 build 的绝对值不能直接比。顶部 KQL 查询框默认 `valid: true`，可改成任意表达式。']
     try:
-        r = es_get('/bench-env/_search?size=10')
+        r = es_get('/benchmark-result-env/_search?size=10')
         for hit in r['hits']['hits']:
             d = hit['_source']
             topo = d.get('topology') or {}
@@ -603,11 +614,11 @@ def env_markdown():
                 md.append(d['notes'])
     except Exception as e:                                   # noqa: BLE001
         md.append('')
-        md.append('(bench-env 读取失败: %s)' % e)
+        md.append('(benchmark-result-env 读取失败: %s)' % e)
 
     # 口径体检：valid / 实验车 / 赛道
     try:
-        r = es_post('/bench-run/_search', {
+        r = es_post('/benchmark-result-race/_search', {
             'size': 0,
             'aggs': {
                 'by_valid': {'terms': {'field': 'valid', 'size': 5}},
@@ -640,7 +651,7 @@ def env_markdown():
                       '这些场次不会出现在按 series_key 分线的图里，重跑 bench-pipeline.sh 即可。' % _stale)
     except Exception as e:                                   # noqa: BLE001
         md.append('')
-        md.append('(bench-run 体检读取失败: %s)' % e)
+        md.append('(benchmark-result-race 体检读取失败: %s)' % e)
     return '\n'.join(md)
 
 
@@ -790,7 +801,8 @@ def _dashboard(panels, refs, dash_id, title, time_from, time_to, description,
             'title': title,
             'hits': 0,
             # 时间范围必须显式保存：默认是"最近 15 分钟"，而压测数据是历史场次，
-            # 不设 timeRestore 的话仪表盘打开就是一片空白。窗口按数据实际范围算。
+            # 不设 timeRestore 的话仪表盘打开就是一片空白。窗口统一 now-30d 相对窗
+            # （D11 定稿：绝对窗会固化在建板时刻，且各板边界不对齐）。
             'timeRestore': True, 'timeFrom': time_from, 'timeTo': time_to,
             'refreshInterval': {'pause': True, 'value': 0},
             'description': description,
@@ -966,7 +978,7 @@ DS_TABLE_SPECS = [
 #   重档吞吐阈值 ≥240 ops/s（3 分片实测最优 252）。
 #
 # 不放的四条理由（实测核对过，不是想当然）：
-#   ① 这两场没有 RACES.md 记账 → bench-run 的 valid 为 null，被看板级
+#   ① 这两场没有 RACES.md 记账 → benchmark-result-race 的 valid 为 null，被看板级
 #      `valid: true` 整体挡掉，每块板只剩一张「未出图面板」说明表 —— 是空占位。
 #   ② 即使放出来也画不出曲线：write race 与 query race 的 task 不同（index-append
 #      vs knn-*），按 task 过滤后每张面板只剩 1 个数据点；仅有的 2 点（存储/GC/
@@ -1017,7 +1029,7 @@ def ds_collect():
             "filter": {"query_string": {"query": filt}},
             "aggs": {"v": {"stats": {"field": "value"}}}}
     try:
-        r = es_post('/bench-metric/_search', {"size": 0,
+        r = es_post('/benchmark-result-metric/_search', {"size": 0,
                                                "query": {"query_string": {"query": "track:ds-*"}},
                                                "aggs": aggs})
     except Exception:                                           # noqa: BLE001
@@ -1120,14 +1132,15 @@ def tsvb_multi_series(idx, terms_field, metrics_spec, formatter):
 
 
 def tsvb_metrics_panel(title, panel_filter, terms_field, metrics_spec, formatter,
-                       index_pattern='bench-metric', interval='2h'):
+                       index_pattern='benchmark-result-metric', interval='2h'):
     """TSVB metrics 面板（表格形态）：行=分组、列=指标"""
     return {
         'type': 'metrics', 'aggs': [],
         'params': {
             'id': PANEL, 'type': 'timeseries',
             'series': [tsvb_multi_series(0, terms_field, metrics_spec, formatter)],
-            'time_field': '@timestamp', 'index_pattern': index_pattern,
+            # x 轴 = run_start（批次锚点），与 tsvb_timeseries 同口径（D5/D11 定稿）
+            'time_field': 'run_start', 'index_pattern': index_pattern,
             'interval': interval,
             'axis_position': 'left', 'axis_formatter': 'number',
             'show_legend': 1, 'show_grid': 1, 'legend_position': 'right',
@@ -1367,7 +1380,7 @@ def es_track_facts():
     """
     facts = {}
     try:
-        r = es_post('/bench-metric/_search', {
+        r = es_post('/benchmark-result-metric/_search', {
             'size': 0,
             'aggs': {'t': {'terms': {'field': 'track', 'size': 200},
                            'aggs': {'k': {'terms': {'field': 'task', 'size': 200}},
@@ -1387,9 +1400,9 @@ def es_track_facts():
 
 
 def es_track_runs(track):
-    """某赛道的场次数（bench-run 一行 = 一场 race）"""
+    """某赛道的场次数（benchmark-result-race 一行 = 一场 race）"""
     try:
-        r = es_post('/bench-run/_search', {
+        r = es_post('/benchmark-result-race/_search', {
             'size': 0, 'query': {'term': {'track': track}},
             'aggs': {'n': {'value_count': {'field': 'race_id'}},
                      'cars': {'terms': {'field': 'series_key', 'size': 50}},
@@ -1416,51 +1429,27 @@ def pick_interval(lo_ms, hi_ms):
 
 
 def data_window(track=None, pad_days=1):
-    """仪表盘默认时间窗 = 数据的实际时间范围（各留 1 天余量）。
+    """仪表盘默认时间窗：统一相对窗 now-30d（D11 定稿）。
 
-    为什么不用固定相对窗：压测批次集中在 4 天内，若用 now-90d 这类固定窗，
-    曲线会全部挤在最右侧 4% 的位置，完全看不出趋势。窗口跟着数据走，
-    打开就是"这一批结果"的完整横轴。
+    旧做法（按数据实际范围算绝对窗）有两个缺陷：① 窗口在建板那一刻**固化**，
+    新批次入库后要重跑 make_dashboard 才能扩窗；② 各赛道板的窗口边界互不一致
+    （geo 板 10-11~10-19，ds-j512 板 10-14~10-21），同一个"10-15"在两板指的不是
+    同一段时间。相对窗两条全治：所有板共用 now-30d，永远罩住近 30 天的批次，
+    边界天然对齐。折线不会"挤在最右侧"—— 面板的 x 轴是 run_start（批次锚点，
+    见 tsvb_timeseries），一批一个点，30 天窗里有多少批就画多少个点。
 
-    传 track 时只算该赛道的窗口 —— 每个赛道是独立看板，时间轴各按自己的批次走。
-
-    返回 (timeFrom, timeTo) 字符串；ES 里没数据时退回 now-90d。
+    track/pad_days 形参保留（历史调用点都带着），不再参与计算。
     """
-    try:
-        query = {'term': {'track': track}} if track else {'match_all': {}}
-        r = es_post('/bench-run/_search', {
-            'size': 0, 'query': query,
-            'aggs': {'span': {'stats': {'field': '@timestamp'}},
-                     'n': {'value_count': {'field': '@timestamp'}}}})
-        st = r['aggregations']['span']
-        if not st.get('count'):
-            return 'now-90d', 'now'
-        lo = datetime.datetime.fromtimestamp(st['min'] / 1000, datetime.timezone.utc)
-        hi = datetime.datetime.fromtimestamp(st['max'] / 1000, datetime.timezone.utc)
-        lo = lo - datetime.timedelta(days=pad_days)
-        hi = hi + datetime.timedelta(days=pad_days)
-        return lo.strftime('%Y-%m-%dT%H:%M:%S.000Z'), hi.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    except Exception:                                       # noqa: BLE001
-        return 'now-90d', 'now'
+    return 'now-30d', 'now'
 
 
 def data_window_span(lo_ms, hi_ms, pad_days=1):
-    """跨多个赛道的合并看板用的时间窗（按给定的起止跨度算）
+    """跨多赛道的合并看板时间窗 —— 与 data_window 同一口径：now-30d（D11 定稿）。
 
-    与 data_window(track) 的区别：后者按单个赛道算，这里按一批赛道的并集算 ——
-    合并看板（如维度扫描）覆盖多个赛道，窗口必须罩住全部场次，
-    否则打开看板时默认时间窗把大部分场次挡在窗外。
+    旧做法按各赛道场次的并集算绝对窗，同样有"固化 + 板间不对齐"的问题。
+    lo_ms/hi_ms 形参保留（历史调用点都带着），不再参与计算。
     """
-    try:
-        if not lo_ms or not hi_ms:
-            return 'now-90d', 'now'
-        lo = datetime.datetime.fromtimestamp(lo_ms / 1000, datetime.timezone.utc)
-        hi = datetime.datetime.fromtimestamp(hi_ms / 1000, datetime.timezone.utc)
-        lo = lo - datetime.timedelta(days=pad_days)
-        hi = hi + datetime.timedelta(days=pad_days)
-        return lo.strftime('%Y-%m-%dT%H:%M:%S.000Z'), hi.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    except Exception:                                       # noqa: BLE001
-        return 'now-90d', 'now'
+    return 'now-30d', 'now'
 
 
 def overview_dashboard(track_info):
@@ -1491,7 +1480,7 @@ def overview_dashboard(track_info):
                       time_from, time_to,
                       'rally race 结果可视化总入口（对照 opensearch.org/benchmarks；'
                       '每个 esrally track 一个独立看板，不同赛道不混图；'
-                      '源 = raceway bench-export.py 导出的 bench-run/bench-metric）')
+                      '源 = raceway bench-export.py 导出的 benchmark-result-race/benchmark-result-metric）')
 
 
 def nav_markdown(track_info, ds_info=None):
@@ -1570,9 +1559,9 @@ def main():
     print('目标 Kibana: %s (%s)  ES: %s'
           % (KIBANA_VERSION or '未知', KIBANA, ES))
 
-    objs = [index_pattern_obj('bench-metric'),
-            index_pattern_obj('bench-run'),
-            index_pattern_obj('bench-env')]
+    objs = [index_pattern_obj('benchmark-result-metric'),
+            index_pattern_obj('benchmark-result-race'),
+            index_pattern_obj('benchmark-result-env')]
 
     # 赛道从 ES 实算，不硬编码：新增一场新赛道的压测后，跑一次脚本就多一个看板
     facts = es_track_facts()
@@ -1648,8 +1637,12 @@ def main():
     with open(args.out, 'w', encoding='utf-8') as f:
         f.write(ndjson)
     _ndash = sum(1 for o in objs if o['type'] == 'dashboard')
-    print('wrote %s: %d objects (%d dashboards + %d panels)'
-          % (args.out, len(objs), _ndash, len(objs) - _ndash))
+    # 非 dashboard 的对象里既有面板也有 index-pattern，分开报，免得把
+    # index-pattern 数说成面板（曾报 "184 panels"，实际是 181 面板 + 3 index-pattern）
+    _nvis = sum(1 for o in objs if o['type'] == 'visualization')
+    _nip = sum(1 for o in objs if o['type'] == 'index-pattern')
+    print('wrote %s: %d objects (%d dashboards + %d panels + %d index-patterns)'
+          % (args.out, len(objs), _ndash, _nvis, _nip))
 
     if args.do_import:
         # 先清掉本次不再生成的旧对象（改造前的单板面板），再导入

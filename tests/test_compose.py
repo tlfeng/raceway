@@ -26,7 +26,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CARS_TEXT = """
 # 注释行与空行都跳过
 
-jdk25 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=jdk25 JDK_WANT=25|OpenJDK
+jdk25 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=jdk25 JDK_WANT=25|GraalVM
 jdk26 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=jdk26 JDK_DIR=/opt/jdks/jdk-26 JDK_WANT=26|OpenJDK
 es819 ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819
 """

@@ -586,7 +586,7 @@ monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/（分相位时
   PROGSTEP "  监控摘要 $fid: steal_max=${worst:-无数据}%(三节点最坏)"
 }
 
-env_summary_csv() { # campaign 收尾：把各场 summary 拍平成一张 CSV（bench-env/bench-metric 可直接吃）
+env_summary_csv() { # campaign 收尾：把各场 summary 拍平成一张 CSV（benchmark-result-env/benchmark-result-metric 可直接吃）
   local mondir="$CAMP_DIR/monitors"
   [ -d "$mondir" ] || return 0
   python3 - "$mondir" "${VM_NAMES[@]}" <<'PY' || log "  警告: ENV-SUMMARY.csv 生成失败"
@@ -641,7 +641,7 @@ capture_race_json() { # <fid> <w|q> <rally 日志> —— 按日志里的 race i
   fi
 }
 
-env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw/，供每场 sidecar 引用（bench-env 台账源）
+env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw/，供每场 sidecar 引用（benchmark-result-env 台账源）
   FP_DIR="$CAMP_DIR/logs/fp"; mkdir -p "$FP_DIR"
   { echo "hostname=$(hostname)"; echo "kernel=$(uname -r)"; echo "nproc=$(nproc)"
     echo "cpu_model=$(lscpu | awk -F: '/^Model name/{gsub(/^ +/,"",$2);print $2;exit}')"
@@ -665,7 +665,7 @@ env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw
     mb=$(echo "$pin" | sed -n "s/.*<currentMemory unit='KiB'>\([0-9]*\).*/\1/p" | head -1)
     echo "$nm|${vc:-0}|${mb:-0}|$(echo "$pin" | grep -c '<vcpupin')" >> "$FP_DIR/virsh.txt"
   done
-  log "  环境指纹已抓取: $FP_DIR（bench-env 台账源）"
+  log "  环境指纹已抓取: $FP_DIR（benchmark-result-env 台账源）"
 }
 
 race_metric_ok() { # <fid> <w|q> —— 断言 race.json 真有非 null 的吞吐指标
@@ -1029,7 +1029,7 @@ PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_C
   fi
 } > "$CAMP_DIR/PACKAGES.txt"
 
-env_fingerprint_raw    # bench-env 台账源（静态部分，每场 sidecar 引用同一份）
+env_fingerprint_raw    # benchmark-result-env 台账源（静态部分，每场 sidecar 引用同一份）
 
 # 排程模式：赛道集合从排程文件里收集（prepare/校验按这个集合走）
 if [ -n "${SCHEDULE_FILE:-}" ]; then
@@ -1155,7 +1155,7 @@ else
   done
 fi
 
-env_summary_csv   # monitors/*-summary.txt → ENV-SUMMARY.csv（bench-env/bench-metric 可直接吃）
+env_summary_csv   # monitors/*-summary.txt → ENV-SUMMARY.csv（benchmark-result-env/benchmark-result-metric 可直接吃）
 PROGSTEP "campaign 结束: $okcnt/$total 场有效。报告: $CAMP_DIR/results/；汇总: $RACES"
 if [ -n "${NOTIFY_URL:-}" ]; then
   curl -sk --max-time 10 -X POST -H 'Content-Type: application/json' \

@@ -5,7 +5,7 @@
   python3 bench-report.py --export <exports/20261018-a> --campaign <campaigns/jdk3-20261017-155312> \
       --echarts echarts.min.js --out 报告.html
 
-数据全部来自离线导出载荷（bench-run.jsonl / bench-metric.jsonl），不需要 ES 集群。
+数据全部来自离线导出载荷（benchmark-result-race.jsonl / benchmark-result-metric.jsonl），不需要 ES 集群。
 """
 import argparse
 import json
@@ -56,9 +56,9 @@ def car_of_run(run):
 def load_detail_metrics(path, camp, run_index=None):
     """流式扫大文件，只留目标 campaign 且画图用得上的行
 
-    bench-metric 精简后**不再冗余场次维度**（car / engine / track_raw / codec /
-    round / phase…，方案 §1 修订）—— 这些按 race_id 从 bench-run 回填：
-    指标行只留指标事实与口径，场次维度以 bench-run 为准，避免两份漂移。
+    benchmark-result-metric 精简后**不再冗余场次维度**（car / engine / track_raw / codec /
+    round / phase…，方案 §1 修订）—— 这些按 race_id 从 benchmark-result-race 回填：
+    指标行只留指标事实与口径，场次维度以 benchmark-result-race 为准，避免两份漂移。
     """
     rows = []
     with open(path, encoding="utf-8") as f:
@@ -126,7 +126,7 @@ def build(runs, detail, sysrows, camp):
         t = tails.get((card["car"], card["track"]), {})
         card["p99"] = med(t.get("p99"))
         card["p100"] = med(t.get("p100"))
-    # 2) 查询延迟/吞吐分车聚合（bench-metric 逐场逐操作，3 轮取中位）
+    # 2) 查询延迟/吞吐分车聚合（benchmark-result-metric 逐场逐操作，3 轮取中位）
     acc = {}
     for m in detail:
         if m.get("phase") != "q":
@@ -253,7 +253,7 @@ def build_codec(runs, detail, camp):
              if k in [a["key"] for a in cars]]
     cars.sort(key=lambda a: order.index(a["key"]) if a["key"] in order else 99)
 
-    # 逐操作查询延迟 p50（bench-metric 里 family=latency / stat=p50，已归一为秒）
+    # 逐操作查询延迟 p50（benchmark-result-metric 里 family=latency / stat=p50，已归一为秒）
     acc = {}
     for m in detail:
         if m.get("campaign") != camp or m.get("phase") != "q":
@@ -481,14 +481,14 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     camp = os.path.basename(args.campaign.rstrip("/"))
-    runs = load_runs(os.path.join(args.export, "bench-run.jsonl"))
-    # 场次维度以 bench-run 为准：指标行不再冗余 car/engine/track_raw/codec/round/phase
+    runs = load_runs(os.path.join(args.export, "benchmark-result-race.jsonl"))
+    # 场次维度以 benchmark-result-race 为准：指标行不再冗余 car/engine/track_raw/codec/round/phase
     # （方案 §1 修订）—— 报告按 race_id 回填，两边口径不会漂移。
     run_index = {r.get("race_id"): r for r in runs}
-    detail = load_detail_metrics(os.path.join(args.export, "bench-metric.jsonl"), camp, run_index)
+    detail = load_detail_metrics(os.path.join(args.export, "benchmark-result-metric.jsonl"), camp, run_index)
     sysrows = [m for m in detail if m.get("family") == "system"]
     # system 行没有 phase/task，需要单独捞
-    with open(os.path.join(args.export, "bench-metric.jsonl"), encoding="utf-8") as f:
+    with open(os.path.join(args.export, "benchmark-result-metric.jsonl"), encoding="utf-8") as f:
         for line in f:
             if '"family": "system"' not in line or ('"campaign": "%s"' % camp) not in line:
                 continue
@@ -498,12 +498,12 @@ def main():
     ccamp = args.codec_campaign and os.path.basename(args.codec_campaign.rstrip("/"))
     if ccamp:
         payload["codec"] = build_codec(runs, load_detail_metrics(
-            os.path.join(args.export, "bench-metric.jsonl"), ccamp, run_index), ccamp)
+            os.path.join(args.export, "benchmark-result-metric.jsonl"), ccamp, run_index), ccamp)
     payload["head"] = [
         "campaign %s：3 车 × 3 赛道 × 3 轮 = 27 场，全 VALID、0 重试" % camp,
         "口径 16g 堆 / 32 vCPU 逐场实测断言；负载卡点仅起跑前一次，赛中分相位采样只记录",
         "写入暖机：geo 20s、nested 25s、hnsw 40s（原 geo 70s / nested 120s 会吃掉测量窗口）",
-        "生成于导出载荷 bench-run/bench-metric（离线，未依赖 ES）",
+        "生成于导出载荷 benchmark-result-race/benchmark-result-metric（离线，未依赖 ES）",
     ]
     payload["concl"] = [
         "Kona 25 与 Oracle GraalVM 25 在三赛道写入上全部持平：geo +0.6%、hnsw +1.9%、nested +2.2%，均小于同车轮次间极差（7.8~25.5%）。此前「Kona 快 14~17%」与「nested GraalVM 快 19%」均未复现，已撤回。",
