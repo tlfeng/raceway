@@ -336,18 +336,17 @@ class TestPhaseTracking(unittest.TestCase):
         c = self._camp('ph1', [
             '[2026-10-20 10:00:00] campaign ph1 启动: cars=[a] tracks=geo rounds=1',
             '[2026-10-20 10:01:00] ===== [1] a-geo-r1 开始 =====',
-            '[2026-10-20 10:05:00] [1] a-geo-r1 write race 开始',
-            '[2026-10-20 10:12:00] [1] a-geo-r1 query race 开始',
+            '[2026-10-20 10:05:00] [1] a-geo-r1 full race 开始',
         ])
         f = c.fields[0]
         self.assertEqual(f.status, 'RUNNING')
-        self.assertEqual(f.phase, 'query')
+        self.assertEqual(f.phase, 'write+query')
 
     def test_phase_clears_when_field_done(self):
         c = self._camp('ph2', [
             '[2026-10-20 10:00:00] campaign ph2 启动: cars=[a] tracks=geo rounds=1',
             '[2026-10-20 10:01:00] ===== [1] a-geo-r1 开始 =====',
-            '[2026-10-20 10:05:00] [1] a-geo-r1 write race 开始',
+            '[2026-10-20 10:05:00] [1] a-geo-r1 full race 开始',
             '[2026-10-20 10:30:00] [1] a-geo-r1 完成: VALID（29 分钟）',
         ])
         f = c.fields[0]
@@ -358,7 +357,7 @@ class TestPhaseTracking(unittest.TestCase):
         c = self._camp('ph3', [
             '[2026-10-20 10:00:00] campaign ph3 启动: cars=[a] tracks=geo rounds=1',
             '[2026-10-20 10:01:00] ===== [1] a-geo-r1 开始 =====',
-            '[2026-10-20 10:05:00] [1] a-geo-r1 write race 开始',
+            '[2026-10-20 10:05:00] [1] a-geo-r1 full race 开始',
         ])
         d = Q.campaign_json(c)
         f = d['fields'][0]

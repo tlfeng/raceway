@@ -179,6 +179,8 @@ nonseg_shards() { # <index>
 }
 
 # 异步 forcemerge 并轮询到每分片 1 段
+# （单挑战协议下编排侧不再调用 —— merge 移入赛道 full challenge，段数卡点退役；
+#   函数保留供手工对某个索引做"合并+验证"。）
 force_merge_to_one() { # <index> <max_wait_sec>
   local idx="$1" maxw="${2:-1200}"
   local ip="${VM_IPS[0]}" n deadline=$((SECONDS + maxw))
@@ -192,6 +194,70 @@ force_merge_to_one() { # <index> <max_wait_sec>
   done
   log "  段数卡点失败: $idx 仍有 $n 个分片 >1 段"
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# 单挑战（full）：写段（建索引/refresh，nested 系写段自带 forcemerge+等合并）
+# → forcemerge(1) → 查段，一次 rally 调用跑完（phase=wq）。
+# merge 的"完成等待"由赛道自带（force-merge 同步 API / wait-until-merges-finish
+# 条件操作，rally 保证完成后才跑后续 op）；编排侧段数卡点（SEG-ASSERT）随拆分
+# 协议退役 —— merge 结果无验证是接受的取舍。
+derive_full_challenge() { # <track_dir> —— 从 write-only + query-only 拼出 challenges/full.json（幂等）
+  local dir="$1" w="$1/challenges/write-only.json" q="$1/challenges/query-only.json" out="$1/challenges/full.json"
+  [ -s "$out" ] && return 0
+  if [ ! -s "$w" ] || [ ! -s "$q" ]; then
+    log "  full challenge 派生失败: $dir 缺 write-only/query-only"
+    return 1
+  fi
+  python3 - "$w" "$q" "$out" <<'PY' || return 1
+import json, re, sys
+
+def schedule_of(path):
+    """取 challenge 文件里 schedule 数组的原文（文件含 jinja 模板，不能 json.load）。"""
+    txt = open(path, encoding="utf-8").read()
+    i = txt.index('"schedule"')
+    i = txt.index("[", i)
+    depth, j, in_str, esc = 0, i, False, False
+    while True:
+        c = txt[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+                if depth == 0:
+                    return txt[i + 1:j]
+        j += 1
+
+w_path, q_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+w = schedule_of(w_path).strip().rstrip(",")
+q = schedule_of(q_path).strip().rstrip(",")
+merge = ""
+if '"force-merge"' not in w:  # 写段已自带 merge（如 nested-s3）就不重复插
+    merge = ''',
+        { "operation": { "operation-type": "force-merge", "max-num-segments": 1,
+                         "request-timeout": 7200 } },
+        { "name": "refresh-after-force-merge", "operation": "refresh" },
+        { "name": "wait-until-merges-finish",
+          "operation": { "operation-type": "index-stats", "index": "_all",
+            "condition": { "path": "_all.total.merges.current", "expected-value": 0 },
+            "retry-until-success": true, "include-in-reporting": false } }'''
+out = ('{\n  "name": "full",\n  "description": '
+       '"Indexes the corpus, force-merges to one segment and runs the full query set in one race.",\n'
+       '  "schedule": [\n' + w + merge + ',\n' + q + '\n  ]\n}\n')
+json.loads(re.sub(r"\{\{.*?\}\}", '"X"', out, flags=re.S))  # 括号配平自检（jinja 占位替换成字符串）
+open(out_path, "w", encoding="utf-8").write(out)
+print("full challenge 派生 →", out_path)
+PY
 }
 
 # ============================================================================

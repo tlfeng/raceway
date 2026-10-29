@@ -32,9 +32,9 @@
 #
 # 每场: reset(只停集群) → 赛前负载检测 → ibs 引擎就位 → JDK 就位(JDK_DIR 换入/回切)
 #       → ibs wipe 冷启动 → 集群卡点(含端口属主) → heap_assert → cpu_affinity_assert
-#       → write race → 段数卡点 → query race → ENV 判定 → sidecar/监控归档
+#       → full race（写+合并+查单挑战，phase=wq）→ ENV 判定 → sidecar/监控归档
 # 口径：堆由 ibs 部署统一设定（内存/2=16g）；负载卡点按 PRECHECK_MODE（each 每场 / once 起跑前）；
-#   场中 load-monitor 分相位采集（w 写入/q 查询，5s）仅记录不判成败（merge 相位太短采不到，不采）。codec 是索引设置维度，靠赛道变体承载（gdef/gzstd/gbc）。
+#   load-monitor 单挑战全程一份采样（5s）仅记录不判成败。codec 是索引设置维度，靠赛道变体承载（gdef/gzstd/gbc）。
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -709,6 +709,13 @@ def has_median(m):
 if phase == "w":
     bulk = [m for m in om if "docs/s" in ((m.get("throughput") or {}).get("unit") or "")] or om
     sys.exit(0 if all(has_median(m) for m in bulk) and any(has_median(m) for m in bulk) else 1)
+if phase == "wq":
+    # 单挑战一场里写段+查段都有：写段按 w 规则（docs/s 吞吐全有 median），
+    # 整场按 q 规则（过半 op 有吞吐）
+    bulk = [m for m in om if "docs/s" in ((m.get("throughput") or {}).get("unit") or "")] or om
+    w_ok = bool(bulk) and all(has_median(m) for m in bulk)
+    good = sum(1 for m in om if has_median(m))
+    sys.exit(0 if (w_ok and good * 2 >= len(om)) else 1)
 # 查询赛：个别 task（refresh/sleep 类）本就无吞吐，要求过半有
 good = sum(1 for m in om if has_median(m))
 sys.exit(0 if good * 2 >= len(om) else 1)
@@ -720,7 +727,7 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
   local d="$FP_DIR/$fid-$ph" eng dir ip ch
   [ -n "$FP_DIR" ] && [ -d "$FP_DIR" ] || { log "  警告: 环境指纹未就绪，跳过 sidecar $fid-$ph"; return 0; }
   eng="$ENGINE_NAME"; dir=$(eng_dir_of "$eng")
-  [ "$ph" = w ] && ch="write-only" || ch="query-only"
+  case "$ph" in w) ch="write-only";; q) ch="query-only";; *) ch="full";; esac
   mkdir -p "$d"
   cp -f "$FP_DIR/host.txt" "$FP_DIR/virsh.txt" "$CAMP_DIR/PACKAGES.txt" "$d/" 2>/dev/null
   mv "$d/PACKAGES.txt" "$d/packages.txt" 2>/dev/null
@@ -853,9 +860,8 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   [ "$att" -gt 1 ] && fid="${fid}-try${att}"
   local track; track=$(track_dir "$tk")
   local idx; idx=$(track_index "$tk")
-  local wrep="$CAMP_DIR/results/$fid-w.md"
-  local qrep="$CAMP_DIR/results/$fid-q.md"
-  local wlog="$CAMP_DIR/logs/$fid-w.log" qlog="$CAMP_DIR/logs/$fid-q.log"
+  local rep="$CAMP_DIR/results/$fid-wq.md"
+  local rlog="$CAMP_DIR/logs/$fid-wq.log"
   local HOSTS; HOSTS=$(target_hosts)
   local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
   local tp=""
@@ -906,10 +912,16 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     PROGSTEP "[$seq] $fid CLUSTER-NOT-READY（logs/ibs-ready-$fid.log）"; return 1; }
   heap_assert "$eng" "$HEAP" "$(eng_dir_of "$eng")" "$(svc2_of "$eng")" || { echo "| $fid | HEAP-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid HEAP-ASSERT-FAIL（实际堆≠声明 heap:$HEAP）"; return 1; }
   cpu_affinity_assert "$eng" || { echo "| $fid | CPU-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-ASSERT-FAIL"; return 1; }
-  monitor_start "$fid-w" "$eng"   # 分相位被动采集：w=写入 q=查询（merge 相位不采，见段数卡点处注释），不参与判定
 
-  # 4) write-only race
-  PROGSTEP "[$seq] $fid write race 开始（timeout $(track_tmo_w "$tk")s）"
+  # 4) full race（单挑战：写段 → forcemerge(1) → 查段，一次调用跑完，phase=wq）
+  #    merge 的完成等待由赛道自带（force-merge 同步 API / wait-until-merges-finish）；
+  #    编排侧段数卡点（SEG-ASSERT）已退役 —— merge 结果无验证是接受的简化取舍。
+  derive_full_challenge "$track" || {
+    echo "| $fid | RACE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+    PROGSTEP "[$seq] $fid full challenge 派生失败"; return 1; }
+  local TMO=$(( $(track_tmo_w "$tk") + $(track_tmo_q "$tk") ))
+  monitor_start "$fid-wq" "$eng"   # 单挑战全程一份宿主侧采样（5s，只记录不判定）
+  PROGSTEP "[$seq] $fid full race 开始（timeout ${TMO}s）"
   local rc=0
   local ctag=""; [ -n "${EXPECT_CPU_CORES:-}" ] && ctag=",cores:${EXPECT_CPU_CORES}"
   # 压缩与 source_reuse 是**两个独立标签**（不再糅成 "ZSTD+source_reuse"）：
@@ -920,59 +932,28 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   _comp=$(track_compression "$tk"); _sr=$(track_source_reuse "$tk")
   [ -n "$_comp" ] && cdc=",codec:$_comp"
   [ -n "$_sr" ] && cdc="$cdc,source_reuse:$_sr"
-  timeout "$(track_tmo_w "$tk")" "$RALLY" race --pipeline=benchmark-only \
-    --target-hosts="$HOSTS" --track-path="$track" --challenge=write-only \
+  timeout "$TMO" "$RALLY" race --pipeline=benchmark-only \
+    --target-hosts="$HOSTS" --track-path="$track" --challenge=full \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
     --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
-    --report-format=markdown --report-file="$wrep" > "$wlog" 2>&1 || rc=$?
-  [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid write race FAILED rc=$rc（尾部: $(tail -2 "$wlog" | head -1)）"
-  capture_race_json "$fid" w "$wlog"
-  sidecar_capture "$fid" w "$tk" "$rnd" "$att" "$track" "$tp"
-  monitor_stop "$fid-w"
+    --report-format=markdown --report-file="$rep" > "$rlog" 2>&1 || rc=$?
+  [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid full race FAILED rc=$rc（尾部: $(tail -2 "$rlog" | head -1)）"
+  capture_race_json "$fid" wq "$rlog"
+  sidecar_capture "$fid" wq "$tk" "$rnd" "$att" "$track" "$tp"
+  monitor_stop "$fid-wq"
 
-  # 5) 段数卡点
-  #    （merge 相位不再起监控：forcemerge 的 HTTP 调用是同步的，秒级完成，
-  #     5s 采样间隔一次都赶不上 —— 实测三个 campaign 的 -m CSV 全部只有表头，
-  #     ENV-SUMMARY 里约 1/3 的行是 NO-DATA 噪声。要 merge 期占用画像得换
-  #     1s 间隔或事后读 /proc，有需要再加。）
-  local segok=1
-  if [ $rc -eq 0 ]; then
-    force_merge_to_one "$idx" 1200 || segok=0
-  fi
-
-  # 6) query-only race
-  local rcq=0
-  if [ $rc -eq 0 ] && [ $segok -eq 1 ]; then
-    monitor_start "$fid-q" "$eng"
-    PROGSTEP "[$seq] $fid query race 开始"
-    timeout "$(track_tmo_q "$tk")" "$RALLY" race --pipeline=benchmark-only \
-      --target-hosts="$HOSTS" --track-path="$track" --challenge=query-only \
-      ${tp:+--track-params="$tp"} --client-options="$OPTS" \
-      --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
-      --report-format=markdown --report-file="$qrep" > "$qlog" 2>&1 || rcq=$?
-    [ $rcq -ne 0 ] && PROGSTEP "[$seq] $fid query race FAILED rc=$rcq"
-    capture_race_json "$fid" q "$qlog"
-    sidecar_capture "$fid" q "$tk" "$rnd" "$att" "$track" "$tp"
-    monitor_stop "$fid-q"
-  fi
-
-  # 6.5) recall 探针（索引在线时打；召回塌了的性能数字不作数）
-  if [ "${CUR_RECALL:-0}" = "1" ] && [ "$rcq" -eq 0 ]; then
+  # 5) recall 探针（索引在线时打；召回塌了的性能数字不作数）
+  if [ "${CUR_RECALL:-0}" = "1" ] && [ "$rc" -eq 0 ]; then
     PROGSTEP "[$seq] $fid recall 探针开始"
     recall_probe "$fid" "$track" "$tk"
   fi
 
-  # 7) 判定（监控只记录环境事实、不参与成败；成败看 race 结果与指标真实性）
+  # 6) 判定（监控只记录环境事实、不参与成败；成败看 race 结果与指标真实性）
   local t1=$(date +%s)
   local status="VALID" metok=1
-  race_metric_ok "$fid" w || { metok=0; PROGSTEP "[$seq] $fid 写赛 throughput 全 null（测量窗口被 warmup 吃掉）"; }
-  if [ $metok -eq 1 ]; then
-    race_metric_ok "$fid" q || { metok=0; PROGSTEP "[$seq] $fid 查询赛 throughput 过半 null"; }
-  fi
+  race_metric_ok "$fid" wq || { metok=0; PROGSTEP "[$seq] $fid 指标断言未过（写段吞吐全 null 或查询吞吐过半 null）"; }
   [ $metok -eq 0 ] && status="METRIC-NULL-FAIL"
-  [ $rc -ne 0 ]    && status="WRITE-FAIL"
-  [ $rcq -ne 0 ]   && status="QUERY-FAIL"
-  [ $segok -eq 0 ] && status="SEG-ASSERT-FAIL"
+  [ $rc -ne 0 ]    && status="RACE-FAIL"
 
   echo "| $fid | $status | precheck=$PCTAG | $(( (t1-t0)/60 ))min |" >> "$RACES"
   PROGSTEP "[$seq] $fid 完成: $status（$(( (t1-t0)/60 )) 分钟）"

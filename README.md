@@ -19,7 +19,7 @@
 | 层 | 内容 |
 |---|---|
 | 部署层 | [ibs](https://github.com/tlfeng/ibs) CLI：三节点集群部署（systemd+TLS+admin 初始化）、冷启动、卡点、卸载 |
-| 方法学层 | 本仓库 `run-bench.sh` 等：静默卡点 → 冷启动 → 集群卡点 → 监控 → write race → 段数卡点 → query race → ENV 判定 → 归档 |
+| 方法学层 | 本仓库 `run-bench.sh` 等：静默卡点 → 冷启动 → 集群卡点 → 监控 → full race（写+合并+查单挑战，phase=wq）→ ENV 判定 → 归档 |
 | 发压层 | esrally 2.12+，benchmark-only pipeline，驱动器与集群分离 |
 
 ## 仓库布局
@@ -229,7 +229,7 @@ python3 bench-compose.py serve --port 8802 --ssh root@HOST --es-auth 'admin:xxx'
 `hvtp200k-2s/3s` 只有历史数据（当前 runner 无对应分支），**能看不能排**。
 
 覆盖判定守住三条口径（见 `bench-history.py` 顶部注释）：
-**一场次两行**（写赛+查赛都 VALID 才算跑过）、**build 隔离**
+**相位判定**（拆分协议一场次两行 phase=w/q、两个相位都 VALID 才算跑过；单挑战协议一行 phase=wq）、**build 隔离**
 （`jdk25@3009` 跑过 ≠ `jdk25@3015` 跑过）、**指标库不可用 ≠ 什么都没跑过**。
 
 

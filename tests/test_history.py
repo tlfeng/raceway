@@ -81,6 +81,12 @@ class TestVerdict(unittest.TestCase):
         rows = [row(phase='w', challenge='write-only')]
         self.assertEqual(H._verdict_of(rows), H.VERDICT_VALID)
 
+    def test_full_challenge_single_row_is_complete(self):
+        """单挑战（full）：一场一行 phase=wq 就是完整场次，不算半场。"""
+        rows = [row(phase='wq', challenge='full')]
+        self.assertEqual(H._verdict_of(rows), H.VERDICT_VALID)
+        self.assertNotEqual(H._verdict_of(rows), H.VERDICT_HALF)
+
 
 class TestBuildIsolation(unittest.TestCase):
     """同一格在不同 build 上各跑一次 → 必须按 build 分别判定。"""
