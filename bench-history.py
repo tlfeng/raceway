@@ -20,8 +20,9 @@
 1. **build 隔离**：jdk25@3009 跑过 ≠ jdk25@3015 跑过。跨 build 混线会让结论被
    误读（make_dashboard 就是为此按 series_key 分线的）。覆盖判定必须带 build，
    否则"已跑过"会把不同引擎版本的数据当成同一格。
-2. **一场次两行**：写赛/查赛各一行（phase=w / q）。一场次要算"跑过"，两个相位
-   都得判 VALID；只有写赛 VALID 而查赛没跑的，是**半场**，仍需重跑。
+2. **相位判定**：拆分协议一场次两行（phase=w / q，两个相位都 VALID 才算跑过，
+   只有写赛的是**半场**）；单挑战协议一场次一行（phase=wq）。两种协议的历史数据
+   混库时按各自 challenge 的期望相位集判定（_expected_phases）。
    老 campaign 的 write-only 赛道只有一个相位，按 challenge 判定期望相位。
 3. **只读**：不写 ES、不碰集群、不碰被测引擎。指标库没跑（压测窗口内这是常态）
    时抛 HistoryUnavailable，由调用方降级 —— 不猜、不伪造、不拿空数据当"没跑过"。
@@ -91,7 +92,7 @@ FAIL_STATUSES = (
     'ENGINE-FAIL', 'JDK-SWAP-FAIL', 'JDK-FIX-FAIL', 'JDK-ASSERT-FAIL',
     'COLD-START-FAIL', 'CLUSTER-NOT-READY', 'HEAP-ASSERT-FAIL',
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
-    'SEG-ASSERT-FAIL',
+    'SEG-ASSERT-FAIL', 'RACE-FAIL',
 )
 SKIP_STATUSES = ('SKIP', 'DEADLINE-SKIP')
 
@@ -311,8 +312,11 @@ def fetch_rows(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
 # ------------------------------------------------------------------ 覆盖模型
 def _expected_phases(row):
     """一场次该有哪些相位。write-only 赛道只有写赛。"""
-    if (row.get('challenge') or '').strip() == 'write-only':
+    ch = (row.get('challenge') or '').strip()
+    if ch == 'write-only':
         return {'w'}
+    if ch in ('full', 'nested-search-challenge', 'default'):
+        return {'wq'}
     return {'w', 'q'}
 
 

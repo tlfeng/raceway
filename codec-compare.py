@@ -102,15 +102,20 @@ def valid_fids(camp):
 def collect(camp):
     keep = valid_fids(camp)
     fields = {}
-    for p in sorted(glob.glob(os.path.join(camp, "results", "*-g*-w-race.json"))):
+    # 单挑战（full）与拆分（w+q）两种协议的落档都认：wq 一份文件里写查都有
+    for p in sorted(glob.glob(os.path.join(camp, "results", "*-g*-w-race.json"))
+                    + glob.glob(os.path.join(camp, "results", "*-g*-wq-race.json"))):
         fid = os.path.basename(p)[:-len("-w-race.json")]
+        single = p.endswith("-wq-race.json")
+        if single:
+            fid = os.path.basename(p)[:-len("-wq-race.json")]
         if keep is not None and fid not in keep:
             continue
         key = "-".join(fid.split("-")[:2])          # car + 变体（r 轮号在后头）
         if key not in CAR_LABEL:
             continue
         d = j(p)
-        if not d or d.get("challenge") != "write-only":
+        if not d or d.get("challenge") not in ("write-only", "full"):
             continue
         om = (d.get("results") or {}).get("op_metrics") or []
         if not om:
@@ -135,14 +140,18 @@ def collect(camp):
             "err": om[0].get("error_rate"),
             "codec": measured_codec(camp, fid),
         })
-        qp = os.path.join(camp, "results", "%s-q-race.json" % fid)
-        if os.path.isfile(qp):
-            qd = j(qp)
-            for m in ((qd or {}).get("results") or {}).get("op_metrics") or []:
-                e["q"].append({"op": m.get("task"), "round": (qd.get("user-tags") or {}).get("round"),
-                               "p50": (m.get("latency") or {}).get("50_0"),
-                               "p99": (m.get("latency") or {}).get("99_0"),
-                               "rtp": (m.get("throughput") or {}).get("median")})
+        if single:
+            q_ops = [m for m in om if not str(m.get("task") or "").startswith("index")]
+        else:
+            qp = os.path.join(camp, "results", "%s-q-race.json" % fid)
+            q_ops = (((j(qp) or {}).get("results") or {}).get("op_metrics") or []
+                     if os.path.isfile(qp) else [])
+        rnd = (d.get("user-tags") or {}).get("round")
+        for m in q_ops:
+            e["q"].append({"op": m.get("task"), "round": rnd,
+                           "p50": (m.get("latency") or {}).get("50_0"),
+                           "p99": (m.get("latency") or {}).get("99_0"),
+                           "rtp": (m.get("throughput") or {}).get("median")})
     return fields
 
 

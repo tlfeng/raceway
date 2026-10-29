@@ -25,7 +25,8 @@ DOCS = {"geo": 11396503, "hnsw": 2000000, "nested": 11203029}   # 各赛道语�
 
 
 def race_duration(path_md):
-    """同名 -w-race.json 里 index-append 的 duration(ms)；读不到返回 None"""
+    """同名 -w-race.json / -wq-race.json 里 index-append 的 duration(ms)；读不到返回 None
+    （路径公式按扩展名截断，<fid>-w.md 与 <fid>-wq.md 都落成正确的 race.json 名）"""
     p = path_md[:-3] + "-race.json"
     if not os.path.isfile(p):
         return None

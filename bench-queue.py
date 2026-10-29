@@ -228,7 +228,7 @@ class Field:
     recall: str = ''
     est: int = 0
     conflicts: list = field(default_factory=list)   # 互相矛盾的判定
-    phase: str = ''                                 # 运行中相位：write / query / recall
+    phase: str = ''                             # 运行中相位：write+query / recall
     elapsed_min: float = 0.0                        # 运行中场次已进行分钟数（快照时算）
 
 
@@ -335,9 +335,9 @@ RE_FIELD_SKIP = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+跳过（(.*
 RE_FIELD_DEADLINE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+DEADLINE-SKIP（(.*?)）')
 RE_RETRY = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+第\s*(\d+)/(\d+)\s*次尝试')
 RE_GIVEUP = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+已达最大重试次数')
-RE_PHASE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+(write race 开始|query race 开始|recall 探针开始)')
+RE_PHASE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+(full race 开始|recall 探针开始)')
 # RE_PHASE 第 4 组 → 展示词（进度页的"当前相位"）
-PHASE_LABEL = {'write race 开始': 'write', 'query race 开始': 'query', 'recall 探针开始': 'recall'}
+PHASE_LABEL = {'full race 开始': 'write+query', 'recall 探针开始': 'recall'}
 RE_CAMPAIGN_END = re.compile(r'^\[([\d\-: ]+)\]\s+campaign 结束:\s*(\d+)/(\d+)\s*场有效')
 
 

@@ -88,7 +88,7 @@ def load_detail_metrics(path, camp, run_index=None):
 
 
 def build(runs, detail, sysrows, camp):
-    W = [r for r in runs if r.get("phase") == "w"]
+    W = [r for r in runs if r.get("phase") in ("w", "wq")]
     # 1) 明细 campaign：按 (car, track) 汇总逐轮
     byat = {}
     for r in W:
@@ -120,7 +120,7 @@ def build(runs, detail, sysrows, camp):
     # 每车每赛道的 bulk p99/p100（来自明细指标）
     tails = {}
     for m in detail:
-        if m["task"] == "index-append" and m["family"] == "service_time" and m["phase"] == "w":
+        if m["task"] == "index-append" and m["family"] == "service_time" and m["phase"] in ("w", "wq"):
             tails.setdefault((m["car"], m["track"]), {}).setdefault(m["stat"], []).append(m["value"])
     for card in detail_card:
         t = tails.get((card["car"], card["track"]), {})
@@ -209,7 +209,10 @@ def build_codec(runs, detail, camp):
     for r in rows:
         key = CAR_LABEL.get((r.get("engine"), r.get("track_raw"))) or \
             "%s-%s" % (r.get("engine"), r.get("track_raw"))
-        grp.setdefault(key, {"w": [], "q": []})["w" if r.get("phase") == "w" else "q"].append(r)
+        ph = r.get("phase")
+        slot = grp.setdefault(key, {"w": [], "q": []})
+        # 单挑战（wq）一场覆盖两相位：写/查两侧都计入
+        (slot["w"] if ph in ("w", "wq") else slot["q"]).append(r)
 
     def spread(v):
         v = [x for x in v if x]

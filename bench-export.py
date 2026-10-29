@@ -61,7 +61,7 @@ def track_name_of(raw):
 # 压缩：default(LZ4) / ZSTD / best_compression(DEFLATE)
 # source_reuse：true / false —— Easysearch 专有（ES 不认 index.source_reuse）
 PHASE = {"write-only": "w", "query-only": "q", "index-only": "w",
-         "nested-search-challenge": "wq", "default": "wq"}
+         "full": "wq", "nested-search-challenge": "wq", "default": "wq"}
 LOWER_BETTER = ("latency", "service_time", "processing_time", "error_rate", "duration",
                 "indexing_time", "merge_time", "refresh_time", "flush_time", "gc",
                 "disk", "store", "system", "memory", "queue_time")
@@ -1346,11 +1346,13 @@ def main():
             # 必须按尾部的 -test-worker-N 切，否则 fid 被截成 "es819"，环境行与场次对不上
             m = re.match(r"^(.*)-(test-worker-\d+)$", key)
             fid, node = (m.group(1), m.group(2)) if m else (key.partition("-")[0], key.partition("-")[2])
-            # 相位后缀 -w/-m/-q（分相位采集，与 race 行 phase=w/q 同词汇）；剥掉后缀让
-            # 环境行与 race 行同 fid 对上，相位记进 phase 字段。报告侧按 fid 聚合取最坏
-            # 即自动跨相位；历史 campaign 无后缀 → phase=""
+            # 相位后缀 -w/-m/-q/-wq（分相位或单挑战全程采集，与 race 行 phase 同词汇）；
+            # 剥掉后缀让环境行与 race 行同 fid 对上，相位记进 phase 字段。
+            # 报告侧按 fid 聚合取最坏即自动跨相位；历史 campaign 无后缀 → phase=""
             ph = ""
-            if fid.endswith(("-w", "-m", "-q")):
+            if fid.endswith("-wq"):
+                ph, fid = "wq", fid[:-3]
+            elif fid.endswith(("-w", "-m", "-q")):
                 ph, fid = fid[-1], fid[:-2]
             # 该 campaign 里找不到这场 race → monitors/ 目录被别的批次的产物污染
             # （服务器侧目录混放）。这种行的时间戳/身份只能取自别的批次（全局字典时代的

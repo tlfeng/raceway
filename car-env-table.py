@@ -56,12 +56,13 @@ def main():
         return 1
     rows = []
     for camp in camps:
-        for p in sorted(glob.glob(os.path.join(camp, "results", "*-w-race.json"))):
+        for p in sorted(glob.glob(os.path.join(camp, "results", "*-w-race.json"))
+                        + glob.glob(os.path.join(camp, "results", "*-wq-race.json"))):
             try:
                 d = json.load(open(p, encoding="utf-8"))
             except (ValueError, OSError):
                 continue
-            if d.get("challenge") != "write-only":
+            if d.get("challenge") not in ("write-only", "full"):
                 continue
             om = (d.get("results") or {}).get("op_metrics") or []
             if not om:
@@ -69,7 +70,8 @@ def main():
             tr = d.get("track")
             if tr not in DOCS:
                 continue
-            fid = os.path.basename(p)[:-len("-w-race.json")]
+            suffix = "-wq-race.json" if p.endswith("-wq-race.json") else "-w-race.json"
+            fid = os.path.basename(p)[:-len(suffix)]
             a = (om[0].get("throughput") or {}).get("median")
             dur = (om[0].get("duration") or 0) / 1000.0
             b = DOCS[tr] / dur if dur else None
@@ -80,7 +82,7 @@ def main():
                          "p99": (om[0].get("service_time") or {}).get("99_0"),
                          "p100": (om[0].get("service_time") or {}).get("100_0")})
     if not rows:
-        print("没有 write-only 的 race.json 可解析")
+        print("没有 write-only/full 的 race.json 可解析")
         return 1
 
     if detail:
