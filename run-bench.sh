@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # run-bench.sh —— 性能编排（配置 × 赛道 × 轮次，在压测机上运行；单入口，esrally 风格）
-#   ./run-bench.sh <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds=3] [配置文件]
+#   ./run-bench.sh <geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
 #   ./run-bench.sh list                          # 列可用赛道/配置模板/近期 campaign
 #
 # 配置文件（第 3 参数或 CONF= 环境变量）：每行一个配置，轮内按行序右旋配对交错——
@@ -45,9 +45,14 @@ source ./vm-bench-lib.sh
 declare -F track_params >/dev/null 2>&1 \
   || die "vm-bench-lib.sh 版本过旧（缺 track_params）：请把整个仓库同步到压测机（scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/）"
 
-WHAT="${1:?用法: $0 <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
+# 赛道/模式名单：用法提示、参数校验、文件头注释三处共用这一份（WHAT_ARGS）。
+# 踩过的坑：文案列了 6 个历史短名，实际 case 只认 3 个 —— 另外 3 个传进去直接 die，
+# 文案却写着能用。收敛成一份之后，这类漂移由 tests/test_codec_variants.py 挡住。
+WHAT_ARGS='geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>|list'
+
+WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]}"
 [ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
-WHAT="${1:?用法: $0 <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
+WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]}"
 ROUNDS="${2:-3}"
 DRY=${DRY:-0}
 
@@ -128,7 +133,7 @@ case "$WHAT" in
   all) TRACKS=(geo hnsw nested);;
   ds) TRACKS=(ds-g1920 ds-j2048 ds-j1024 ds-g960 ds-j768 ds-j512 ds-j1536);;
   ds-*) TRACKS=("$WHAT");;
-  *) die "track 参数必须是 geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>";;
+  *) die "track 参数必须是 $WHAT_ARGS";;
 esac
 
 # ---- 配置解析与校验（fail-fast 在建 campaign 目录之前） -------------------------

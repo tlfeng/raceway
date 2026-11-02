@@ -122,8 +122,6 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名（geo-codec-*）
   #    与 legacy 别名走的是同一条规则，只是名字不同。
   local b; b=$(track_base "$1")
-  # track_canonical 只映射 gdef/gzstd/gbc；这三个更早的短名按 geo 基座处理。
-  case "$1" in gdefsr|gzstdns|gbcsr) b=geo;; esac
   case "$b" in
     geo|nested) echo "number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
     *) echo "";;

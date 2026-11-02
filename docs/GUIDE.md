@@ -63,7 +63,7 @@ scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/
 ## 3. 三种编排方式
 
 ```bash
-./run-bench.sh <track> [rounds=3] [配置文件]     # track: geo|gdef|gzstd|gbc|hnsw|hv1024|nested|codec|both|all|ds
+./run-bench.sh <track> [rounds=3] [配置文件]     # track: geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>
 ./run-bench.sh list                              # 列可用赛道、配置模板、近期跑分
 ./run-bench.sh --dry-run geo 3 my.conf           # 只打印排程，不执行（DRY=1 等价）
 ```
