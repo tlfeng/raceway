@@ -864,8 +864,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local rlog="$CAMP_DIR/logs/$fid-wq.log"
   local HOSTS; HOSTS=$(target_hosts)
   local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
-  local tp=""
-  case "$tk" in geo|nested|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr) tp="number_of_shards:$SHARDS,number_of_replicas:$REPLICAS";; esac
+  local tp; tp=$(track_params "$tk")
   local t0=$(date +%s)
 
   PROGSTEP "===== [$seq] $fid 开始 ====="

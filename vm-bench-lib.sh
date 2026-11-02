@@ -113,6 +113,23 @@ track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
   if [ "$sr" = "true" ] || [ "$comp" = "ZSTD" ]; then echo "easysearch"; else echo ""; fi
 }
 
+track_params() { # <id> → esrally --track-params（空 = 不传）
+  # 只有"模板类基座"需要传分片口径：geonames 的 index.json 是 Jinja 模板，
+  # 写的是 "index.number_of_shards": {{number_of_shards | default(5)}} —— 不传就
+  # 落到模板默认的 **5 分片**，与本项目其余赛道的 3 分片口径不一致，跨赛道/跨变体
+  # 的数字就不可比了（实测 legacy 别名 gdef/gzstd/gbc 落档都是 3 分片）。
+  # 其余赛道（hnsw/hv1024/ds-*）分片已烘进 index.json，不传。
+  # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名（geo-codec-*）
+  #    与 legacy 别名走的是同一条规则，只是名字不同。
+  local b; b=$(track_base "$1")
+  # track_canonical 只映射 gdef/gzstd/gbc；这三个更早的短名按 geo 基座处理。
+  case "$1" in gdefsr|gzstdns|gbcsr) b=geo;; esac
+  case "$b" in
+    geo|nested) echo "number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
+    *) echo "";;
+  esac
+}
+
 # ---- 拓扑（单事实源 = ibs ip.txt）---------------------------------------------
 # 集群节点 = ip.txt 中主机名不以 esrally 开头的行（esrally 行是驱动器，不进集群）。
 # 产出：VM_IPS/VM_NODES（角色节点数组）、NNODES、NODE_RANGE（ops.deploy -n 的 1-based 行号区间）、

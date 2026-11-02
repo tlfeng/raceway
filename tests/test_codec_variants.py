@@ -32,6 +32,38 @@ C = importlib.import_module('bench-compose')    # noqa: E402
 E = importlib.import_module('bench-export')     # noqa: E402  （codec 两维度拆分的实现在这）
 
 
+def _bash_path(p):
+    """把本地路径转成 bash 看得见的路径。
+
+    Windows 上的 bash 通常是 WSL：它看不见 `C:\\...`，得写成 `/mnt/c/...`，
+    否则 source 静默失败、函数全部没定义（测试表现为"函数返回空"）。
+    Git Bash 看得见 Windows 路径，所以先问 bash 自己是哪一种。
+    """
+    if os.name != 'nt':
+        return p
+    probe = subprocess.run(['bash', '-c', 'test -d /mnt && echo wsl || echo native'],
+                           capture_output=True, text=True)
+    if 'wsl' not in probe.stdout:
+        return p
+    d = os.path.abspath(p).replace('\\', '/')
+    if len(d) > 2 and d[1] == ':':
+        return '/mnt/' + d[0].lower() + d[2:]
+    return d
+
+
+def _run_bash(script, workdir):
+    """把脚本写成文件再执行。
+
+    不能用 `bash -c "<脚本>"`：在 Windows 上这一层传参会吃掉脚本里的引号
+    （`"$i"` 变成空串），bash 收到的脚本被改了样 —— 表现为变量全空、
+    函数返回空。写成文件走 `bash <file>` 才不会走那层转义。
+    """
+    sp = os.path.join(workdir, '_probe.sh')
+    with open(sp, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(script)
+    return subprocess.run(['bash', _bash_path(sp)], capture_output=True, text=True)
+
+
 def bash_derive(fn, ids):
     """在 bash 里跑 vm-bench-lib.sh 的推导函数 → {id: stdout}。
 
@@ -39,14 +71,15 @@ def bash_derive(fn, ids):
     """
     with tempfile.TemporaryDirectory() as d:
         shutil.copy(os.path.join(ROOT, 'vm-bench-lib.sh'), d)
-        with open(os.path.join(d, 'vm-bench.env'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(d, 'vm-bench.env'), 'w', encoding='utf-8', newline='\n') as f:
             f.write('ROOT=/opt/raceway\n')
         quoted = ' '.join("'%s'" % i for i in ids)
         script = (
-            "source '%s/vm-bench-lib.sh' 2>/dev/null\n"
+            "cd '%s' || exit 1\n"
+            "source ./vm-bench-lib.sh 2>/dev/null\n"
             "for i in %s; do printf '%%s\\t' \"$i\"; %s \"$i\"; echo; done\n"
-            % (d, quoted, fn))
-        p = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+            % (_bash_path(d), quoted, fn))
+        p = _run_bash(script, d)
         out = {}
         for line in p.stdout.splitlines():
             if '\t' in line:
@@ -135,6 +168,65 @@ class TestCatalog(unittest.TestCase):
         # 基础赛道（非变体）无约束
         self.assertIsNone(H.engines_of('geo'))
         self.assertIsNone(H.engines_of('ds-j1024'))
+
+
+class TestTrackParams(unittest.TestCase):
+    """分片口径：canonical 变体与 legacy 别名必须拿到同一份 track-params。
+
+    geonames 的 index.json 是 Jinja 模板，分片数写的是
+    `{{number_of_shards | default(5)}}` —— 不传 track-params 就落到模板默认的
+    **5 分片**，而本项目其余赛道都是 3 分片。一旦漏传，同一条赛道的新旧场次
+    分片数就不同（跨变体/跨赛道的数字直接不可比），而且**不会报错**。
+
+    这条曾经真的漏过：runner 原来按 id 名单判断（只列了 geo/nested 与几个
+    legacy 短别名），canonical 名（geo-codec-*）不在名单里 → 静默走 5 分片。
+    """
+
+    PARAMS = 'number_of_shards:3,number_of_replicas:0'
+
+    def test_geo_family_gets_shard_params(self):
+        """模板类基座（geo 族 + nested）必须传分片口径。"""
+        ids = ['geo', 'nested',
+               'gdef', 'gzstd', 'gbc',
+               'geo-codec-def', 'geo-codec-def-sr',
+               'geo-codec-zstd', 'geo-codec-zstd-sr',
+               'geo-codec-bc', 'geo-codec-bc-sr']
+        b = bash_derive('track_params', ids)
+        for i in ids:
+            self.assertEqual(b.get(i), self.PARAMS, '分片口径不对: %s' % i)
+
+    def test_canonical_matches_legacy_alias(self):
+        """canonical 名与 legacy 别名必须给出完全相同的口径。"""
+        pairs = [('geo-codec-def', 'gdef'),
+                 ('geo-codec-zstd-sr', 'gzstd'),
+                 ('geo-codec-bc', 'gbc')]
+        ids = [x for p in pairs for x in p]
+        b = bash_derive('track_params', ids)
+        for canon, legacy in pairs:
+            self.assertEqual(b.get(canon), b.get(legacy),
+                             'canonical 与 legacy 口径不一致: %s vs %s' % (canon, legacy))
+
+    def test_baked_tracks_get_nothing(self):
+        """分片已烘进 index.json 的赛道不传 track-params。"""
+        ids = ['hnsw', 'hv1024', 'ds-j1024', 'ds-g1920',
+               'hnsw-codec-zstd', 'hnsw-codec-def']
+        b = bash_derive('track_params', ids)
+        for i in ids:
+            self.assertEqual(b.get(i, ''), '', '不该传分片参数: %s' % i)
+
+    def test_shards_knob_is_honored(self):
+        """SHARDS / REPLICAS 旋钮要真的生效（不能写死）。"""
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(os.path.join(ROOT, 'vm-bench-lib.sh'), d)
+            with open(os.path.join(d, 'vm-bench.env'), 'w', encoding='utf-8', newline='\n') as f:
+                f.write('ROOT=/opt/raceway\n')
+            script = (
+                "cd '%s' || exit 1\n"
+                "source ./vm-bench-lib.sh 2>/dev/null\n"
+                "SHARDS=5; REPLICAS=1\n"
+                "track_params geo-codec-def\n" % _bash_path(d))
+            p = _run_bash(script, d)
+        self.assertEqual(p.stdout.strip(), 'number_of_shards:5,number_of_replicas:1')
 
 
 class TestPrepareDefaults(unittest.TestCase):
