@@ -536,9 +536,12 @@ def load_campaign_meta(camp_dir):
             m["sidecar_by_race"][rid] = s
         m["env_id"] = s.get("env", {}).get("env_id") or m["env_id"]
         m["env"] = s.get("env") or m["env"]
-    # 赛末（forcemerge 之后）落盘体积：q 阶段的节点统计原始探针，三节点 store 之和
-    for p in glob.glob(os.path.join(camp_dir, "logs", "fp", "*-q", "nodes-stats.txt")):
-        fid = os.path.basename(os.path.dirname(p))[:-2]
+    # 赛末（forcemerge 之后）落盘体积：节点统计原始探针，三节点 store 之和。
+    # 拆分协议落档 <fid>-q、单挑战协议落档 <fid>-wq（merge 都发生在探针之前），两个都认。
+    for p in glob.glob(os.path.join(camp_dir, "logs", "fp", "*-q", "nodes-stats.txt")) + \
+             glob.glob(os.path.join(camp_dir, "logs", "fp", "*-wq", "nodes-stats.txt")):
+        _fpdir = os.path.basename(os.path.dirname(p))
+        fid = _fpdir[:-3] if _fpdir.endswith("-wq") else _fpdir[:-2]
         try:
             nd = json.load(open(p, encoding="utf-8")).get("nodes") or {}
         except (ValueError, OSError):

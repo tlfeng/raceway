@@ -63,11 +63,12 @@ def measured_codec(camp, fid):
 
 
 def post_merge_store(camp, fid):
-    """真·压缩后体积：q 阶段 sidecar 原始探针 logs/fp/<fid>-q/nodes-stats.txt 的三节点 store 之和。
-    race.json 的 store_size 是写赛结束时的快照，那时本编排的 force_merge_to_one 还没跑，
-    多段状态下 codec 差异没充分显现 → 压缩对比必须以赛末（merge 之后）的节点统计为准。"""
+    """真·压缩后体积：赛末 sidecar 原始探针 logs/fp/<fid>-<q|wq>/nodes-stats.txt 的三节点
+    store 之和（拆分协议落 -q、单挑战协议落 -wq，merge 都发生在探针之前）。
+    race.json 的 store_size 是写赛结束时的快照，多段状态下 codec 差异没充分显现
+    → 压缩对比必须以赛末（merge 之后）的节点统计为准。"""
     out = {"store_gb": None, "segments": None, "docs": None}
-    for ph in ("q", "w"):
+    for ph in ("wq", "q", "w"):
         p = os.path.join(camp, "logs", "fp", "%s-%s" % (fid, ph), "nodes-stats.txt")
         d = j(p)
         if not d or "nodes" not in d:
