@@ -18,6 +18,7 @@
 """
 import importlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -203,12 +204,12 @@ class TestTrackParams(unittest.TestCase):
             self.assertEqual(b[i], self.PARAMS, '分片口径不对: %s' % i)
 
     def test_all_codec_names_share_one_params(self):
-        """6 个 canonical 变体 + 6 个 legacy 别名，分片口径必须完全一致。
+        """6 个 canonical 变体 + 3 个 legacy 别名，分片口径必须完全一致。
 
         这里断言的是**具体值**，不是"canonical 与 legacy 相等" —— 只比相等的话，
         两边同时为空（函数根本没跑起来）也会通过，等于没测。
         """
-        ids = ['gdef', 'gzstd', 'gbc', 'gdefsr', 'gzstdns', 'gbcsr',
+        ids = ['gdef', 'gzstd', 'gbc',
                'geo-codec-def', 'geo-codec-def-sr',
                'geo-codec-zstd', 'geo-codec-zstd-sr',
                'geo-codec-bc', 'geo-codec-bc-sr']
@@ -240,6 +241,158 @@ class TestTrackParams(unittest.TestCase):
             p = _run_bash(script, d)
         self.assertEqual(p.stdout.strip(), 'number_of_shards:5,number_of_replicas:1')
 
+
+class TestTrackNameHelpText(unittest.TestCase):
+    """文案承诺的赛道名，必须真的能被 runner 接受。
+
+    踩过的坑：文案列了 6 个历史短名，实际 case 只认 3 个 —— 另外 3 个传进去
+    直接 die，文案却写着能用。这里做**行为测**（不解析源码）：从 runner 自己的
+    文案里抠出它承诺的名字，逐个跑一遍，确认没有"说了不算"的。
+
+    文案有三份（文件头注释 / 无参用法提示 / 错参报错消息），必须列同一份名单。
+    """
+
+    REJECT = 'track 参数必须是'
+    PH = '\x00'          # 占位符哨兵：<> 里是形态说明，不是能直接跑的名字
+
+    def _prepare(self, d):
+        shutil.copy(os.path.join(ROOT, 'run-bench.sh'), d)
+        shutil.copy(os.path.join(ROOT, 'vm-bench-lib.sh'), d)
+        with open(os.path.join(d, 'vm-bench.env'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write('ROOT=/opt/raceway\nRESULTS_ROOT=/opt/raceway/campaigns\n')
+
+    # ---- 跑 runner --------------------------------------------------------
+    def _run(self, d, *args):
+        """跑一次 runner，返回 stdout+stderr 合并后的输出。"""
+        argv = ' '.join("'%s'" % a for a in args)
+        script = ("cd '%s' || exit 1\n"
+                  "bash ./run-bench.sh %s 2>&1\n" % (_bash_path(d), argv))
+        return _run_bash(script, d).stdout
+
+    def _run_many(self, d, names):
+        """一次 bash 里跑完多个名字 → {名字: 输出}。
+
+        逐个起 bash 在 WSL 上不便宜（每次 ~0.15s），一次循环跑完省一个数量级。
+        """
+        lst = ' '.join("'%s'" % n for n in names)
+        script = ("cd '%s' || exit 1\n"
+                  "for n in %s; do\n"
+                  "  out=$(bash ./run-bench.sh \"$n\" 2>&1)\n"
+                  "  printf '===%%s\\n' \"$n\"\n"
+                  "  printf '%%s\\n' \"$out\"\n"
+                  "done\n" % (_bash_path(d), lst))
+        out = _run_bash(script, d).stdout
+        res, cur, buf = {}, None, []
+        for line in out.splitlines():
+            if line.startswith('==='):
+                if cur is not None:
+                    res[cur] = '\n'.join(buf)
+                cur, buf = line[3:], []
+            elif cur is not None:
+                buf.append(line)
+        if cur is not None:
+            res[cur] = '\n'.join(buf)
+        missing = [n for n in names if n not in res]
+        self.assertEqual(missing, [], '批量执行没回收到这些名字的输出: %s' % missing)
+        return res
+
+    # ---- 解析文案里的名单 --------------------------------------------------
+    def _literal_names(self, listed):
+        """从 `a|b|<x>-<y>|<z>` 里取出**字面**名字。
+
+        占位符里也可能带 `|`（如 `<def|zstd|bc>`），所以先把 `<...>` 整段换成
+        哨兵再按 `|` 拆 —— 带哨兵的片段是占位符拼出来的形态，不是能直接跑的名字。
+        """
+        clean = re.sub(r'<[^<>]*>', self.PH, listed)
+        out = []
+        for tok in clean.split('|'):
+            tok = tok.strip()
+            if not tok or self.PH in tok:
+                continue
+            out.append(tok)
+        return out
+
+    def _names_in_angle(self, seg):
+        """取 `<...>` 里的名单（第一个 `<` 到最后一个 `>` 之间）。"""
+        return seg[seg.index('<') + 1: seg.rindex('>')]
+
+    def _usage_names(self, usage):
+        """无参用法提示里的名单。"""
+        seg = usage.split('用法:', 1)[1].split(' [rounds]', 1)[0]
+        return self._literal_names(self._names_in_angle(seg))
+
+    def _error_names(self, err):
+        """错参报错消息里的名单。"""
+        listed = err.split(self.REJECT, 1)[1].splitlines()[0]
+        return self._literal_names(listed)
+
+    def _header_names(self):
+        """文件头注释里那行用法里的名单。"""
+        with open(os.path.join(ROOT, 'run-bench.sh'), encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('#   ./run-bench.sh <'):
+                    seg = line.split(' [rounds', 1)[0]
+                    return self._literal_names(self._names_in_angle(seg))
+        self.fail('run-bench.sh 文件头没找到用法行')
+
+    # ---- 用例 --------------------------------------------------------------
+    def test_help_texts_agree(self):
+        """文件头注释 / 用法提示 / 报错消息必须列同一份名字。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            self._prepare(d)
+            usage = self._run(d)
+            err = self._run(d, '__no_such_track__')
+        self.assertIn('用法:', usage)
+        self.assertIn(self.REJECT, err)
+        header = self._header_names()
+        self.assertEqual(self._usage_names(usage), header,
+                         '文件头注释与用法提示列的名字不一致')
+        self.assertEqual(self._error_names(err), header,
+                         '报错消息与用法提示列的名字不一致')
+
+    def test_every_name_in_help_is_actually_accepted(self):
+        """文案里承诺的每个字面名，都要真的不被赛道名校验拦下。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            self._prepare(d)
+            err = self._run(d, '__no_such_track__')
+            self.assertIn(self.REJECT, err)
+            names = self._error_names(err)
+            self.assertTrue(names, '报错消息里没解析出赛道名: %r' % err)
+            res = self._run_many(d, names)
+        bad = [n for n in names if self.REJECT in res.get(n, '')]
+        self.assertEqual(bad, [], '文案承诺了但实际会被 die 拦下: %s' % bad)
+
+    def test_canonical_codec_form_is_accepted(self):
+        """canonical 形态（<赛道>-codec-<def|zstd|bc>[-sr]）是跑单个变体的正确写法。"""
+        geo_family = sorted(n for n, v in C.TRACK_CATALOG.items()
+                            if v['base'] == 'geo' and v['variant'])
+        self.assertEqual(len(geo_family), 6, 'geo 族的 canonical 变体数不对')
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            self._prepare(d)
+            res = self._run_many(d, geo_family)
+        bad = [n for n in geo_family if self.REJECT in res.get(n, '')]
+        self.assertEqual(bad, [], 'canonical 变体名被拒: %s' % bad)
+
+    def test_removed_legacy_names_are_rejected(self):
+        """gdefsr/gzstdns/gbcsr 从未实现过（只进过文案）—— 文案不许再承诺它们。"""
+        dead = ['gdefsr', 'gzstdns', 'gbcsr']
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            self._prepare(d)
+            res = self._run_many(d, dead)
+        for n in dead:
+            self.assertIn(self.REJECT, res.get(n, ''), '%s 本该被拒绝' % n)
+
+    def test_list_menu_names_are_accepted(self):
+        """`list` 菜单里列的赛道，也要真的能跑（菜单也是一份文案）。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            self._prepare(d)
+            out = self._run(d, 'list')
+            self.assertIn('可用赛道:', out)
+            names = out.split('可用赛道:', 1)[1].splitlines()[0].split()
+            self.assertTrue(names, 'list 菜单里没解析出赛道名: %r' % out)
+            res = self._run_many(d, names)
+        bad = [n for n in names if self.REJECT in res.get(n, '')]
+        self.assertEqual(bad, [], 'list 菜单里的赛道名被拒: %s' % bad)
 
 class TestPrepareDefaults(unittest.TestCase):
     """prepare 脚本的默认变体集合要与清单里的 geo 族一致。"""
