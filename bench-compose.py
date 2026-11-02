@@ -8,7 +8,7 @@ serve 是三合一 Web 控制台（原"排程编排台"扩容）：
   最新没收尾的 campaign；显示当前场次/相位/已进行时长、进度条、剩余预估、
   PROGRESS.txt 尾部日志；可停止（远端 stop-campaign.sh）
 - ③ 历史与结果：全部 campaign 清单（一次远端调用取摘要），任一场可"看进度"、
-  可"按此重排"（预填启动矩阵）；外链 Kibana 看板
+  可"按此重排"（预填启动矩阵）
 
 设计要点（见 PLAN-raceway队列可视化与编排台.md §四 v1）：
 - 交错必须复刻 order_for_round（赛道外层 → 轮次 → 车右旋），直接 import
@@ -697,10 +697,6 @@ _PAGE = """<!doctype html>
 </div>
 
 <div id="tab-history" class="tab">
- <fieldset><legend>外部结果入口</legend>
-  <a id="kibana" href="#" target="_blank">Kibana 看板 →</a>
-  <div class="sub" id="kibanahint"></div>
- </fieldset>
  <fieldset><legend>两场对比（car-compare：逐轮实测 + 中位差值 Δ + 轮间极差）</legend>
   A <select id="cmpa" style="max-width:250px"></select> 车 <input id="cmpcara" size="8" placeholder="自动">
   &nbsp;vs&nbsp;
@@ -783,11 +779,6 @@ async function boot(){
   document.getElementById('tracks').innerHTML=h;
   document.getElementById('conn').textContent =
     '远端 '+(j.ssh||'本地')+' · raceway 根 '+j.root+' · 车源 '+j.cars_file;
-  const kb=document.getElementById('kibana');
-  kb.href=j.kibana_url+'/app/dashboards';
-  kb.textContent='Kibana 看板（'+j.kibana_url+'）→';
-  document.getElementById('kibanahint').textContent =
-    'Kibana 若只听远端 127.0.0.1，先建隧道：ssh -L 5601:127.0.0.1:5601 '+(j.ssh||'user@host');
   ['cars','tracks','rounds','recall','estov','dsh','custom','tag','incov'].forEach(function(id){
     document.getElementById(id).addEventListener('change',function(){savePrefs();loadHist();});
   });
@@ -1533,7 +1524,6 @@ class Handler(BaseHTTPRequestHandler):
                 'token_codec': TOKEN_CODEC,
                 'ssh': st.args.ssh or '', 'root': st.args.root,
                 'cars_file': st.args.cars_file,
-                'kibana_url': st.args.kibana_url,
             }, ensure_ascii=False))
         elif path == '/api/history':
             cov = st.history()
@@ -1625,9 +1615,6 @@ def main(argv=None):
     ap.add_argument('--ssh', default=os.environ.get('RACEWAY_SSH'),
                     help='user@host；缺省读环境变量 RACEWAY_SSH，再缺省操作本地')
     ap.add_argument('--port', type=int, default=8802)
-    ap.add_argument('--kibana-url', default='http://127.0.0.1:5601',
-                    help='历史页外链的 Kibana 地址（默认 http://127.0.0.1:5601；'
-                         'Kibana 只听远端 127.0.0.1 时需先建 ssh 隧道）')
     ap.add_argument('--no-open', action='store_true',
                     help='serve 起来后不自动打开浏览器')
     ap.add_argument('--yes', action='store_true')
