@@ -126,11 +126,10 @@ else
   fi
 fi
 
-# ---- 6/6 指标库与看板（信息性：压测窗口内本来就该停着） ------------------------
-section "6/6 指标库 9237 / Kibana 5601（压测窗口内应为停用状态）"
+# ---- 6/6 指标库（信息性：压测窗口内本来就该停着） ------------------------------
+section "6/6 指标库 9237（压测窗口内应为停用状态）"
 port_up() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
-if port_up 9237; then note "指标库 9237 在运行（入库/看板可用；压测窗口内记得停）"; else note "指标库 9237 未运行（压测窗口内是常态；入库前再启动）"; fi
-if port_up 5601; then note "Kibana 5601 在运行"; else note "Kibana 5601 未运行"; fi
+if port_up 9237; then note "指标库 9237 在运行（入库可用；压测窗口内记得停）"; else note "指标库 9237 未运行（压测窗口内是常态；入库前再启动）"; fi
 if command -v systemctl >/dev/null 2>&1; then
   st=$(systemctl is-enabled easysearch-metric-store.service 2>/dev/null || true)
   [ "$st" = "enabled" ] && warn "指标库开机自启是 enabled（窗口期一重启就被拉回来抢 CPU；systemctl disable 关掉）" \

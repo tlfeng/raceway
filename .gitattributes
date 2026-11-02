@@ -22,7 +22,6 @@
 # 二进制资源不参与行尾转换
 # 注意：binary 宏会关掉 text 转换，因此 renormalize 也不会动它们；
 # 但工作区里若已被 autocrlf 改过，必须从 HEAD 还原，否则会被灌回索引。
-echarts.min.js binary
 *.min.js binary
 *.jar binary
 *.tar.gz binary
