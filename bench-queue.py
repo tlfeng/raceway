@@ -67,7 +67,7 @@ STATUS_FAILS = (
     'ENGINE-FAIL', 'JDK-SWAP-FAIL', 'JDK-FIX-FAIL', 'JDK-ASSERT-FAIL',
     'COLD-START-FAIL', 'CLUSTER-NOT-READY', 'HEAP-ASSERT-FAIL',
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
-    'SEG-ASSERT-FAIL',
+    'SEG-ASSERT-FAIL', 'RACE-FAIL',
 )
 KNOWN_STATUS = (STATUS_VALID, STATUS_SKIP, STATUS_DEADLINE) + STATUS_FAILS
 
@@ -665,7 +665,7 @@ def build_campaign(src, cid, schedule_override=None):
         elif kind == 'giveup':
             f.ended = ts.strip()
             if not is_fail(f.status):
-                f.status = 'WRITE-FAIL'
+                f.status = 'RACE-FAIL'
                 f.detail = '已达最大重试次数'
 
     # ---- 3) 判定表（RACES.md）归并
