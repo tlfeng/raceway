@@ -32,6 +32,9 @@ C = importlib.import_module('bench-compose')    # noqa: E402
 E = importlib.import_module('bench-export')     # noqa: E402  （codec 两维度拆分的实现在这）
 
 
+_BASH_IS_WSL = None
+
+
 def _bash_path(p):
     """把本地路径转成 bash 看得见的路径。
 
@@ -39,11 +42,14 @@ def _bash_path(p):
     否则 source 静默失败、函数全部没定义（测试表现为"函数返回空"）。
     Git Bash 看得见 Windows 路径，所以先问 bash 自己是哪一种。
     """
+    global _BASH_IS_WSL
     if os.name != 'nt':
         return p
-    probe = subprocess.run(['bash', '-c', 'test -d /mnt && echo wsl || echo native'],
-                           capture_output=True, text=True)
-    if 'wsl' not in probe.stdout:
+    if _BASH_IS_WSL is None:
+        probe = subprocess.run(['bash', '-c', 'test -d /mnt && echo wsl || echo native'],
+                               capture_output=True, text=True)
+        _BASH_IS_WSL = 'wsl' in probe.stdout
+    if not _BASH_IS_WSL:
         return p
     d = os.path.abspath(p).replace('\\', '/')
     if len(d) > 2 and d[1] == ':':
@@ -193,18 +199,23 @@ class TestTrackParams(unittest.TestCase):
                'geo-codec-bc', 'geo-codec-bc-sr']
         b = bash_derive('track_params', ids)
         for i in ids:
-            self.assertEqual(b.get(i), self.PARAMS, '分片口径不对: %s' % i)
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], self.PARAMS, '分片口径不对: %s' % i)
 
-    def test_canonical_matches_legacy_alias(self):
-        """canonical 名与 legacy 别名必须给出完全相同的口径。"""
-        pairs = [('geo-codec-def', 'gdef'),
-                 ('geo-codec-zstd-sr', 'gzstd'),
-                 ('geo-codec-bc', 'gbc')]
-        ids = [x for p in pairs for x in p]
+    def test_all_codec_names_share_one_params(self):
+        """6 个 canonical 变体 + 6 个 legacy 别名，分片口径必须完全一致。
+
+        这里断言的是**具体值**，不是"canonical 与 legacy 相等" —— 只比相等的话，
+        两边同时为空（函数根本没跑起来）也会通过，等于没测。
+        """
+        ids = ['gdef', 'gzstd', 'gbc', 'gdefsr', 'gzstdns', 'gbcsr',
+               'geo-codec-def', 'geo-codec-def-sr',
+               'geo-codec-zstd', 'geo-codec-zstd-sr',
+               'geo-codec-bc', 'geo-codec-bc-sr']
         b = bash_derive('track_params', ids)
-        for canon, legacy in pairs:
-            self.assertEqual(b.get(canon), b.get(legacy),
-                             'canonical 与 legacy 口径不一致: %s vs %s' % (canon, legacy))
+        for i in ids:
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], self.PARAMS, '分片口径不对: %s' % i)
 
     def test_baked_tracks_get_nothing(self):
         """分片已烘进 index.json 的赛道不传 track-params。"""
@@ -212,7 +223,8 @@ class TestTrackParams(unittest.TestCase):
                'hnsw-codec-zstd', 'hnsw-codec-def']
         b = bash_derive('track_params', ids)
         for i in ids:
-            self.assertEqual(b.get(i, ''), '', '不该传分片参数: %s' % i)
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], '', '不该传分片参数: %s' % i)
 
     def test_shards_knob_is_honored(self):
         """SHARDS / REPLICAS 旋钮要真的生效（不能写死）。"""
