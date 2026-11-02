@@ -39,6 +39,11 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 source ./vm-bench-lib.sh
+# 版本错配守卫：lib 与 runner 必须成对同步。缺 track_params 时分片口径会静默变空
+# → 索引落到赛道模板的默认分片数（geonames 模板默认 5），与其余赛道的 3 不一致，
+# 而且不会报错 —— 在这里挡住，别等到数字不可比才发现。
+declare -F track_params >/dev/null 2>&1 \
+  || die "vm-bench-lib.sh 版本过旧（缺 track_params）：请把整个仓库同步到压测机（scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/）"
 
 WHAT="${1:?用法: $0 <geo|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr|hnsw|hv1024|nested|codec|both|all|list> [rounds] [配置文件]}"
 [ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
@@ -864,8 +869,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local rlog="$CAMP_DIR/logs/$fid-wq.log"
   local HOSTS; HOSTS=$(target_hosts)
   local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
-  local tp=""
-  case "$tk" in geo|nested|gdef|gdefsr|gzstdns|gzstd|gbc|gbcsr) tp="number_of_shards:$SHARDS,number_of_replicas:$REPLICAS";; esac
+  local tp; tp=$(track_params "$tk")
   local t0=$(date +%s)
 
   PROGSTEP "===== [$seq] $fid 开始 ====="

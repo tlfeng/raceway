@@ -384,6 +384,7 @@ hnsw-codec-zstd    ds-j1024-codec-bc-sr   …（任意基础赛道都能这么�
 几个实现细节：
 
 - 基础赛道 `$TRACK_GEO` 一点没改。`prepare-codec-track.sh` 只复制一份副本，在副本的 settings 里加一行，幂等。
+- **分片数不烘在变体里，靠 track-params 传**。geonames 的 `index.json` 是 Jinja 模板，分片位置写的是 `{{number_of_shards | default(5)}}` —— 不传就会落到模板默认的 **5 分片**。runner 按**基座赛道**统一传 `SHARDS`/`REPLICAS`（默认 3/0），所以 canonical 变体名（`geo-codec-*`）和 legacy 别名（`gdef`/`gzstd`/`gbc`）拿到的是同一份口径。变体目录里看不到分片设置，不代表分片数就是模板默认值。
 - 历史短名 `gdef` / `gzstd` / `gbc` 保留为别名（`gzstd` 实际是 `geo-codec-zstd-sr`）。不改名是为了让旧跑分的场次名（`…-gzstd-r1`）语义不漂移。
 - 可证明性：sidecar 每场抓一次 `GET /<索引>/_settings?flat_settings=true` 的实测值 —— 烘进赛道不等于集群里真是这个值。
 - 汇总用 `codec-compare.py <跑分目录> [--detail]`，出写入两口径、赛末体积、逐操作查询三张表。
