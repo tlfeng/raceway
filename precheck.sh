@@ -24,11 +24,11 @@ QUIET_FOREIGN_CPU=${QUIET_FOREIGN_CPU:-${VERDICT_FOREIGN_MAX:-5}}
 #   ^ 外来进程 CPU %：同上，继承 VERDICT_FOREIGN_MAX
 QUIET_FREE_GB=${QUIET_FREE_GB:-20}         # 磁盘可用 GB
 
-# 宿主旁路负载：指标库(9237) / 协议适配层(9202)
+# 宿主旁路负载：指标库(9237) / 协议适配层(9202) / Kibana(5601)
 #
-# 这两个服务跑在**压测机**上，而压测机就是这三台虚机的 hypervisor ——
+# 这三个服务跑在**压测机**上，而压测机就是这三台虚机的 hypervisor ——
 # 它们和被测引擎抢同一批物理 CPU，还会在压测期间做 ES 后台活动
-# （refresh / segment merge）。
+# （refresh / segment merge）、Kibana 定时轮询、看板渲染。
 # 压测窗口里跑这些，测出来的数字就带着"旁路负载"的味道：
 # 不是引擎慢，是宿主被占了。实测一次全量导出（nice 19、单线程）就落在
 # 某场写赛窗口内 —— steal 恰好还是 0.00%，但"steal=0"不等于"环境干净"，
@@ -36,7 +36,7 @@ QUIET_FREE_GB=${QUIET_FREE_GB:-20}         # 磁盘可用 GB
 #
 # 只查"这几个端口有没有人在听"，不查进程名（避免误伤别人的同端口服务）。
 # 逃生阀：HOST_QUIET_PORTS="" 可关掉这条检查（vm-bench.env 里设）。
-HOST_QUIET_PORTS=${HOST_QUIET_PORTS:-"9202 9237"}
+HOST_QUIET_PORTS=${HOST_QUIET_PORTS:-"9202 9237 5601"}
 
 # 另查指标库的**开机自启**状态：端口查不到 ≠ 窗口期不会被拉回来。
 # 压测机 = 虚机 hypervisor，窗口期内一旦重启，enabled 的指标库会被 systemd
@@ -88,10 +88,11 @@ quiet_check() {
   # 宿主侧：旁路服务检查（压测机 = 虚机的 hypervisor，旁路负载会污染测量）
   local busy; busy=$(host_busy_ports)
   if [ -n "$busy" ]; then
-    log "FAIL 压测机: 端口${busy} 有服务在听（指标库 9237 / 适配层 9202）"
+    log "FAIL 压测机: 端口${busy} 有服务在听（指标库 9237 / 适配层 9202 / Kibana 5601）"
     log "      它们与被测引擎抢 hypervisor 的 CPU，压测期间必须停着"
     log "      停法: systemctl stop easysearch-metric-store.service"
     log "            systemctl disable easysearch-metric-store.service   # 关开机自启"
+    log "            bash /testing/raceway/kibana/deploy-kibana.sh stop"
     fail=1
   fi
   # 自启状态卡点：端口查不到 ≠ 窗口期不会被拉回来。
