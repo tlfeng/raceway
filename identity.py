@@ -72,7 +72,10 @@ CAR_FALLBACK = {
     "kona25": {"engine": "easysearch", "version": "2.5.0", "jdk": "kona25"},
 }
 
-BUILD_UNKNOWN = "—"     # 无 build 号的配置（ez250 发行包 / ES 8.19）用占位符，段数保持一致
+BUILD_UNKNOWN = "—"     # 该产品**没有** build 概念（ES 8.19.23）—— "不适用"，不是"不知道"
+# 有 build 概念但查不到时按车代号隔开（unk-<车>），与 JDK 位的策略一致：
+# 写 "—" 会把所有未知 build 的车挤进同一条线 —— 实测 15 场 build=3008 的 ez250
+# 被写成 ez@2.5.0@—@graalvm25，和别的 build 混成一条曲线。
 #
 # build 号只认**源头**：sidecar 的包名 / version_from_pkg、部署日志
 # （ibs-deploy-<车>.log 的 "Deploying Easysearch 2.5.0-3015"）、revision 指纹。
@@ -207,7 +210,14 @@ def series_key_of(engine, version, build_no, jdk_vendor=None, jdk_major=None, ca
     """
     short = ENGINE_SHORT.get(engine or "", engine or "")
     ver = str(version) if version not in (None, "") else "?"
-    build = str(build_no) if build_no not in (None, "") else BUILD_UNKNOWN
+    if build_no not in (None, ""):
+        build = str(build_no)
+    elif engine == "elasticsearch":
+        build = BUILD_UNKNOWN          # ES 版本号本身没有 build 段 —— 不适用
+    elif car:
+        build = "unk-%s" % car         # 有 build 概念但查不到 → 按车隔开，不挤成一条线
+    else:
+        build = BUILD_UNKNOWN
     jdk = jdk_short_of(jdk_vendor, jdk_major) or ("unk-%s" % car if car else "?")
     return "@".join([short or "?", ver, build, jdk])
 

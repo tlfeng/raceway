@@ -20,6 +20,7 @@ error_rate 例外：rally 的 op_metrics.error_rate 本就是 0~1 的比例（�
 """
 import argparse
 import datetime
+import collections
 import glob
 import hashlib
 import json
@@ -83,6 +84,18 @@ CANON_STATS = ("value", "mean", "p50", "p90", "p99", "p999", "p9999", "p100", "m
 CANON_UNITS = ("s", "ms", "ops/s", "docs/s", "pages/s", "MB/s", "GB", "MB", "bytes",
                "count", "ratio", "percent", "text", "")
 CANON_QUALITY = ("ok", "degraded", "unknown")
+# challenge 是**源值**封闭词表（runner 的 case "$ph" in w) write-only;; q) query-only;; *) full;;），
+# 合并成一行时是多值数组 —— 值仍然是源值，不新增词表。
+CANON_CHALLENGE = ("write-only", "query-only", "index-only", "full", "nested-search-challenge")
+# codec 归一后的封闭词表
+CANON_CODEC = ("default", "zstd", "best_compression")
+# 规范赛道名封闭词表（12 个）。归一后命中不了登记表的场次**不写库**：
+# 归一不出来说明这一场的赛道身份不可信（实测：fid 形态脏、user_tags.track 是解析器
+# 写坏的字面量），留着它只会把看板的分线带偏 —— 挡住比带偏强。
+CANON_TRACK = ("geo", "hnsw", "nested", "hv1024",
+               "hvtp200k-2s", "hvtp200k-3s",
+               "ds-j512", "ds-j768", "ds-j1024", "ds-j2048",
+               "ds-g960", "ds-g1920")
 CANON_LATENCY_MODE = ("open_loop", "closed_loop", "unknown")
 # ---------------------------------------------------------------------------
 # benchmark-result-metric 的字段白名单（方案 §1 修订「物化只给看板真正查得到的字段」+ §3.3）
@@ -107,15 +120,22 @@ METRIC_FIELDS = frozenset((
     "_index", "_id",
     "race_id", "@timestamp", "task", "operation", "family", "metric", "stat",
     "value", "unit", "value_original", "unit_original", "value_text", "direction",
-    "quality", "latency_mode", "backlog_ratio",
-    "track", "series_key", "valid", "campaign",
+    # trusted：行级布尔「这一行的数字能不能用」。v1 的 quality(ok/degraded/unknown)
+    # 与 valid(true/false/null) 一起退役：场次级闸门（非 VALID / host-noise）移到
+    # 导出期 —— 不该入库的场次根本不写库，库里只剩行级可信度一个标记。
+    "trusted", "latency_mode", "backlog_ratio",
+    "track", "series_key", "campaign",
     # run_start：批次锚点（该批次最早一场 race 的时刻）。同一批次的所有行共享同一个值，
     # 按它分桶恒为一个桶 —— 批次跨 UTC 午夜时按 @timestamp 分桶会把一次实验切成两段。
     "run_start",
-    "fid", "node",
-    # phase 只出现在 monitor 采样行上：那一行采自赛程的哪个相位（w/m/q），
-    # 它不是场次维度的重复（场次相位回 benchmark-result-race 查）
-    "phase",
+    # codec / source_reuse 是**处理变量**（这次怎么跑），不是身份。它们必须进 metric：
+    # 看板按 series_key 分组，ES 不能 join，不带这两个字段就没法在指标行上排除
+    # 存储变体（DESIGN §2.6）。
+    "codec", "source_reuse",
+    # phase：这行来自赛内哪个阶段（w/m/q）。它是源派生值（从 challenge 按固定表映射），
+    # 词表一个字不改 —— 合并后同一场里有写段与查段两批行，靠它分开。
+    # node：monitor 采样行专用（哪个虚机节点采的）。
+    "phase", "node",
 ))
 METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
                              "direction", "track", "series_key"))
@@ -142,32 +162,36 @@ METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
 # sidecar 源层仍保留原始值，需要时可从 pkg 重推。
 RACE_FIELDS = frozenset((
     "_index", "_id",
-    # 主键与时间
-    "race_id", "@timestamp", "run_start", "campaign", "fid",
+    # 主键与时间。race_id 现在是**一次测量**的确定性标识（不再是 uuid）：
+    # {campaign}|{车}-{赛道}-r{轮}|a{attempt}。可重算 → 重跑同一批次 upsert 覆盖，
+    # 不像 uuid 那样每次导出都堆一批新行。
+    "race_id", "@timestamp", "run_start", "campaign", "attempt",
     # 身份正交六列（唯一事实源在本索引；benchmark-result-metric 只带 series_key）
     "engine", "version", "engine_build", "jdk_vendor", "jdk_version", "series_key",
-    # JDK 声明与实测证据（比较以实测列为准；want≠measured 用 jdk_match_want 标记）
-    "jdk_want", "jdk_measured", "jdk_match_want",
+    "car_code",
+    # 声明（JDK 想要什么）+ 配置身份（这台车配了什么）+ 实测校验（跑的时候实际是什么）
+    # 声明/配置层是**可比性**的依据（覆盖 99%，来自编排）；实测层只用来查漂移
+    # （实测覆盖 40%，缺实测的场次不因此被判不可信）。
+    "jdk_want_major", "jdk_want_vendor",
+    "heap_mb", "heap_measured_mb", "cores", "cores_measured",
     # 包指纹
-    "pkg", "pkg_sha256", "pkg_inventory",
-    # run 维度
-    "track", "track_raw", "challenge", "phase", "round", "dims", "lineage",
-    "segment_form", "codec", "source_reuse", "knn_params", "env_id",
-    "nnodes", "cores_tag", "heap_tag", "heap_declared", "cores_declared",
-    # 实测资源
-    "heap_gb", "heap_max_measured_mb", "available_processors_measured",
-    "index_writer_memory_measured_mb", "version_map_memory_measured_mb",
-    "fixed_bit_set_memory_measured_mb",
+    "pkg", "pkg_sha256",
+    # run 维度。challenge 是**多值**：一次测量可以由多个 challenge 段组成
+    # （老协议写赛+查赛分开跑 → ["write-only","query-only"]；新协议一次跑完 → ["full"]）。
+    # 值全是源值，不新增词表。
+    "track", "challenge", "round", "dims", "lineage",
+    "codec", "source_reuse", "env_id", "nnodes",
     "clients", "bulk_size", "shards", "replicas",
-    # 语料与环境
-    "corpus", "pipeline", "rally_version", "rally_car", "environment", "cluster",
-    "user_tags", "track_params",
-    # 赛末/全场派生便利列（看板聚合一律走 benchmark-result-metric）
-    "store_size_gb_post_merge", "segments_post_merge",
-    "write_task_duration_s", "throughput_docs_per_s_whole",
-    # 可信度闸门与溯源
-    "status", "valid", "quality", "degraded_tasks", "caliber_warnings",
-    "source", "fingerprint",
+    # 向量参数（从 flattened 拆成标量）
+    "knn_index_type", "knn_element_type", "knn_m", "knn_ef_construction",
+    "knn_num_candidates",
+    # 语料与环境（从 flattened 拆成标量）
+    "corpus_docs", "corpus_name", "cluster_revision", "cluster_flavor",
+    "rally_version",
+    # 赛末快照（forcemerge 之后）+ 溯源
+    "store_size_gb_post_merge", "segments_post_merge", "source",
+    # 可信度：场次级汇总（任一行 false 则 false）。判断单行看 metric 上的 trusted。
+    "trusted",
 ))
 RACE_REQUIRED = frozenset(("race_id", "@timestamp", "campaign", "track", "series_key"))
 ENV_FIELDS = frozenset((
@@ -519,6 +543,8 @@ def load_campaign_meta(camp_dir):
     # 写成 CONTAMINATED 会让 valid=false，看板闸门 valid:true 会把这一场整个滤掉
     # （ds-j2048 只有 jdk25 车有数据，一滤就空面板）。状态保持 VALID，
     # 污染事实走这个清单 + 文档 caliber_warnings 双通道留痕。
+    # 臂级 build 表（PROGRESS.txt / SUMMARY.md 的臂头行）——与有没有 CONTAMINATED.txt 无关
+    m["arm_builds"] = load_arm_builds(camp_dir)
     cf = os.path.join(camp_dir, "CONTAMINATED.txt")
     if os.path.isfile(cf):
         m["contaminated"] = [x.strip() for x in open(cf, encoding="utf-8", errors="replace")
@@ -747,7 +773,10 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
         if counters is not None:
             counters["latency_mode_" + lsrc] = counters.get("latency_mode_" + lsrc, 0) + 1
         row_common = dict(common)
-        row_common["quality"] = q
+        # 行级 trusted：这一行的数字能不能用。degraded = 该 task 的 error_rate 超阈值
+        # （写阶段 >1%、查询侧 >0），它吐出的时延量的是"失败响应有多快"，
+        # 混进延迟曲线会把引擎显得比实际更快 → 这一行不可信。
+        row_common["trusted"] = (q != "degraded")
         row_common["latency_mode"] = mode
         if backlog is not None:
             row_common["backlog_ratio"] = backlog
@@ -770,7 +799,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
                     n += 1
                 seen_stat[stat] = True
                 nv, nu = norm_value(v, unit)
-                _push({"_index": "benchmark-result-metric", "_id": "%s|%s|%s|%s" % (run_id, task, family, stat),
+                _push({"_index": "benchmark-result-metric", "_id": "%s|%s|%s|%s|%s" % (run_id, row_common.get("phase"), task, family, stat),
                             "@timestamp": ts, "task": task, "operation": om.get("operation"),
                             "family": family, "metric": family, "stat": stat,
                             "value": nv, "unit": nu, "value_original": v, "unit_original": unit,
@@ -798,7 +827,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
                     n += 1
                 qseen[stat] = True
                 nv, nu = norm_value(diff, lat_u)
-                _push({"_index": "benchmark-result-metric", "_id": "%s|%s|queue_time|%s" % (run_id, task, stat),
+                _push({"_index": "benchmark-result-metric", "_id": "%s|%s|%s|queue_time|%s" % (run_id, row_common.get("phase"), task, stat),
                             "@timestamp": ts, "task": task, "operation": om.get("operation"),
                             "family": "queue_time", "metric": "queue_time", "stat": stat,
                             "value": nv, "unit": nu, "value_original": diff, "unit_original": lat_u,
@@ -813,7 +842,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
             # duration: rally 给毫秒，归一到秒。
             raw_unit = "ratio" if key == "error_rate" else "ms"
             nv, nu = norm_value(v, raw_unit)
-            _push({"_index": "benchmark-result-metric", "_id": "%s|%s|%s|value" % (run_id, task, fam),
+            _push({"_index": "benchmark-result-metric", "_id": "%s|%s|%s|%s|value" % (run_id, row_common.get("phase"), task, fam),
                         "@timestamp": ts, "task": task, "operation": om.get("operation"),
                         "family": fam, "metric": key, "stat": "value", "value": nv, "unit": nu,
                         "value_original": v, "unit_original": raw_unit,
@@ -831,7 +860,7 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
         else:
             stat = "value"
         nv, nu = norm_value(v, unit)
-        _push({"_index": "benchmark-result-metric", "_id": "%s||%s|%s" % (run_id, fam + "_" + key, stat),
+        _push({"_index": "benchmark-result-metric", "_id": "%s|%s||%s|%s" % (run_id, common.get("phase"), fam + "_" + key, stat),
                     "@timestamp": ts, "task": None, "operation": None,
                     "family": fam, "metric": key, "stat": stat, "value": nv, "unit": nu,
                     "value_original": v, "unit_original": unit,
@@ -887,9 +916,12 @@ def validate_payload(runs, metrics, envs=()):
         if u not in CANON_UNITS:
             problems.append("unit 越界（不在词表内）: %r  %s" % (u, i))
         unit_count[u] = unit_count.get(u, 0) + 1
-        qv = m.get("quality")
-        if qv is not None and qv not in CANON_QUALITY:
-            problems.append("quality 越界（不在词表内）: %r  %s" % (qv, i))
+        tv = m.get("trusted")
+        if tv is not None and not isinstance(tv, bool):
+            problems.append("trusted 必须是裸布尔（不是字符串/数字）: %r  %s" % (tv, i))
+        cv = m.get("codec")
+        if cv is not None and cv not in CANON_CODEC:
+            problems.append("codec 越界（不在词表内）: %r  %s" % (cv, i))
         lm = m.get("latency_mode")
         if lm is not None and lm not in CANON_LATENCY_MODE:
             problems.append("latency_mode 越界（不在词表内）: %r  %s" % (lm, i))
@@ -931,18 +963,18 @@ def validate_payload(runs, metrics, envs=()):
             problems.append("%s 行出现白名单外字段: %s × %d 行" % (name, k, v))
         for k, v in sorted(r_miss.items()):
             problems.append("%s 行缺必填字段 %s: %d 行" % (name, k, v))
-    # 同一 (场次, task) 的所有行 quality 必须一致
+    # 同一 (场次, task) 的所有行 trusted 必须一致
     # 注意必须用复合键：task 名在不同场次之间会重名（index-append 每个场次都有），
-    # 只按 task 分组会把不同场次的质量标记混在一起比。
+    # 只按 task 分组会把不同场次的可信度标记混在一起比。
     tq = {}
     for m in metrics:
         t = m.get("task")
         if not t:
             continue
         k = (m.get("race_id"), t)
-        q = m.get("quality")
+        q = m.get("trusted")
         if k in tq and tq[k] != q:
-            problems.append("同一 (场次, task) 的行 quality 不一致: %s/%s (%s vs %s)"
+            problems.append("同一 (场次, task) 的行 trusted 不一致: %s/%s (%s vs %s)"
                             % (k[0], t, tq[k], q))
         tq.setdefault(k, q)
     # error_rate **超阈值**的 task 整块必须 degraded
@@ -951,8 +983,8 @@ def validate_payload(runs, metrics, envs=()):
         if m.get("family") == "error_rate" and (m.get("value") or 0) > 0:
             k = (m.get("race_id"), m.get("task"))
             thr = WRITE_DEGRADED_ERROR_RATE if is_write_task(m.get("task")) else 0.0
-            if (m.get("value") or 0) > thr and tq.get(k) != "degraded":
-                problems.append("error_rate 超阈值的 (场次, task) 未标 degraded: %s/%s" % k)
+            if (m.get("value") or 0) > thr and tq.get(k) is not False:
+                problems.append("error_rate 超阈值的 (场次, task) 未标不可信: %s/%s" % k)
     # closed_loop 的 task 不应出现积压（口径与实测矛盾）
     for m in metrics:
         if m.get("family") == "latency" and m.get("latency_mode") == "closed_loop":
@@ -960,14 +992,22 @@ def validate_payload(runs, metrics, envs=()):
             if br is not None and br > 0.01:
                 problems.append("closed_loop 任务出现积压（口径矛盾）: %s br=%.3f"
                                 % (m.get("task"), br))
-    # 场次级：quality 必须是各 task 的最差
+    # 场次级：trusted 必须是各 task 的最差（任一 task 不可信 → 整场不可信）
+    race_worst = {}
+    for (rid, _t), tv in tq.items():
+        race_worst[rid] = race_worst.get(rid, True) and (tv is not False)
     for r in runs:
-        dt = r.get("degraded_tasks") or []
-        q = r.get("quality")
-        if dt and q != "degraded":
-            problems.append("场次有 degraded task 但 quality 不是 degraded: %s" % r.get("race_id"))
-        if not dt and q == "degraded":
-            problems.append("场次标 degraded 但没有 degraded task: %s" % r.get("race_id"))
+        rid = r.get("race_id")
+        worst = race_worst.get(rid)
+        if worst is None:
+            continue
+        if r.get("trusted") is True and not worst:
+            problems.append("场次标可信但有 task 不可信: %s" % rid)
+    # challenge 是源值封闭词表（老协议写赛+查赛合并成一行时是多值）
+    for r in runs:
+        for cv in (r.get("challenge") or []):
+            if cv not in CANON_CHALLENGE:
+                problems.append("challenge 越界（不在源值词表内）: %r  %s" % (cv, r.get("race_id")))
     # 覆盖率（非致命）
     n = len(runs) or 1
     def cov(fn):
@@ -975,19 +1015,167 @@ def validate_payload(runs, metrics, envs=()):
     cover = {
         "env_id": cov(lambda r: bool(r.get("env_id"))),
         "dims": cov(lambda r: r.get("dims") is not None),
-        "segment_form": cov(lambda r: bool(r.get("segment_form"))),
         "codec": cov(lambda r: bool(r.get("codec"))),
         "source_reuse": cov(lambda r: r.get("source_reuse") is not None),
-        "sidecar": cov(lambda r: not any(str(w).startswith("no-sidecar")
-                                         for w in (r.get("caliber_warnings") or []))),
-        "quality_ok": cov(lambda r: r.get("quality") == "ok"),
-        "degraded_races": sum(1 for r in runs if r.get("quality") == "degraded"),
+        # 配置身份层 vs 实测校验层的覆盖率 —— 两者的差就是"没采到 sidecar"的场次
+        "heap_mb": cov(lambda r: r.get("heap_mb") is not None),
+        "heap_measured_mb": cov(lambda r: r.get("heap_measured_mb") is not None),
+        "cores": cov(lambda r: r.get("cores") is not None),
+        "cores_measured": cov(lambda r: r.get("cores_measured") is not None),
+        "trusted_true": sum(1 for r in runs if r.get("trusted") is True),
+        "trusted_false": sum(1 for r in runs if r.get("trusted") is False),
+        "attempt_gt1": sum(1 for r in runs if (r.get("attempt") or 1) > 1),
+        "multi_segment": sum(1 for r in runs if isinstance(r.get("challenge"), list) and len(r["challenge"]) > 1),
     }
     for k, v in cover.items():
         if k != "degraded_races" and v < 50.0:
             warnings.append("字段覆盖率偏低: %s = %.1f%%（过滤条件用该字段会漏掉大半场次）" % (k, v))
     return problems, warnings, {"fields": cover, "stat_histogram": stat_count,
                                 "unit_histogram": unit_count, "stat_aliases": aliases}
+
+
+# ---------------------------------------------------------------------------
+# 场次身份：真 fid 与重试号的恢复
+# ---------------------------------------------------------------------------
+# race.json 里**没有 fid** —— 它是导出器用 user-tags 的「车/赛道/轮次」拼出来的，
+# 拼的时候会丢掉重试号（-tryN）。真 fid 只存在于两个地方：
+#   ① campaign 的 results/<fid>[-tryN]-<phase>-race.json 的**文件名**
+#   ② sidecar 的 run.fid
+# ① 覆盖更广：文件名里有 race-id，能与 rally store 里的 uuid 目录对上；
+# ② 只有 40% 的场次有 sidecar。
+# 实测：含 -tryN 的 4 场全部能从 ① 精确还原；其余 135 场（早期批次）本来就没有重试，
+# 拼出来的 fid 就是对的 —— 所以恢复是 100% 正确的，不靠猜。
+_FID_FILE_RE = re.compile(r"^(.*)-(w|q|m|wq)-race\.json$")
+_TRY_RE = re.compile(r"-try(\d+)$")
+
+
+def load_race_id_index(campaigns_dir):
+    """race-id → (真 fid, phase)：从 campaign 的 results/ 文件名取。
+
+    文件名是「真 fid」的唯一载体：race.json 内部没有 fid，sidecar 只覆盖 40% 的场次。
+    """
+    idx = {}
+    for p in glob.glob(os.path.join(campaigns_dir, "*", "results", "*-race.json")):
+        m = _FID_FILE_RE.match(os.path.basename(p))
+        if not m:
+            continue
+        try:
+            d = json.load(open(p, encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        rid = d.get("race-id")
+        if rid:
+            idx[rid] = (m.group(1), m.group(2))
+    return idx
+
+
+def track_from_fid(fid):
+    """真 fid（{车}-{赛道}-r{轮}[-tryN]）→ 赛道名。
+
+    fid 的赛道段是**唯一可靠**的来源：user_tags.track 在早期批次里被解析器写成了
+    键名（字面量 "track"，实测 923 场），而 fid 是编排时定的。
+    赛道名本身含 '-'（ds-g1920 / hvtp200k-3s），所以用贪婪匹配。
+    """
+    if not fid:
+        return None
+    base = _TRY_RE.sub("", fid)
+    m = re.match(r"^[^\-]+-(.+)-r\w+$", base)
+    return m.group(1) if m else None
+
+
+# 臂头行里的「臂 → (版本, build)」：PROGRESS.txt 的
+# "=== 臂 ez250 (2.5.0-3008) 开始 ===" 与 SUMMARY.md 的 "## ez250 (2.5.0-3008)"。
+# 臂名就是车代号 —— 这是 sidecar 之外的第二条 build 证据链。
+_ARM_BUILD_RE = re.compile(r"===\s+臂\s+(\S+)\s*\((\d[\d.]*)-(\d+)\)")
+_SUMMARY_ARM_RE = re.compile(r"^##\s+(\S+)\s*\((\d[\d.]*)-(\d+)\)", re.M)
+
+
+def load_arm_builds(camp_dir):
+    """批次级的「臂 → build」表。
+
+    esrm-20261014-003226 那批没有 sidecar，臂头行里却写着 ez250 (2.5.0-3008) ——
+    之前导出器只能把它写成 "—"，15 场挤进同一条线。臂头行是**批次级**证据：
+    同一批次里这个臂用的就是这个 build。
+    """
+    out = {}
+    for name, rx in (("PROGRESS.txt", _ARM_BUILD_RE), ("SUMMARY.md", _SUMMARY_ARM_RE)):
+        p = os.path.join(camp_dir, name)
+        if not os.path.exists(p):
+            continue
+        try:
+            txt = open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for m in rx.finditer(txt):
+            out.setdefault(m.group(1), m.group(3))
+    return out
+
+
+def arm_build_of(arms, car):
+    """按车代号取臂级 build；车代号可能带后缀（jdk25-3009），臂名是它的前缀。"""
+    if not arms or not car:
+        return None
+    if car in arms:
+        return arms[car]
+    cands = [a for a in arms if car.startswith(a + "-")]
+    if len(cands) == 1:
+        return arms[cands[0]]
+    return None
+
+
+def canon_track(raw):
+    """原始赛道名 → 规范赛道名：历史短名（gdef/gzstd/gbc）→ 规范变体名
+    （geo-codec-*）→ 基础赛道名（geo）。"""
+    if not raw:
+        return None
+    return H.base_of(H.canonical_id(str(raw)))
+
+
+def attempt_of(fid):
+    """重试号：fid 尾部的 -tryN → N；没有后缀 → 1。"""
+    m = _TRY_RE.search(fid or "")
+    return int(m.group(1)) if m else 1
+
+
+def heap_mb_of(tag):
+    """编排标签的堆（"16g"）→ MB 整数；不是这个形态就返回 None。"""
+    if not tag:
+        return None
+    m = re.match(r"^(\d+)([gGmM])$", str(tag).strip())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * 1024 if m.group(2).lower() == "g" else n
+
+
+def measured_int(values):
+    """逐节点实测值 → 单值。节点之间不一致直接判 None（不是"取第一个"）。
+
+    同一台车的三个节点跑出不同的堆/核数属于部署异常 —— 静默取一个等于把异常洗掉。
+    契约要求这种情况判失败（DESIGN §2.5.2），这里返回 None 让上层记为"不可比"。
+    """
+    vals = {int(v) for v in (values or []) if v is not None}
+    if len(vals) != 1:
+        return None
+    return vals.pop()
+
+
+def codec_norm(c):
+    """压缩方式归一：大小写不统一（实测混着 ZSTD 与 default）→ 词表封闭的小写值。"""
+    if not c:
+        return None
+    c = str(c).strip().lower()
+    return {"zstd": "zstd", "best_compression": "best_compression",
+            "best compression": "best_compression", "default": "default"}.get(c, c)
+
+
+def sr_bool(v):
+    """source_reuse → 裸布尔（契约要求布尔，不是字符串 "true"）。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() == "true"
 
 
 def main():
@@ -1016,6 +1204,13 @@ def main():
     _recall_fids = sorted({f for (_c, f) in recall_idx})
 
     envs, runs, metrics = {}, [], []
+    # segments：一次测量的**每一段**（老协议一次测量跑写赛+查赛两段）。
+    # 段级先攒着，循环结束后按 (批次, 真fid, 重试号) 合并成一行 race。
+    segments = []
+    # dropped：被写入侧闸门剔掉的场次清单（manifest 可审计）
+    dropped = []
+    # race-id → (真 fid, phase)：真 fid 只存在于 campaign 的 results/ 文件名里
+    rid2fid = load_race_id_index(args.campaigns)
     counters = {}          # 导出期统计（口径来源分布等），进 manifest
     # (campaign, fid) → 场次回填材料（track/时间/valid/quality/series_key），
     # monitors 补的 system 行从这里取自己批次的值。
@@ -1063,14 +1258,31 @@ def main():
         ts = (datetime.datetime.strptime(ts, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ")
               if ts else None)
         side = meta.get("sidecar_by_race", {}).get(race_id) or meta.get("sidecar", {}).get(fid + "-" + phase, {})
-        # 重试场的 fid 带 -tryN（race.json 里没有轮试号）：以 sidecar 的 fid 为准回查 RACES.md，
+        # ---- 真 fid 与重试号的恢复（见 load_race_id_index 的说明）----
+        # 真 fid 只在 campaign 的 results/ 文件名与 sidecar.run.fid 里，race.json 自己没有。
+        # 优先用文件名（覆盖全量、含 -tryN），sidecar 作为第二路。
+        _rid_fid = rid2fid.get(race_id)
+        real_fid = (_rid_fid[0] if _rid_fid else None) \
+            or ((side.get("run") or {}).get("fid") if side else None)
+        attempt = attempt_of(real_fid or fid)
+        # status 按真 fid 回查 RACES.md：重试场的 fid 带 -tryN，
         # 否则 10-18 的 es819-gbc-r1-try3（VALID）会被套上 r1 首 attempt 的 QUERY-FAIL
-        real_fid = (side.get("run") or {}).get("fid") if side else None
         status = (meta.get("status", {}).get(real_fid) if real_fid else None) \
             or meta.get("status", {}).get(fid) or meta.get("status", {}).get(fid + "-try2") \
             or meta.get("status", {}).get(fid + "-try3")
         if real_fid:
-            fid = real_fid   # sidecar 的 fid 才是本场唯一身份（含变体名与 -tryN），比 car-track-rN 拼出来的准
+            fid = real_fid   # 真 fid 才是本场唯一身份（含变体名与 -tryN），比 car-track-rN 拼出来的准
+        # 赛道名有两条来源，**谁命中规范名登记表就用谁**：
+        #   ① 真 fid 的赛道段 —— user_tags.track 在早期批次里是解析器写坏的字面量
+        #      （"track"，实测 923 场），而 fid 是编排时定的，可靠；
+        #   ② rally 记的 track 字段 —— 有几场它的 fid 形态本身是脏的
+        #      （jdk25-3009-hvtp200k-3s-rNone，车代号段多带了 build 号），
+        #      但 track 字段是规范名。
+        # 两条都不命中 → 归一不出来，这场不写库（见写入侧闸门）。
+        _tr_fid = canon_track(track_from_fid(fid))
+        _tr_tag = canon_track(d.get("track"))
+        tr = (_tr_fid if _tr_fid in CANON_TRACK
+              else (_tr_tag if _tr_tag in CANON_TRACK else (_tr_fid or _tr_tag)))
         dur = None
         for om in ((d.get("results") or {}).get("op_metrics") or []):
             if om.get("task") == "index-append" and om.get("duration"):
@@ -1088,6 +1300,21 @@ def main():
             warn.append("no-sidecar：JDK/heap/clients/bulk 无实测值，仅有 user_tags 声明")
         if status is None:
             warn.append("no-RACES.md：valid 未知（campaign 目录不在或该场未记账）")
+
+        # ---- 写入侧闸门：不该入库的场次根本不写库（契约 §2.0）----
+        # 库里没有 valid / status，因为能查到的都是过了筛的：
+        #   ① 非 VALID（RACES.md 记 SKIP / QUERY-FAIL，或根本没记账）→ 整场不写
+        #   ② host-noise（CONTAMINATED.txt 人工登记：宿主旁路负载污染）→ 整场不写
+        # 场次级过滤放在写入侧，而不是"入库后再让每个面板记得加过滤"——
+        # 后者漏一个面板就混进脏数据（旧数据里那 733 行未记账场次就是这么留下的）。
+        # 被剔的场次在 manifest 的 dropped 段留清单，可审计。
+        _drop_reason = None
+        if status != "VALID":
+            _drop_reason = "not_valid"
+        elif fid in (meta.get("contaminated") or []):
+            _drop_reason = "host_noise"
+        elif tr not in CANON_TRACK:
+            _drop_reason = "track_unknown"
 
         # ---- 实测身份（方案 §3.2「引擎(实测)」+ §3.2「实验变量 typed promote」）----
         # 身份只认**本场/本车/本race 的源头证据**：sidecar 实测 > 部署日志 >
@@ -1145,6 +1372,11 @@ def main():
         if not build_no and deploy_eng:
             build_no = deploy_eng[2]
         if not build_no:
+            # 臂头行（PROGRESS.txt / SUMMARY.md）：批次级的「这个臂用的哪个 build」。
+            # 优先级在 user_tags.engine_ver 之前 —— 车标签是编排时贴的，
+            # 臂头行是那一批实际装的东西。
+            build_no = arm_build_of(meta.get("arm_builds"), car)
+        if not build_no:
             _uv = ut.get("engine_ver") or ""
             build_no = (_uv.rsplit("-", 1)[-1] if "-" in _uv else None) or None
         # ---- JDK 身份：实测优先，逐级降级（identity.py 口径）----
@@ -1200,93 +1432,102 @@ def main():
         # jdk_version/series_key）；benchmark-result-metric 只带 series_key（看板分线的唯一依赖）。
         # 车代号（car/arm/car_build/car_label）不再入库 —— 那是「车代号」的重复编码，
         # 车代号只留在 user_tags.car，身份靠上面六个正交字段表达。
-        common = {"race_id": race_id, "campaign": camp,
+        # ---- 段级标识：一次测量 = (批次 × 真fid × 重试号) ----
+        # seg_key 是导出期中间量；合并后映射到最终 race_id。
+        seg_key = "SEG|%s|%s|a%d" % (camp, fid, attempt)
+        # ---- common = 场次级 + 指标行共用的维度 ----
+        common = {"race_id": seg_key, "campaign": camp,
                   # run_start：批次锚点（该批次最早一场 race 的时刻）——
                   # 同一批次的所有行共享同一个值，按它分桶恒为一个桶，跨午夜批次不被切开。
                   "run_start": campaign_run_start.get(camp),
                   # series_key：看板分线键 + 图例文案（引擎@版本@build@JDK）
                   "series_key": series_key,
-                  # 实验变量：这一场测的是什么（向量维度 / codec / 段形态）
-                  "dims": dims, "lineage": lineage, "segment_form": segment_form,
-                  "codec": codec_of(d, side),
-                  "source_reuse": source_reuse_of(d, side),
-                  "quality": race_row_quality,
-                  "knn_params": knn_params_of(side),
+                  # 实验变量：这一场测的是什么（向量维度 / 语料血统）
+                  "dims": dims, "lineage": lineage,
+                  # 处理变量：归一后的压缩方式 + 裸布尔 source_reuse。
+                  # 两者都进 metric —— 面板按 series_key 分线，ES 不能 join，
+                  # 指标行不带它们就没法排除存储变体（DESIGN §2.6）。
+                  "codec": codec_norm(codec_of(d, side)),
+                  "source_reuse": sr_bool(source_reuse_of(d, side)),
+                  "trusted": not degraded_tasks,
                   # track 必须进 common：benchmark-result-metric 的指标行没有它就没法按赛道过滤，
                   # 而按赛道拆看板要求每个指标行都带归一化后的赛道名
-                  "track": tr, "track_raw": d.get("track"), "phase": phase, "round": rnd,
-                  "challenge": d.get("challenge"), "env_id": side.get("env", {}).get("env_id"),
-                  "valid": (status == "VALID") if status else None, "status": status}
-        # system 行回填材料按 (campaign, fid) 归档 —— 同批次内 fid ↔ race 一一对应
-        # （重试场的 fid 带 -tryN，仍是唯一身份）。
-        camp_fid[(camp, fid)] = {"track": tr, "ts": ts,
-                                 "valid": (status == "VALID") if status else None,
-                                 "quality": race_row_quality, "series_key": series_key}
-        runs.append({"_index": "benchmark-result-race", "_id": race_id, "race_id": race_id, "@timestamp": ts,
-                     "campaign": camp, "fid": fid,
-                     # run_start：批次锚点 —— 跨 UTC 午夜的批次按它归到一个桶
-                     "run_start": campaign_run_start.get(camp),
-                     # ---- 身份维度（正交，唯一事实源在本索引）----
-                     "engine": engine,
-                     "version": str(version) if version is not None else None,
-                     "engine_build": build_no,
-                     "jdk_vendor": jdk_vendor, "jdk_version": jdk_version,
-                     # series_key：看板分线键 + 图例文案（引擎@版本@build@JDK）
-                     "series_key": series_key,
-                     "heap_gb": heap_gb,
-                     "dims": dims, "lineage": lineage, "segment_form": segment_form,
-                     "track": tr, "track_raw": d.get("track"), "challenge": d.get("challenge"),
-                     "phase": phase, "round": rnd, "nnodes": ut.get("nnodes"),
-                     "cores_tag": ut.get("cores"), "heap_tag": ut.get("heap"),
-                     "pipeline": d.get("pipeline"), "rally_version": d.get("rally-version"),
-                     "environment": d.get("environment"), "user_tags": ut,
-                     "track_params": d.get("track-params"),
-                     # rally_car = Rally 自己的 car（客户端插件列表，如 ["external"]）——
-                     # 跟本项目的「车」（一套被测配置）不是一回事，单独存。
-                     "rally_car": d.get("car"),
-                     "cluster": d.get("cluster"),
-                     "pkg": pkg,
-                     # 该批次的默认包（PACKAGES.txt 清单）—— 只是"这批装了哪些包"，
-                     # 不等于本车跑的包（ez240 车在 jdk3-20261016-* 跑的是 2.4.0-2975，
-                     # 那批清单里写的却是默认包 2.5.0-3015）。
-                     "pkg_inventory": (meta.get("pkg_own") or {}).get(engine) or None,
-                     # 包 sha256 只认本场 sidecar 实测 —— 无实测就是 null，
-                     # 不从其他批次/场次借用（campaign 不是证据池）
-                     "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256"),
-                     "jdk_want": (side.get("jdk") or {}).get("want"),
-                     "jdk_measured": (side.get("jdk") or {}).get("measured_nodes"),
-                     "jdk_match_want": (side.get("jdk") or {}).get("match_want"),
-                     "heap_declared": (side.get("run_params") or {}).get("heap_declared"),
-                     "heap_max_measured_mb": (side.get("run_params") or {}).get("heap_max_measured_mb"),
-                     "cores_declared": (side.get("run_params") or {}).get("cores_declared"),
-                     "available_processors_measured": (side.get("run_params") or {}).get("available_processors_measured"),
-                     "index_writer_memory_measured_mb": (side.get("run_params") or {}).get("index_writer_memory_measured_mb"),
-                     "version_map_memory_measured_mb": (side.get("run_params") or {}).get("version_map_memory_measured_mb"),
-                     "fixed_bit_set_memory_measured_mb": (side.get("run_params") or {}).get("fixed_bit_set_memory_measured_mb"),
-                     "clients": (side.get("run_params") or {}).get("clients"),
-                     "bulk_size": (side.get("run_params") or {}).get("bulk_size"),
-                     "shards": (side.get("run_params") or {}).get("shards"),
-                     "replicas": (side.get("run_params") or {}).get("replicas"),
-                     "corpus": side.get("corpus") or ({"docs": DOCS.get(d.get("track"))} if DOCS.get(d.get("track")) else None),
-                     "env_id": (side.get("env") or {}).get("env_id"),
-                     "codec": codec_of(d, side),
-                     "source_reuse": source_reuse_of(d, side),
-                     # ---- 派生便利列（存储方案 §2.2 定稿口径）----
-                     # 赛末 forcemerge 后的快照：另一个时间点的测量，不是场次值，
-                     # 画时间序列会失真 —— 只用于报表读数，不做看板聚合。
-                     "store_size_gb_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("store_gb"),
-                     "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
-                     # 全场派生值（index-append 时长 / 语料量÷时长）：与 benchmark-result-metric 里
-                     # duration/throughput 家族同源。报表便利列 —— 看板聚合一律走 metric 索引，
-                     # 那里才有 stat 轴与 quality 闸门。
-                     "write_task_duration_s": dur, "throughput_docs_per_s_whole": rate_b,
-                     "status": status, "valid": (status == "VALID") if status else None,
-                     "quality": race_quality, "degraded_tasks": degraded_tasks,
-                     "knn_params": knn_params_of(side),
-                     "caliber_warnings": warn,
-                     "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
-                     "fingerprint": hashlib.sha1(("%s|%s|%s" % (race_id, status, d["_path"])).encode()).hexdigest()})
-        emit_metrics(d, race_id, ts, common, metrics, side=side, counters=counters)
+                  "track": tr, "phase": phase,
+                  "env_id": (side.get("env") or {}).get("env_id")}
+        # ---- 场次行（段级；同一测量的多段在循环后合并成一行）----
+        _knn = knn_params_of(side) or {}
+        _corpus = side.get("corpus") or ({"docs": DOCS.get(d.get("track"))} if DOCS.get(d.get("track")) else None) or {}
+        _cluster = d.get("cluster") or {}
+        _want = (side.get("jdk") or {}).get("want") or {}
+        # 配置身份层：编排声明优先（覆盖 99%），sidecar 的声明兜底（覆盖 40%）——
+        # 同一事实的两条来源路径，不是两列（"一个事实只占一列"）。
+        _cfg_heap = heap_mb_of(ut.get("heap")) or srp.get("heap_declared_mb")
+        _cfg_cores = ut.get("cores") or srp.get("cores_declared")
+        # 实测校验层：三节点不一致直接判 None（部署异常不能静默取第一个）。
+        _meas_heap = measured_int(srp.get("heap_max_measured_mb"))
+        _meas_cores = measured_int(srp.get("available_processors_measured"))
+        # 配置漂移：实测与配置对不上 → 这场的数据不可比（不另开列，并入 trusted）。
+        _drift = False
+        if _cfg_heap is not None and _meas_heap is not None and int(_cfg_heap) != int(_meas_heap):
+            _drift = True
+        if _cfg_cores is not None and _meas_cores is not None and int(_cfg_cores) != int(_meas_cores):
+            _drift = True
+        # 赛末体积：探针落的是 GiB，契约统一用 GB（×1.073741824）。
+        _pm = (meta.get("post_merge", {}).get(real_fid or fid) or {})
+        _pm_store_gb = (round(_pm["store_gb"] * 1.073741824, 4)
+                        if _pm.get("store_gb") is not None else None)
+        seg_row = {"_index": "benchmark-result-race", "_id": seg_key, "race_id": seg_key,
+                   "@timestamp": ts, "campaign": camp, "attempt": attempt,
+                   # run_start：批次锚点 —— 跨 UTC 午夜的批次按它归到一个桶
+                   "run_start": campaign_run_start.get(camp),
+                   # ---- 身份维度（正交，唯一事实源在本索引）----
+                   "engine": engine,
+                   "version": str(version) if version is not None else None,
+                   "engine_build": build_no,
+                   "jdk_vendor": jdk_vendor, "jdk_version": jdk_version,
+                   "series_key": series_key, "car_code": car,
+                   # ---- 声明 / 配置身份 / 实测校验 ----
+                   "jdk_want_major": _want.get("major"), "jdk_want_vendor": _want.get("vendor"),
+                   "heap_mb": int(_cfg_heap) if _cfg_heap is not None else None,
+                   "heap_measured_mb": _meas_heap,
+                   "cores": int(_cfg_cores) if _cfg_cores is not None else None,
+                   "cores_measured": _meas_cores,
+                   # ---- 包指纹（sha256 只认本场 sidecar 实测，不跨批次借）----
+                   "pkg": pkg, "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256"),
+                   # ---- run 维度 ----
+                   "track": tr, "challenge": d.get("challenge"), "round": rnd,
+                   "dims": dims, "lineage": lineage,
+                   "codec": common["codec"], "source_reuse": common["source_reuse"],
+                   "env_id": (side.get("env") or {}).get("env_id"),
+                   "nnodes": ut.get("nnodes"),
+                   "clients": srp.get("clients"), "bulk_size": srp.get("bulk_size"),
+                   "shards": srp.get("shards"), "replicas": srp.get("replicas"),
+                   # ---- 向量参数（flattened 拆出的标量）----
+                   "knn_index_type": _knn.get("index_type"),
+                   "knn_element_type": _knn.get("element_type"),
+                   "knn_m": _knn.get("m"), "knn_ef_construction": _knn.get("ef_construction"),
+                   "knn_num_candidates": _knn.get("num_candidates"),
+                   # ---- 语料与环境（flattened 拆出的标量）----
+                   "corpus_docs": _corpus.get("docs"), "corpus_name": _corpus.get("name"),
+                   "cluster_revision": _cluster.get("revision"),
+                   "cluster_flavor": _cluster.get("distribution-flavor"),
+                   "rally_version": d.get("rally-version"),
+                   # ---- 赛末快照 + 溯源 + 可信度 ----
+                   # 赛末 forcemerge 后的快照：另一个时间点的测量，不是场次值，
+                   # 画时间序列会失真 —— 只用于报表读数，不做看板聚合。
+                   # 单位换算：探针落的是 GiB，契约统一用 GB（×1.073741824）。
+                   "store_size_gb_post_merge": _pm_store_gb,
+                   "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
+                   "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
+                   "trusted": (not degraded_tasks) and (not _drift)}
+        if _drop_reason:
+            dropped.append({"reason": _drop_reason, "campaign": camp, "fid": fid,
+                            "attempt": attempt, "status": status,
+                            "track": tr, "timestamp": ts})
+        else:
+            segments.append({"key": (camp, fid, attempt), "seg_key": seg_key, "phase": phase,
+                             "ts": ts, "row": seg_row, "warn": list(warn)})
+            emit_metrics(d, seg_key, ts, common, metrics, side=side, counters=counters)
         # ---- 召回率行：挂到该场**查询** race 上 ----
         # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
         # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
@@ -1300,7 +1541,7 @@ def main():
             for _task, _stats in (_rec or {}).items():
                 for _stat, _v in _stats.items():
                     metrics.append({"_index": "benchmark-result-metric",
-                                    "_id": "%s|%s|recall|%s" % (race_id, _task, _stat),
+                                    "_id": "%s|%s|%s|recall|%s" % (seg_key, phase, _task, _stat),
                                     "@timestamp": ts, "task": _task, "operation": None,
                                     "family": "recall", "metric": "recall", "stat": _stat,
                                     "value": _v, "unit": "ratio",
@@ -1339,6 +1580,74 @@ def main():
         elif camp not in metas:
             unmatched += 1
 
+    # ---- 合并：同一次测量的多个段合成一行 race ----
+    # 老协议一次测量跑两段（写赛 + 查赛），老脚本把它们存成两场；新协议一次跑完只有一段。
+    # 合并后「一次比赛 = 一行」。赛级指标（results 块：disk/gc/merge/throttle）也只剩一份 ——
+    # 两段实测同值（实测 1947 个 (family,metric,stat) 两场完全一致），留两份就是重复计数。
+    seg_groups = {}
+    for seg in segments:
+        seg_groups.setdefault(seg["key"], []).append(seg)
+    # 段级警告汇总（caliber_warnings 字段已退役，警告改走 manifest）
+    _warn_count = collections.Counter()
+    for seg in segments:
+        for w in (seg.get("warn") or []):
+            _warn_count[w.split("：")[0]] += 1
+    seg_warnings = ["场次警告 %s：%d 场" % (_k, _v) for _k, _v in sorted(_warn_count.items())]
+    seg2race = {}          # 段级 key → 合并后的 race_id
+    seg2primary = {}       # 合并后的 race_id → 主段的 phase（段级 key 不含 phase，用行内 phase 区分来源段）
+    dropped_race_level = 0
+    for key, segs in seg_groups.items():
+        # 主段：写段优先（赛级指标量的是写阶段结束时的状态），否则最早的一段
+        segs_sorted = sorted(segs, key=lambda x: (x["phase"] != "w", x["ts"] or ""))
+        primary = segs_sorted[0]
+        race_id = "%s|%s|a%d" % (key[0], key[1], key[2])
+        row = dict(primary["row"])
+        row["_id"] = race_id
+        row["race_id"] = race_id
+        # challenge 是多值：这次测量由哪些 challenge 段组成（值全是源值，不新增词表）
+        row["challenge"] = sorted({x["row"]["challenge"] for x in segs if x["row"].get("challenge")})
+        # 场次时间 = 最早一段的时刻（一次测量的起点）
+        _tss = [x["ts"] for x in segs if x["ts"]]
+        row["@timestamp"] = min(_tss) if _tss else None
+        # 可信度：任一段不可信 → 整场不可信
+        row["trusted"] = all(x["row"].get("trusted") for x in segs)
+        # 溯源：各段的路径合并
+        _src = []
+        for x in segs:
+            for p in (x["row"].get("source") or []):
+                if p not in _src:
+                    _src.append(p)
+        row["source"] = _src
+        runs.append(row)
+        seg2primary[race_id] = primary["phase"]
+        for x in segs:
+            seg2race[x["seg_key"]] = race_id
+        # system 行的回填材料：按 (campaign, 真fid) 归档 —— 同批次内真fid ↔ 一次测量一一对应
+        # （重试场的真fid 带 -tryN，仍是唯一身份）。
+        camp_fid[(key[0], key[1])] = {"track": row["track"], "ts": row["@timestamp"],
+                                     "race_id": race_id, "trusted": row["trusted"],
+                                     "series_key": row["series_key"]}
+
+    # ---- 指标行：段级 key → 合并后的 race_id；赛级指标只留主段的那一份 ----
+    _kept = []
+    for m in metrics:
+        sid = m.get("race_id")
+        rid = seg2race.get(sid)
+        if rid is None:
+            _kept.append(m)
+            continue
+        # 赛级指标（无 task）在写段与查段各产出一份且数值完全相同 → 只留主段那份，
+        # 否则按 race_id 聚合会重复计数（DESIGN §五·11 的根因）。
+        # 注意段级 seg_key 不含 phase（同一测量的两段共用），来源段要看行内的 phase。
+        if m.get("task") is None and m.get("phase") != seg2primary.get(rid):
+            dropped_race_level += 1
+            continue
+        if m.get("_id", "").startswith(sid + "|"):
+            m["_id"] = rid + m["_id"][len(sid):]
+        m["race_id"] = rid
+        _kept.append(m)
+    metrics = _kept
+
     # monitors → system 指标（benchmark-result-metric 补一行/场/节点/相位/项）
     sysrows = 0
     orphan_fids = {}       # campaign → 该批次 monitors 里对不上本批次任何场次的 fid
@@ -1372,26 +1681,28 @@ def main():
                 # env_verdict 是 OK/FAIL 这类**文字**判定，不是数值 —— 塞进 double 的 value 列
                 # 会被 ES 拒收（mapper_parsing_exception），整行静默丢失。改走 value_text 文字列。
                 if isinstance(mv, str):
-                    metrics.append({"_index": "benchmark-result-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
-                                    "@timestamp": src["ts"], "campaign": camp, "fid": fid, "node": node,
+                    metrics.append({"_index": "benchmark-result-metric", "_id": "env|%s|%s|%s|value" % (camp, key, mk),
+                                    "@timestamp": src["ts"], "campaign": camp, "node": node,
+                                    # race_id 指回这次测量（合并后的主键）——
+                                    # 旧版 system 行没有它，只能靠文件名反查，孤儿行查不到就丢。
+                                    "race_id": src["race_id"],
                                     # run_start：system 行也归属该批次 → 同一个锚点，
                                     # 否则同一批次里一半行有锚点一半没有，按它分桶会裂成两个桶。
                                     "run_start": campaign_run_start.get(camp),
-                                    "valid": src["valid"],
                                     "series_key": src["series_key"],
-                                    "quality": src["quality"] or "ok",
-                                    "phase": ph, "track": src["track"],
+                                    "trusted": src["trusted"],
+                                    "phase": ph or None, "track": src["track"],
                                     "family": "system", "metric": mk, "stat": "value",
                                     "value": None, "value_text": mv, "unit": "text",
                                     "value_original": None, "direction": "lower-better"})
                     continue
                 metrics.append({"_index": "benchmark-result-metric", "_id": "env|%s|%s|%s" % (camp, key, mk),
-                                "@timestamp": src["ts"], "campaign": camp, "fid": fid, "node": node,
+                                "@timestamp": src["ts"], "campaign": camp, "node": node,
+                                "race_id": src["race_id"],
                                 "run_start": campaign_run_start.get(camp),
-                                "valid": src["valid"],
                                 "series_key": src["series_key"],
-                                "quality": src["quality"] or "ok",
-                                "phase": ph, "track": src["track"],
+                                "trusted": src["trusted"],
+                                "phase": ph or None, "track": src["track"],
                                 "family": "system", "metric": mk, "stat": "value",
                                 "value": (mv / 100.0 if unit_of(mk) == "ratio" else mv),
                                 "unit": unit_of(mk),
@@ -1399,6 +1710,7 @@ def main():
 
     # ---- 口径契约断言：先验后写，脏载荷不进库 ----
     problems, warnings, cover = validate_payload(runs, metrics, envs.values())
+    warnings.extend(seg_warnings)
     if orphan_fids:
         warnings.append("monitors 目录里对不上本批次任何场次的 fid（system 行已丢弃，治本=清理源层 monitors/）: %s"
                         % {c: sorted(f) for c, f in sorted(orphan_fids.items())})
@@ -1442,59 +1754,52 @@ def main():
         # 能直接当时序图 x 轴（date_histogram 按它分桶，同一批次恒聚一个桶），也能范围过滤。
         "run_start": dict(_TS),
         # ---- 主键与归属 ----
-        "race_id": {"type": "keyword"}, "campaign": {"type": "keyword"}, "fid": {"type": "keyword"},
-        # ---- 身份正交六列 ----
+        "race_id": {"type": "keyword"}, "campaign": {"type": "keyword"},
+        # attempt：重试号（同一 campaign 下同一 fid 的第几次尝试）。
+        # 它必须单独成列：车/赛道/轮次完全相同、只有重试号不同的两场是两次独立测量。
+        "attempt": {"type": "integer"},
+        # ---- 身份正交六列 + 车代号 ----
         # jdk_vendor 必须单列：GraalVM 25 与 Kona 25 的完整版本号都是 25.0.4，只有厂商能分；
         # jdk_version 是实测完整版本号，粒度随 JDK 本身（有更新尾号的 25.0.4，GA 首版就是 27）
         "engine": {"type": "keyword"}, "version": {"type": "keyword"},
         "engine_build": {"type": "keyword"},
         "jdk_vendor": {"type": "keyword"}, "jdk_version": {"type": "keyword"},
-        "series_key": {"type": "keyword"},
-        # ---- JDK 声明与实测证据（比较以实测列为准）----
-        "jdk_want": {"type": "flattened"}, "jdk_measured": {"type": "keyword"},
-        "jdk_match_want": {"type": "boolean"},
+        "series_key": {"type": "keyword"}, "car_code": {"type": "keyword"},
+        # ---- 声明 / 配置身份 / 实测校验 ----
+        # heap_mb 与 cores 是**配置身份**（编排声明，分组比较用）；
+        # heap_measured_mb 与 cores_measured 是**实测校验**（只用来查漂移）。
+        # 两层分开是因为实测只覆盖 40% 的场次 —— 让实测当唯一依据等于对多数场次无法分组。
+        "jdk_want_major": {"type": "keyword"}, "jdk_want_vendor": {"type": "keyword"},
+        "heap_mb": {"type": "integer"}, "heap_measured_mb": {"type": "integer"},
+        "cores": {"type": "integer"}, "cores_measured": {"type": "integer"},
         # ---- 包指纹 ----
         "pkg": {"type": "keyword"}, "pkg_sha256": {"type": "keyword"},
-        "pkg_inventory": {"type": "keyword"},
         # ---- run 维度 ----
-        "track": {"type": "keyword"}, "track_raw": {"type": "keyword"},
-        "challenge": {"type": "keyword"}, "phase": {"type": "keyword"},
-        # typed promote（方案 §3.2）：dims 要能 range/排序，round 要能当整数分组
+        "track": {"type": "keyword"},
+        # challenge 是多值 keyword：一次测量可由多个 challenge 段组成，值全是源值
+        "challenge": {"type": "keyword"},
+        # typed promote：dims 要能 range/排序，round 要能当整数分组
         "dims": {"type": "integer"}, "round": {"type": "integer"},
-        "lineage": {"type": "keyword"}, "segment_form": {"type": "keyword"},
-        "codec": {"type": "keyword"}, "source_reuse": {"type": "keyword"},
-        "knn_params": {"type": "flattened"}, "env_id": {"type": "keyword"},
-        "nnodes": {"type": "integer"}, "cores_tag": {"type": "keyword"},
-        "heap_tag": {"type": "keyword"}, "heap_declared": {"type": "keyword"},
-        "cores_declared": {"type": "keyword"},
-        # ---- 实测资源 ----
-        "heap_gb": {"type": "double"}, "heap_max_measured_mb": {"type": "double"},
-        "available_processors_measured": {"type": "integer"},
-        "index_writer_memory_measured_mb": {"type": "double"},
-        "version_map_memory_measured_mb": {"type": "double"},
-        "fixed_bit_set_memory_measured_mb": {"type": "double"},
+        "lineage": {"type": "keyword"},
+        "codec": {"type": "keyword"}, "source_reuse": {"type": "boolean"},
+        "env_id": {"type": "keyword"}, "nnodes": {"type": "integer"},
         "clients": {"type": "integer"}, "bulk_size": {"type": "integer"},
         "shards": {"type": "integer"}, "replicas": {"type": "integer"},
-        # ---- 语料与环境 ----
-        "corpus": {"type": "flattened"}, "pipeline": {"type": "keyword"},
+        # ---- 向量参数（flattened 拆出的标量）----
+        "knn_index_type": {"type": "keyword"}, "knn_element_type": {"type": "keyword"},
+        "knn_m": {"type": "integer"}, "knn_ef_construction": {"type": "integer"},
+        "knn_num_candidates": {"type": "integer"},
+        # ---- 语料与环境（flattened 拆出的标量）----
+        "corpus_docs": {"type": "long"}, "corpus_name": {"type": "keyword"},
+        "cluster_revision": {"type": "keyword"}, "cluster_flavor": {"type": "keyword"},
         "rally_version": {"type": "keyword"},
-        # rally_car：Rally 自己的 car（客户端插件列表，如 ["external"]），
-        # 与本项目的「车」（一套被测配置）不是一回事，单独一个字段
-        "rally_car": {"type": "keyword"},
-        "environment": {"type": "keyword"}, "cluster": {"type": "flattened"},
-        "user_tags": {"type": "flattened"}, "track_params": {"type": "flattened"},
-        # ---- 派生便利列（报表读数用；看板聚合一律走 benchmark-result-metric）----
+        # ---- 赛末快照 + 溯源 + 可信度 ----
         "store_size_gb_post_merge": {"type": "double"},
         "segments_post_merge": {"type": "integer"},
-        "write_task_duration_s": {"type": "double"},
-        "throughput_docs_per_s_whole": {"type": "double"},
-        # ---- 可信度闸门与溯源 ----
-        "status": {"type": "keyword"}, "valid": {"type": "boolean"},
-        "quality": {"type": "keyword"}, "degraded_tasks": {"type": "keyword"},
-        "caliber_warnings": {"type": "keyword"},
         # source 是字符串数组（溯源路径），不是对象 → keyword（数组按多值索引），
         # 不能用 flattened（flattened 只收对象，标量串会被 mapper_parsing_exception 整批拒收）
-        "source": {"type": "keyword"}, "fingerprint": {"type": "keyword"},
+        "source": {"type": "keyword"},
+        "trusted": {"type": "boolean"},
     })
     # benchmark-result-env：独立模板 + dynamic strict（D10 定稿）
     # disk_type/disk_path 目前恒 null（sidecar 未采集）——列先占住，采集补上后无需改模板
@@ -1531,17 +1836,18 @@ def main():
                        "value": {"type": "double"}, "value_original": {"type": "double"},
                        "unit_original": {"type": "keyword"},
                        "value_text": {"type": "keyword"},
-                       # 口径契约：quality 是面板闸门（degraded 行不能混进延迟曲线），
+                       # 口径契约：trusted 是面板闸门（不可信的行不能混进延迟曲线），
                        # latency_mode / backlog_ratio 解释 latency 的口径
-                       "quality": {"type": "keyword"},
+                       "trusted": {"type": "boolean"},
                        "latency_mode": {"type": "keyword"},
                        "backlog_ratio": {"type": "double"},
                        # 看板维度：赛道（按赛道拆看板）、身份分线键、场次/批次过滤
                        "track": {"type": "keyword"}, "series_key": {"type": "keyword"},
-                       "valid": {"type": "boolean"}, "campaign": {"type": "keyword"},
-                       # monitor 采样行专用：场次标识 / 节点 / 采样相位
-                       "fid": {"type": "keyword"}, "node": {"type": "keyword"},
-                       "phase": {"type": "keyword"}}}}}
+                       "campaign": {"type": "keyword"},
+                       # 处理变量：跨批聚合默认只看默认压缩，面板按这两个字段排除存储变体
+                       "codec": {"type": "keyword"}, "source_reuse": {"type": "boolean"},
+                       # 这行来自赛内哪个阶段（w/m/q）+ monitor 采样行的节点
+                       "phase": {"type": "keyword"}, "node": {"type": "keyword"}}}}}
     templates = {"benchmark-result-race": TPL_RACE, "benchmark-result-env": TPL_ENV,
                  "benchmark-result-metric": TPL_METRIC}
     # 自检：三张 strict 模板必须覆盖各自文档的**全部字段** ——
@@ -1560,15 +1866,24 @@ def main():
 
     with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"generated_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "races_scanned": len(seen), "bench_run": len(runs), "bench_metric": len(metrics),
+                   # races_scanned = 扫到的 rally run 数（段）；bench_run = 合并后的**测量次数**
+                   # （一次比赛 = 一行）。两者不等是正常的：老协议一次测量跑写赛+查赛两段。
+                   "races_scanned": len(seen), "segments_scanned": len(segments),
+                   "bench_run": len(runs), "bench_metric": len(metrics),
                    "bench_env": len(envs), "system_rows": sysrows,
                    "system_rows_dropped_orphan": orphan_rows,
                    "monitors_orphan_fids": {c: sorted(f) for c, f in sorted(orphan_fids.items())},
                    "campaigns_with_dir": sorted(metas), "races_without_campaign_dir": unmatched,
                    "skipped_no_campaign": skipped_no_campaign,
                    "require_campaign": bool(args.require_campaign),
-                   "valid_true": sum(1 for r in runs if r.get("valid") is True),
-                   "valid_null": sum(1 for r in runs if r.get("valid") is None),
+                   # dropped：写入侧闸门剔掉的场次（库里不留痕，但清单可审计）
+                   "dropped": {"count": len(dropped),
+                               "by_reason": dict(collections.Counter(x["reason"] for x in dropped)),
+                               "items": dropped},
+                   "merged": {"measurements": len(runs),
+                              "multi_segment": sum(1 for r in runs
+                                                   if isinstance(r.get("challenge"), list) and len(r["challenge"]) > 1),
+                              "race_level_rows_dropped": dropped_race_level},
                    "assertions": {"status": "pass" if not problems else "fail",
                                   "problems": problems, "warnings": warnings},
                    "coverage": cover,
