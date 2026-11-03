@@ -15,6 +15,9 @@
 载荷快照原样入 ES/EasySearch，不因目标集群差异改写数据内容 —— 唯一的例外是
 flattened 字段的显式 null（见 flatten_fields），那是被目标集群的 mapper 逼出来的
 必要处理，对 ES 语义等价。
+
+退出码：全成功 → 0；bulk 有任何一条 per-item 被拒收 → 1（理由见 flush）。
+refresh 失败只算警告，不改退出码 —— 它不影响数据正确性，只是搜索可见性延迟。
 """
 import argparse
 import base64
@@ -105,12 +108,14 @@ def main():
             flat[idx] = set()
 
     total = {}
+    samples_by_idx = {}
     for idx in want:
         path = os.path.join(args.dir, idx + ".jsonl")
         if not os.path.isfile(path):
             print("跳过（无此文件）: %s" % path)
             continue
         sent = errs = 0
+        samples = []
         buf = []
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -124,37 +129,129 @@ def main():
                 buf.append(json.dumps({"index": {"_index": idx, "_id": rid}}))
                 buf.append(json.dumps(doc, ensure_ascii=False))
                 if len(buf) >= args.batch * 2:
-                    errs += flush(args, buf, sent)
+                    bad, smp = flush(args, buf, sent)
+                    errs += bad
+                    if len(samples) < 3:
+                        samples.extend(smp[:3 - len(samples)])
                     sent += args.batch
                     buf = []
             if buf:
-                errs += flush(args, buf, sent)
+                bad, smp = flush(args, buf, sent)
+                errs += bad
+                if len(samples) < 3:
+                    samples.extend(smp[:3 - len(samples)])
                 sent += len(buf) // 2
         total[idx] = {"sent": sent, "errors": errs}
+        samples_by_idx[idx] = samples
         print("%s: 提交 %d 条，失败 %d" % (idx, sent, errs))
     for idx in want:
         try:
             r = post("%s/%s/_refresh" % (args.es, idx), b"", args.auth, args.insecure)
         except Exception as e:                      # noqa: BLE001
-            print("refresh %s 失败: %s" % (idx, e))
+            # refresh 失败只是搜索可见性延迟，数据本身已经写进去了 ——
+            # 降级成警告，不和 bulk 的失败混在一起，也不改退出码
+            print("警告: refresh %s 失败: %s（不影响数据正确性，仅搜索可见性延迟）" % (idx, e),
+                  file=sys.stderr)
+    failed = [i for i in want if total.get(i, {}).get("errors")]
+    if failed:
+        # 失败摘要走 stderr 并返回 1：strict 拒收是静默的，
+        # 只看"完成"两个字会以为灌成功了，索引里其实少了一大片数据
+        lines = ["==== 入库失败汇总（bulk 有条目被 ES 拒收）===="]
+        t_sent = t_err = 0
+        for idx in want:
+            info = total.get(idx)
+            if not info:
+                continue
+            t_sent += info["sent"]
+            t_err += info["errors"]
+            lines.append("%s: 提交 %d 条，成功 %d 条，失败 %d 条"
+                         % (idx, info["sent"], info["sent"] - info["errors"], info["errors"]))
+            for i, s in enumerate(samples_by_idx.get(idx, []), 1):
+                lines.append("  失败样例 %d: %s" % (i, s))
+        lines.append("合计: 提交 %d 条，失败 %d 条" % (t_sent, t_err))
+        lines.append("结论: 有文档没进索引，退出码 1（strict 拒收是静默的，别当灌成功）")
+        print("\n".join(lines), file=sys.stderr)
+        return 1
     print("完成:", json.dumps(total, ensure_ascii=False))
     return 0
 
 
+def caused_text(cb):
+    """把 error.caused_by 展开成一行文本（ES 的 caused_by 可能层层嵌套）。"""
+    if not isinstance(cb, dict):
+        return str(cb)
+    txt = cb.get("type") or ""
+    if cb.get("reason"):
+        txt = ("%s: %s" % (txt, cb["reason"])) if txt else cb["reason"]
+    inner = cb.get("caused_by")
+    if isinstance(inner, dict):
+        txt = "%s <- %s" % (txt, caused_text(inner))
+    return txt
+
+
+def fmt_fail(action):
+    """把 bulk 里的单条失败压成一行可读摘要（保留 ES 给的 reason / caused_by）。
+
+    整条 action JSON 动辄几百字符，真正定位问题的是 status / error.type /
+    error.reason / error.caused_by / _id，其余部分不打印。
+    """
+    err = action.get("error")
+    if isinstance(err, str):
+        return "reason=%s" % err
+    err = err if isinstance(err, dict) else {}
+    parts = []
+    if action.get("status") is not None:
+        parts.append("status=%s" % action["status"])
+    if err.get("type"):
+        parts.append("type=%s" % err["type"])
+    if err.get("reason"):
+        parts.append("reason=%s" % err["reason"])
+    if err.get("caused_by"):
+        parts.append("caused_by=%s" % caused_text(err["caused_by"]))
+    if action.get("_id"):
+        parts.append("_id=%s" % action["_id"])
+    return " ".join(parts) or json.dumps(action, ensure_ascii=False)[:300]
+
+
 def flush(args, buf, sent):
+    """提交一批 bulk，返回 (失败条数, 本批失败样例列表)。
+
+    strict 拒收是静默的：ES 会整条丢掉类型冲突的文档，而 bulk 仍然返回 200 ——
+    不看 per-item 的 status 就会以为灌成功了。所以失败条数要一路带回 main，
+    最后以非 0 退出码结束，而不是打印一句"完成"就当重灌成功。
+    """
     try:
         r = post("%s/_bulk?refresh=false" % args.es, "\n".join(buf) + "\n", args.auth, args.insecure)
     except urllib.error.HTTPError as e:
-        print("  bulk 失败: %s %s" % (e.code, e.read()[:400]))
-        return 1
+        # 请求级失败：这一批一条都没写进去，整批计失败
+        try:
+            raw = e.read()[:400]
+        except Exception:                                  # noqa: BLE001
+            raw = b""                                      # 有些响应体读不出来，别让报错路径自己崩
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        detail = "bulk 请求失败: HTTP %s %s" % (e.code, raw)
+        print("  " + detail, file=sys.stderr)
+        return len(buf) // 2, [detail]
     bad = 0
-    for item in r.get("items", []):
+    samples = []
+    items = r.get("items") or []
+    expect = len(buf) // 2
+    if len(items) < expect:
+        # 明细比提交的还少：少的那几条结果未知，不能当成功算
+        miss = expect - len(items)
+        bad += miss
+        samples.append("bulk 只返回 %d 条明细（提交 %d 条），%d 条结果未知，按失败计"
+                       % (len(items), expect, miss))
+    for item in items:
         act = item.get("index") or {}
         if act.get("status") not in (200, 201):
             bad += 1
-            if bad <= 3:
-                print("  写失败样例:", json.dumps(act, ensure_ascii=False)[:300])
-    return bad
+            if len(samples) < 3:
+                samples.append(fmt_fail(act))
+    if bad:
+        print("  本批 %d 条有问题（bulk 请求本身仍是 200）" % bad, file=sys.stderr)
+    return bad, samples
 
 
 if __name__ == "__main__":
