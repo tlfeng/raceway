@@ -179,7 +179,7 @@ RACE_FIELDS = frozenset((
     # run 维度。challenge 是**多值**：一次测量可以由多个 challenge 段组成
     # （老协议写赛+查赛分开跑 → ["write-only","query-only"]；新协议一次跑完 → ["full"]）。
     # 值全是源值，不新增词表。
-    "track", "challenge", "round", "dims", "lineage",
+    "track", "track_variant", "challenge", "round", "dims", "lineage",
     "codec", "source_reuse", "env_id", "nnodes",
     "clients", "bulk_size", "shards", "replicas",
     # 向量参数（从 flattened 拆成标量）
@@ -1123,6 +1123,31 @@ def arm_build_of(arms, car):
     return None
 
 
+def variant_from_fid(fid):
+    """真 fid（{车}-{变体}-r{轮}[-tryN]）→ 变体段（不做归一）。"""
+    base = _TRY_RE.sub("", fid or "")
+    m = re.match(r"^[^\-]+-(.+)-r\w+$", base)
+    return m.group(1) if m else None
+
+
+def variant_of(fid, raw_track):
+    """变体身份（**编排事实**）：这次测量用的是哪个赛道变体。
+
+    值 = 变体 id：`<基础赛道>-codec-<token>[-sr]`（如 `geo-codec-def`、`geo-codec-zstd-sr`），
+    基座赛道就是基础赛道名本身（`geo` / `hnsw` / `ds-g1920`…）。
+
+    为什么不用实测的 codec 顶上：基座 geo 与 geo-codec-def 的 index.codec 实测**一样**
+    （引擎默认 LZ4），分不开；实测有 62 场采到 sidecar 却没采到 index.codec，
+    哪天采到了就会变成 'default'，和 default 变体撞车。变体身份只能来自编排。
+    """
+    for cand in (variant_from_fid(fid), raw_track):
+        if not cand:
+            continue
+        c = H.canonical_id(str(cand))
+        return c if "-codec-" in c else H.base_of(c)
+    return None
+
+
 def canon_track(raw):
     """原始赛道名 → 规范赛道名：历史短名（gdef/gzstd/gbc）→ 规范变体名
     （geo-codec-*）→ 基础赛道名（geo）。"""
@@ -1495,7 +1520,8 @@ def main():
                    # ---- 包指纹（sha256 只认本场 sidecar 实测，不跨批次借）----
                    "pkg": pkg, "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256"),
                    # ---- run 维度 ----
-                   "track": tr, "challenge": d.get("challenge"), "round": rnd,
+                   "track": tr, "track_variant": variant_of(fid, d.get("track")),
+                   "challenge": d.get("challenge"), "round": rnd,
                    "dims": dims, "lineage": lineage,
                    "codec": common["codec"], "source_reuse": common["source_reuse"],
                    "env_id": (side.get("env") or {}).get("env_id"),
@@ -1776,6 +1802,12 @@ def main():
         "pkg": {"type": "keyword"}, "pkg_sha256": {"type": "keyword"},
         # ---- run 维度 ----
         "track": {"type": "keyword"},
+        # track_variant：赛道**变体**身份（编排事实）——
+        # `<基础赛道>-codec-<token>[-sr]`（如 geo-codec-def），基座赛道就是基础赛道名本身。
+        # 为什么必须有这一列：track 是基础赛道，基座 geo 与 geo-codec-def 在 track 上一样；
+        # 而实测的 index.codec 分不开它们（引擎默认就是 LZ4，实测有 62 场采到 sidecar
+        # 却没采到 index.codec，一旦采到就变成 'default' 撞车）。变体身份只能来自编排。
+        "track_variant": {"type": "keyword"},
         # challenge 是多值 keyword：一次测量可由多个 challenge 段组成，值全是源值
         "challenge": {"type": "keyword"},
         # typed promote：dims 要能 range/排序，round 要能当整数分组
