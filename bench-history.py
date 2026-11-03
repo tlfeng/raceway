@@ -70,20 +70,29 @@ PAGE_SIZE = 2000
 #   track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
 #   codec 相同，靠 codec 分不出，只能靠目录名）
 #   codec / source_reuse = 压缩与复用的两个独立维度
-_SOURCE_FIELDS = ['campaign', 'fid', 'user_tags', 'engine', 'engine_build',
-                  'track', 'track_raw', 'round', 'status', 'quality', 'phase',
-                  '@timestamp', 'caliber_warnings', 'dims', 'pkg',
+# v3 契约（2026-11-03）：race 一行 = 一次测量（写赛与查赛合并），
+# status/quality/phase/fid/user_tags/track_raw 全部退役。
+#   car_code    = 车代号（原来在 user_tags.car 里）
+#   track_variant = 赛道变体身份（编排事实，基座与 default 变体靠它分开）
+#   challenge   = **多值**，这次测量由哪些 challenge 段组成 → 相位完整性靠它反推
+#   trusted     = 不可信标记（原来叫 quality=degraded）
+# 旧库的行仍能读：下面几个字段取不到时按旧名回落。
+_SOURCE_FIELDS = ['campaign', 'car_code', 'engine', 'engine_build',
+                  'track', 'track_variant', 'track_raw', 'round',
+                  '@timestamp', 'dims', 'pkg', 'attempt',
                   'challenge', 'codec', 'source_reuse',
-                  'series_key', 'jdk_vendor', 'jdk_version']
+                  'series_key', 'jdk_vendor', 'jdk_version', 'trusted',
+                  'status', 'quality', 'phase', 'user_tags', 'fid']
 
 
 def row_build_key(r):
     """一行的 build 标识：`车@build`（无 build 号的车就是车名本身，如 es819）。
 
     索引里不再存 car_build 字段（那是「车代号」的重复编码），这里用
-    user_tags.car + engine_build 合成 —— 与旧的 car_build 字段等价。
+    车代号 + engine_build 合成 —— 与旧的 car_build 字段等价。
+    v3：车代号是顶层 car_code；旧库的行仍从 user_tags.car 取。
     """
-    car = car_of(r)
+    car = r.get('car_code') or car_of(r)
     b = r.get('engine_build')
     return ('%s@%s' % (car, b)) if (car and b) else (car or '')
 
@@ -194,13 +203,16 @@ def variant_of(track, codec, sr):
 def variant_id_of(row):
     """一行 benchmark-result-race → 变体 id（覆盖判定的 key 维度）。
 
-    **按 track_raw（变体目录名）判定，不用 codec 字段反推** —— 因为基座赛道
-    与它的 default 变体实测出来的 index.codec 是一样的（引擎默认就是 LZ4），
-    靠 codec 分不出"geonames 基座"和"geo-codec-def"，只能靠目录名。
+    **按变体目录名判定，不用 codec 字段反推** —— 因为基座赛道与它的 default
+    变体实测出来的 index.codec 是一样的（引擎默认就是 LZ4），靠 codec 分不出
+    "geonames 基座"和"geo-codec-def"。
 
-    - track_raw 含 "-codec-" → 就是变体 id
-    - 否则 → 基础赛道（用 track 字段，它已把目录名归一过：track="geo" 等）
+    v3：变体身份是编排事实，存成顶层 track_variant（`geo-codec-def` 这样的
+    变体 id，基座赛道就是基础赛道名本身）。旧库的行从 track_raw 取。
     """
+    v = row.get('track_variant') or ''
+    if v:
+        return v
     raw = row.get('track_raw') or ''
     if '-codec-' in raw:
         return raw
@@ -310,32 +322,71 @@ def fetch_rows(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
 
 
 # ------------------------------------------------------------------ 覆盖模型
+def _challenges_of(row):
+    """一次测量的 challenge 集合。v3 里是**多值**（写赛+查赛合并成一行）。"""
+    ch = row.get('challenge')
+    if isinstance(ch, str):
+        ch = [ch]
+    return {str(c).strip() for c in (ch or []) if str(c).strip()}
+
+
+def _phases_of(row):
+    """这次测量**实际包含**哪些赛段（由 challenge 集合反推）。
+
+    v3 的 race 行不再有 phase 列 —— 一行就是一次测量，多段已合并，
+    包含哪些段由 challenge 集合说。
+    """
+    ph = set()
+    for c in _challenges_of(row):
+        if c == 'write-only':
+            ph.add('w')
+        elif c == 'query-only':
+            ph.add('q')
+        else:
+            ph.add('wq')
+    return ph
+
+
 def _expected_phases(row):
     """一场次该有哪些相位。write-only 赛道只有写赛。"""
-    ch = (row.get('challenge') or '').strip()
-    if ch == 'write-only':
-        return {'w'}
-    if ch in ('full', 'nested-search-challenge', 'default'):
+    chs = _challenges_of(row)
+    if not chs:
+        return {'w', 'q'}
+    if chs & {'full', 'nested-search-challenge', 'default'}:
         return {'wq'}
+    if chs == {'write-only'}:
+        return {'w'}
     return {'w', 'q'}
 
 
 def _verdict_of(rows):
-    """把一场次（若干行）合并成一个判定。"""
+    """把一场次（若干行）合并成一个判定。
+
+    v3：库里的行全都过了写入侧闸门（非 VALID / host-noise 的场次根本不写库），
+    所以 **status 已退役**，FAIL / SKIP / UNKNOWN 只在读旧库时还可能出现。
+    相位也不再是列 —— 一次测量合并成一行，包含哪些赛段由 challenge 集合说。
+    """
     statuses = [(r.get('status') or '') for r in rows]
     if any(s in FAIL_STATUSES for s in statuses):
         return VERDICT_FAIL
     if any(s in SKIP_STATUSES for s in statuses):
         return VERDICT_SKIP
-    if not any(s == 'VALID' for s in statuses):
+    # v3 的行没有 status 列（过了写入侧闸门的测量都在库里）——
+    # 只有**读到过**状态值才据此判定，空值不算"读到了但不 VALID"。
+    seen_status = [s for s in statuses if s]
+    if seen_status and not any(s == 'VALID' for s in seen_status):
         return VERDICT_UNKNOWN
-    phases = set(r.get('phase') or '' for r in rows)
+    phases = set()
     expected = set()
     for r in rows:
+        phases |= _phases_of(r)
+        if r.get('phase'):          # 旧库的行还有 phase 列
+            phases.add(r['phase'])
         expected |= _expected_phases(r)
     if expected and not expected.issubset(phases):
         return VERDICT_HALF
-    if any((r.get('quality') or '') == 'degraded' for r in rows):
+    if any(r.get('trusted') is False or (r.get('quality') or '') == 'degraded'
+           for r in rows):
         return VERDICT_DEGRADED
     return VERDICT_VALID
 
@@ -436,11 +487,18 @@ class Cell:
 
     @property
     def warnings(self):
+        """这一格有什么值得提示的。
+
+        v3：索引行里不再有 caliber_warnings（警告改走 manifest），
+        剩下的行级信号只有 trusted 与 track_variant。
+        """
         out = []
         for r in self.rows:
-            for w in (r.get('caliber_warnings') or []):
-                if w not in out:
-                    out.append(w)
+            if r.get('trusted') is False:
+                out.append("该测量有 trusted=false 的行（面板只取 trusted=true）")
+            v = r.get('track_variant')
+            if v and v != r.get('track'):
+                out.append("赛道变体：%s（基座 %s）" % (v, r.get('track')))
         return out
 
     def per_build(self):
