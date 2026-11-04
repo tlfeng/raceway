@@ -246,6 +246,13 @@ def node_extras(full_stats_text):
         seg = idx.get("segments") or {}
         if seg:
             e["segment_count"] = seg.get("count")
+        st = idx.get("store") or {}
+        if st.get("size_in_bytes"):
+            e["store_size_bytes"] = st["size_in_bytes"]
+            e["store_size_gb"] = round(st["size_in_bytes"] / 1e9, 3)
+        dc = idx.get("docs") or {}
+        if dc.get("count") is not None:
+            e["doc_count"] = dc["count"]
         fs = n.get("fs") or {}
         if fs:
             tot = fs.get("total") or {}

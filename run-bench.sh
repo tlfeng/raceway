@@ -125,6 +125,7 @@ case "$WHAT" in
   gdef|gzstd|gbc) TRACKS=("$WHAT");; # 历史短名（= geo-codec-* 的别名）
   hnsw) TRACKS=(hnsw);;
   hv1024) TRACKS=(hv1024);;
+  hv1024x*) TRACKS=("$WHAT");;   # 服务器侧变体（hv1024x/-int8/-bbq/-codec-zstd-sr）
   nested) TRACKS=(nested);;
   codec) TRACKS=(geo-codec-def geo-codec-def-sr geo-codec-zstd geo-codec-zstd-sr geo-codec-bc geo-codec-bc-sr);;
            # geonames 一族的压缩×source_reuse 全套 6 变体
@@ -580,11 +581,12 @@ track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
   geo) echo "$TIMEOUT_GEO_W";;
   hnsw) echo "$TIMEOUT_HNSW_W";;
   hv1024) echo "$TIMEOUT_HV1024_W";;
+  hv1024x*) echo "$TIMEOUT_HV1024_W";;
   nested) echo "$TIMEOUT_NESTED_W";;
   ds-*) local dm; dm=$(track_dims "$1") || { echo "$TIMEOUT_DS_W"; return; }
         if [ "$dm" -ge 1536 ]; then echo "$TIMEOUT_DS_W_HI"; else echo "$TIMEOUT_DS_W"; fi;;
  esac; }
-track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
+track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024|hv1024x*) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
 
 monitor_start() { # <fid> <eng> —— 被动周期采样（5s，只记录，不做卡点、不触发重试）
   local fid="$1" eng="$2" ip dir
@@ -824,6 +826,14 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
   #   JDK 27 里压根没有 JVMCI 这个概念，行为上与「JVMCI 关」等价，
   #   所以三个车（GraalVM25 / OpenJDK26 / OpenJDK27）的向量加速路径保持一致。
   local jci_hi=26
+  # 2.5.1+ 新式 bundle 自带不带版本号的 agent（lib/easysearch-security-agent.jar），
+  # 原版 agent 已适配新 JDK，整段修补不适用 —— 保持原版直接跳过。旧逻辑的过滤
+  # 只匹配 -2.5.0.jar 文件名，滤不掉新式 javaagent 行，追加后会双 agent 叠加，
+  # JVM 报 "jar hell!" 拒绝启动 → CLUSTER-NOT-READY（2026-10-29 ez251 六连败根因）。
+  if [ "$(vm "${VM_IPS[0]}" "[ -f $EZ_DIR/lib/easysearch-security-agent.jar ] && echo Y || echo N")" = Y ]; then
+    log "  检测到新式自带 agent（easysearch-security-agent.jar），保持 bundle 原版，跳过修补组合"
+    return 0
+  fi
   local ip
   for ip in "${VM_IPS[@]}"; do
     vm "$ip" "set -e

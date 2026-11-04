@@ -16,7 +16,7 @@ import statistics
 import sys
 
 ROW = re.compile(r"^\|\s*(.+?)\s*\|\s*(\S.*?)\s*\|\s*([-\d.eE+]+)\s*\|")
-FID = re.compile(r"^([a-z0-9]+)-([a-z0-9]+)-r(\d+)(?:-try\d+)?-([wq])\.md$")
+FID = re.compile(r"^([a-z0-9]+)-([a-z0-9]+)-r(\d+)(?:-try\d+)?-([a-z]+)\.md$")
 W_KEYS = ["Median Throughput", "Max Throughput", "50th percentile service time",
           "90th percentile service time", "99th percentile service time", "100th percentile service time"]
 
@@ -66,11 +66,14 @@ def load(camps):
             slot = out.setdefault((car, track), {}).setdefault(key, {"camp": os.path.basename(camp)})
             if side in slot and "-try" not in os.path.basename(p):
                 continue
-            slot[side] = parse_md(p)
-            if side == "w":
+            parsed = parse_md(p)
+            if side in ("w", "wq"):        # 单挑战协议：写+查在同一份 md 里
+                slot["w"] = parsed
                 dur = race_duration(p)
                 if dur:
                     slot["dur"] = dur
+            if side in ("q", "wq"):
+                slot["q"] = parsed
     return out
 
 
@@ -125,8 +128,9 @@ def write_table(data, a, b, track, camps_label):
 
 def query_table(data, a, b, track):
     ra, rb = data.get((a, track), {}), data.get((b, track), {})
-    tasks = sorted({t for r in ra.values() if "q" in r for (k, t) in r["q"] if k == "Median Throughput"} &
-                   {t for r in rb.values() if "q" in r for (k, t) in r["q"] if k == "Median Throughput"})
+    tasks = sorted(({t for r in ra.values() if "q" in r for (k, t) in r["q"] if k == "Median Throughput"} &
+                    {t for r in rb.values() if "q" in r for (k, t) in r["q"] if k == "Median Throughput"})
+                   - {"index-append"})   # 写段任务不是查询操作
     if not tasks:
         return
     print(f"\n## {track} 查询 {len(tasks)} 个操作（3 轮中位；Δ 为 {b} 相对 {a}；耗时越低越好）\n")
