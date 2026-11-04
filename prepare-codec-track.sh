@@ -89,18 +89,29 @@ bake_settings() { # <index.json> <codec> <sr:yes|no>
 import json, sys
 p, codec, sr = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(p, encoding='utf-8').read()
-# ① 纯 JSON 基座（hnsw/nested/hv1024/ds-* 都是）→ 直接改 settings.index
+# ① 纯 JSON 基座（hnsw/nested/hv1024/ds-* 都是）→ 把存储设置写进 settings，**与 "index" 对象平级**
+#
+# ⚠️ 2026-11-04 修掉的坑（实测定位）：原来写的是
+#     idx = settings.setdefault("index", {}); idx["index.codec"] = codec
+# 那会展开成 settings.index.index.codec —— ES 把 "index" 当成设置名前缀，
+# 于是报 "unknown setting [index.index.codec]"，**索引根本建不起来**。
+# 后果是整场作废：create-index 的 error_rate=1.0，随后的 knn-search 全部 error_rate=1.0，
+# 而写阶段的 index-append/refresh/force-merge 反而报 0.0（没索引可写，等于没跑）。
+# 实测证据：hv1024x-codec-zstd-sr 这 3 场（2026-11-03 夜跑）就是这个形态，全军覆没。
+#
+# 正确写法：**与 "index" 对象平级**（ES 同时认 settings.index.* 与 settings["index.codec"] 两种写法）。
+# 参照：旧 geo-codec-* 变体一直是平铺的，所以它们一直能建索引。
 try:
     d = json.loads(s)
 except ValueError:
     d = None
 if d is not None:
-    idx = d.setdefault("settings", {}).setdefault("index", {})
-    idx["index.codec"] = codec
+    st = d.setdefault("settings", {})
+    st["index.codec"] = codec
     # source_reuse 只在要开的时候写：ES 根本不认这个 setting，
     # 写 false 也会让 ES 的 create-index 报 unknown setting。
     if sr == "yes":
-        idx["index.source_reuse"] = True
+        st["index.source_reuse"] = True
     open(p, 'w', encoding='utf-8').write(json.dumps(d, ensure_ascii=False, indent=2))
     sys.exit(0)
 # ② 模板基座（geonames 是 Jinja 模板）→ 按锚点插一行

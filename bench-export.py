@@ -1621,7 +1621,14 @@ def main():
             # 必须和 emit_metrics 一样待在闸门的 else 里 —— 之前它缩进在闸门外，
             # 被剔场次的 recall 行照写不误，SEG| race_id 在 race 索引查无此人
             # （实测漏了 4 行，2026-11-03）。
-            if phase == "q":
+            # 召回率行：**查询相**的场次才发。
+            # phase=="q" 是老协议（读写分跑）；phase=="wq" 是 2026-10-28 起的单挑战
+            # `full` 协议（读写同一段跑）—— 查询相就在同一段里。
+            # 2026-11-04 修：原来只判 phase == "q"，把 full 协议场次的 recall 行全漏了 ——
+            # 实测 hv1024x 家族 15 场在 campaign 里都产出了真 recall 文件（30 个 × ~210 字节），
+            # 却一行都没进库（库里 recall 只有 ds-* 赛道）。query 相漏掉就是「数据在库里
+            # 但从没被查过」那一类（DESIGN §七·2 记录过同款）。
+            if phase in ("q", "wq"):
                 _rec = recall_idx.get((camp, fid))
                 if not _rec:
                     for (_c2, f2), r2 in recall_idx.items():
