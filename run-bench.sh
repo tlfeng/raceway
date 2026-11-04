@@ -13,6 +13,8 @@
 #   不写配置文件 = 单配置模式，沿用下面的顶层环境旋钮。
 #   模板见同目录的 campaign-configs.example.conf；DRY=1 或首参 --dry-run 只打印排程不执行
 #   断点续跑：RACES.md 里已 VALID 的场自动跳过（FRESH=1 强制全重跑）
+#   RECALL=1 ./run-bench.sh <赛道> ...  单跑模式也打 recall 探针（召回塌了的性能数字不作数；
+#                    排程模式由排程行的 recall 列决定，不用这个开关）
 #   收尾可选 NOTIFY_URL=https://webhook… ：POST 一条 JSON 结果摘要
 #
 # 引擎身份（正式三元组，安装包按 PKG_DIR + 三元组推导文件名）：
@@ -87,7 +89,7 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 SCHEDULE_FILE=${SCHEDULE_FILE:-}
 CARS_FILE=${CARS_FILE:-${ARMS_FILE:-}}   # 旧名 ARMS_FILE 仍认（改名前的排程命令照抄能用）
 DS_HOURS=${DS_HOURS:-0}
-CUR_RECALL=0
+CUR_RECALL=${RECALL:-0}     # 单跑模式是否打 recall 探针（RECALL=1）；排程模式由排程行的 recall 列决定
 
 # ---- 配置文件（第 3 参数或 CONF=）：每行一个配置，轮内右旋配对交错 --------------
 CONF_FILE=${3:-${CONF:-}}
@@ -121,7 +123,7 @@ fi
 
 case "$WHAT" in
   geo)  TRACKS=(geo);;
-  *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道，见 prepare-codec-track.sh）
+  *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道；压缩档走 --track-params）
   gdef|gzstd|gbc) TRACKS=("$WHAT");; # 历史短名（= geo-codec-* 的别名）
   hnsw) TRACKS=(hnsw);;
   hv1024) TRACKS=(hv1024);;
@@ -503,7 +505,10 @@ ensure_jdk() {
       fi
     else
       if ! vm "$ip" "[ -x '$JDK_DIR/bin/java' ]"; then
-        log "  $ip: JDK_DIR 不存在或缺 bin/java: $JDK_DIR"; return 1
+        # 虚机上没有这个 JDK：/opt/jdks/jdk-<ver> 约定且本地有安装包 → 直接装（幂等）
+        if ! provision_jdk "$ip"; then
+          log "  $ip: JDK_DIR 不存在或缺 bin/java: $JDK_DIR（也没法从 $PKG_DIR 自动安装）"; return 1
+        fi
       fi
       [ -n "$arch" ] && vm "$ip" "[ -d $dir/$arch ]" || \
         { vm "$ip" "cp -a $dir/jdk $dir/jdk.bundled" || { log "  $ip: 归档自带 JDK 失败"; return 1; }; arch=jdk.bundled; }
@@ -568,6 +573,144 @@ prepare_hnsw_s3() {
   sed -i 's/"number_of_shards": *2/"number_of_shards": 3/' "$TRACK_HNSW_S3/index.json"
   grep -q '"number_of_shards": 3' "$TRACK_HNSW_S3/index.json" || die "hnsw 3 分片改写失败"
   log "hnsw 3 分片变体已生成: $TRACK_HNSW_S3"
+}
+
+# ---------- 赛道准备（定义定版在 tracks/，这里只补 git 收不了的产物）----------
+# 赛道定义（index.json / challenges / operations / track.json）全部来自仓库 tracks/，
+# 运行前只补三类产物：① 语料软链（GB 级）② 查询集生成（hv1024 系）③ .offset 断点处理。
+# 压缩变体**不再生成目录**：压缩档与 source_reuse 由 --track-params 传给定版 index.json
+# 的条件块（{% if index_codec is defined %} / {% if source_reuse ... %}）。
+link_corpus() { # <赛道目录> <语料文件名> [候选源...]
+  local d="$1" f="$2"; shift 2
+  local src="" c
+  for c in "$@"; do [ -e "$c" ] && { src="$c"; break; }; done
+  if [ -z "$src" ]; then
+    log "  提示: 语料 $f 没有本地副本（track.json 里有 base-url 时 rally 会自行下载）"
+    return 0
+  fi
+  [ "$(readlink -f "$d/$f" 2>/dev/null)" = "$(readlink -f "$src")" ] && return 0
+  ln -sf "$src" "$d/$f"
+  log "  语料软链: $f → $src"
+}
+
+# 按 track.json 里声明的 source-file 物化语料软链（软链，不复制）
+prepare_track_corpus() { # <赛道目录>
+  local d="$1" f
+  for f in $(grep -o '"source-file"[[:space:]]*:[[:space:]]*"[^"]*"' "$d/track.json" 2>/dev/null \
+             | sed 's/.*"\([^"]*\)"$/\1/'); do
+    [ -e "$d/$f" ] && continue
+    case "$f" in
+      documents-1024.json)
+        [ -n "${HV_CORPUS:-}" ] && [ -f "${HV_CORPUS}" ] \
+          || die "$(basename "$d"): 需要 HV_CORPUS=1M×1024 维语料 JSON 路径"
+        link_corpus "$d" "$f" "$HV_CORPUS";;
+      documents.json.bz2)
+        link_corpus "$d" "$f" "$HOME/.rally/benchmarks/data/nested/documents.json.bz2";;
+      documents-2.json.bz2)
+        link_corpus "$d" "$f" "$HOME/.rally/benchmarks/data/geonames/documents-2.json.bz2";;
+      *) link_corpus "$d" "$f";;
+    esac
+  done
+}
+
+# hv1024 系查询集：官方 queries.json.bz2 前 2000 条（与 96 维 s3 赛道条数对齐）。
+# queries.json 不进 git（.gitignore）→ 缺失时按需生成。
+# ⚠️ 已有 queries.json 就**直接复用**（不重生成）：压测机上的它来自 ds-j1024 的查询集，
+# 而 truth.jsonl / queries-recall.jsonl 这两份 recall 真值正是按同一批查询算出来的 ——
+# 换一份 queries 就和真值对不上了，recall 数字直接作废。
+prepare_queries() { # <赛道目录>
+  local d="$1" q="$d/queries.json" n=2000
+  grep -q 'queries.json' "$d/track.py" 2>/dev/null || return 0
+  if [ ! -s "$q" ]; then
+    [ -n "${HV_QUERIES_BZ2:-}" ] && [ -f "${HV_QUERIES_BZ2}" ] \
+      || die "$(basename "$d"): 缺 queries.json，且未设 HV_QUERIES_BZ2=官方 queries.json.bz2 路径"
+    bzcat "$HV_QUERIES_BZ2" | head -n "$n" > "$q.tmp" && mv "$q.tmp" "$q" \
+      || { rm -f "$q.tmp"; die "$(basename "$d"): 查询集生成失败"; }
+    log "  查询集已生成（$n 条）: $q"
+  fi
+  local qd; qd=$(python3 -c "import json;print(len(json.loads(open('$q').readline())))" 2>/dev/null || echo 0)
+  [ "$qd" = "1024" ] || die "$(basename "$d"): 查询向量维度 $qd ≠ 1024"
+}
+
+prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处理
+  local tk d
+  for tk in "${TRACKS[@]}"; do
+    d=$(track_dir "$tk")
+    [ -d "$d" ] || die "赛道目录不存在: $d（$tk）"
+    prepare_track_corpus "$d"
+    prepare_queries "$d"
+    case "$tk" in
+      nested*)
+        # nested 语料与 rally 缓存共享 ingest 断点（续跑状态一致，别重复灌 1120 万条）
+        local off="$HOME/.rally/benchmarks/data/nested/documents.json.bz2.offset"
+        [ -e "$off" ] && ln -sf "$off" "$d/documents.json.bz2.offset";;
+      *)
+        # 其余赛道：清掉 .offset 断点（rally 会从旧断点续传 → 写段计量失真）
+        rm -f "$d"/documents-*.offset "$d"/*.offset 2>/dev/null;;
+    esac
+  done
+}
+
+# ds-*（维度扫描）赛道：语料软链修链 + 维度/条数/字节/查询维数自检。
+# ds-* 的定义还没进 git（语料与真值在 $ROOT/corpora-ds/），语料软链曾因目录搬迁全部
+# BROKEN → 这里按同名在 corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，
+# 记录落进 campaign 台账（不留档就只剩一句"当时看着对"）。
+prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道直接跳过）
+  local CORPORA_DS="${CORPORA_DS:-$ROOT/corpora-ds}"
+  local tk d dims f base cand want_n want_b srcf corpus real_b qdims got
+  [ -d "$CORPORA_DS" ] || die "语料目录不存在: $CORPORA_DS（可用 CORPORA_DS= 指定）"
+  for tk in "$@"; do
+    case "$tk" in ds-*) ;; *) continue;; esac   # 混跑时非 ds 赛道不归这里管
+    d="$ROOT/tracks/$tk"
+    [ -d "$d" ] || die "赛道目录不存在: $d"
+    dims=$(track_dims "$tk") || die "未知赛道名: $tk"
+
+    # ① 修链：软链断了就在 corpora-ds 里按同名找回来
+    for f in "$d"/*.json "$d"/*.jsonl; do
+      [ -L "$f" ] || continue
+      [ -e "$f" ] && continue                      # 链还通，不动
+      base=$(basename "$(readlink "$f")")
+      cand="$CORPORA_DS/$base"
+      if [ -e "$cand" ]; then
+        ln -sfn "$cand" "$f"
+        log "  $tk: 修复软链 $(basename "$f") → $cand"
+      else
+        die "$tk: 软链断了且语料目录里找不到 $base（$f → $(readlink "$f")）"
+      fi
+    done
+
+    # ② 清 .offset 断点（rally 会从旧断点续传，write 计量失真）
+    for f in "$d"/*.offset; do [ -e "$f" ] || continue; rm -f "$f"; done
+
+    # ③ 自检：维度 / 条数 / 字节 / 查询维数
+    got=$(grep -o '"dims"[[:space:]]*:[[:space:]]*[0-9]*' "$d/index.json" | head -1 | grep -o '[0-9]*$')
+    [ "$got" = "$dims" ] || die "$tk: index.json dims=$got ≠ 赛道维度 $dims"
+    want_n=$(grep -o '"document-count"[[:space:]]*:[[:space:]]*[0-9]*' "$d/track.json" | head -1 | grep -o '[0-9]*$')
+    want_b=$(grep -o '"uncompressed-bytes"[[:space:]]*:[[:space:]]*[0-9]*' "$d/track.json" | head -1 | grep -o '[0-9]*$')
+    srcf=$(grep -o '"source-file"[[:space:]]*:[[:space:]]*"[^"]*"' "$d/track.json" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    corpus="$d/$srcf"
+    [ -e "$corpus" ] || die "$tk: 语料不可达: $corpus"
+    real_b=$(stat -Lc '%s' "$corpus")
+    [ -n "$want_b" ] && [ "$want_b" != "$real_b" ] && die "$tk: 语料字节数漂移 $real_b ≠ track.json 声明 $want_b"
+    qdims=$(head -1 "$d/queries.json" 2>/dev/null | python3 -c 'import sys,json; a=json.load(sys.stdin); print(len(a) if isinstance(a,list) else len(a.get("emb",[])))' 2>/dev/null)
+    [ "$qdims" = "$dims" ] || die "$tk: 查询向量维数 $qdims ≠ 赛道维度 $dims"
+    for f in truth.jsonl queries-recall.jsonl; do
+      [ -e "$d/$f" ] || die "$tk: $f 不可达（recall 探针依赖它）"
+    done
+    log "  $tk: 自检通过 dims=$dims docs=${want_n:-?} bytes=$real_b"
+    [ -n "${CAMP_DIR:-}" ] && [ -f "$CAMP_DIR/PACKAGES.txt" ] && \
+      printf '%s: 自检通过 dims=%s docs=%s bytes=%s corpus=%s\n' \
+        "$tk" "$dims" "${want_n:-?}" "$real_b" "$corpus" >> "$CAMP_DIR/PACKAGES.txt"
+  done
+  # ④ esrally info 自检（挑战名/操作名能解析）
+  for tk in "$@"; do
+    case "$tk" in ds-*) ;; *) continue;; esac
+    local out; out=$("$RALLY" info --track-path="$ROOT/tracks/$tk" 2>&1) || {
+      echo "$out" | tail -15
+      die "$tk: esrally info 失败"
+    }
+    log "  $tk: esrally info 通过"
+  done
 }
 
 # ds-*（维度扫描）赛道：目录固定在 $ROOT/tracks/<名字>，索引名 vectors
@@ -1065,38 +1208,24 @@ fi
 prepare_hnsw_s3
 [ -d "$TRACK_HNSW_S3" ] || die "hnsw 3 分片变体准备失败"
 
-case " ${TRACKS[*]} " in *" hv1024 "*)
-  ./prepare-hv1024-track.sh || die "hv1024 赛道准备失败"
-  [ -d "$TRACK_HV1024" ] || die "hv1024 赛道准备失败"
-;; esac
+# 赛道准备：定义已定版在仓库 tracks/，这里只补 git 不入库的产物（语料软链 / 查询集 / 断点）
+prepare_tracks
 
-case " ${TRACKS[*]} " in *" nested "*)
-  ./prepare-nested-track.sh || die "nested 赛道准备失败"
-  [ -d "$TRACK_NESTED_S3" ] || die "nested 赛道准备失败"
-;; esac
+# 存储参数守卫：定版 index.json 缺条件块 → 压缩档/source_reuse 静默失效
+# （各臂跑成同一个，数据看着正常、结论全废）→ 起跑前挡住
+for _t in "${TRACKS[@]}"; do track_assert_storage_params "$_t"; done
 
-# 压缩变体：按**规范 id** 收集（历史短名 gdef/gzstd/gbc 先归一），按需生成。
-# 变体目录名 = 规范 id，所以任意基础赛道的变体都能用同一套逻辑。
-_variants=()
-for _t in "${TRACKS[@]}"; do
-  if track_is_variant "$_t"; then _variants+=("$(track_canonical "$_t")"); fi
-done
-if [ ${#_variants[@]} -gt 0 ]; then
-  ./prepare-codec-track.sh ${_variants[@]+"${_variants[@]}"} || die "codec 赛道变体准备失败"
-  for d in ${_variants[@]+"${_variants[@]}"}; do
-    [ -d "$ROOT/tracks/$d" ] || die "codec 赛道变体缺失: $ROOT/tracks/$d"
+# 存储设置台账：压缩档 / source_reuse 现在是 --track-params（不再烘进 index.json 副本），
+# 逐场可回溯靠这一段 —— 参数没落进台账，事后没法解释"这一场的索引设置是什么"
+{
+  echo "--- 存储设置（--track-params）---"
+  for _t in "${TRACKS[@]}"; do
+    echo "== $_t  dir=$(track_dir "$_t")  params=$(track_params "$_t")"
   done
-  # 烘进 index.json 的 settings 逐场可回溯：变体的 settings 差异 + VARIANT.txt 落一份台账
-  { echo "# codec 变体台账（settings 烘在副本 index.json，基座未改动）"
-    for d in ${_variants[@]+"${_variants[@]}"}; do
-      echo "== $d"; cat "$ROOT/tracks/$d/VARIANT.txt" 2>/dev/null
-    done; } > "$CAMP_DIR/CODEC-VARIANTS.txt"
-fi
+} >> "$CAMP_DIR/PACKAGES.txt"
 
 case " ${TRACKS[*]} " in *ds-*)
-  # CAMP_DIR 显式传下去：run-bench.sh 里它是普通 shell 变量（没 export），
-  # prepare 脚本要靠它把语料自检记录追加进本 campaign 的 PACKAGES.txt
-  CAMP_DIR="$CAMP_DIR" ./prepare-dimsweep-track.sh || die "ds-* 赛道准备失败"
+  prepare_ds_tracks "${TRACKS[@]}"
   for d in "${TRACKS[@]}"; do
     case "$d" in ds-*) [ -d "$ROOT/tracks/$d" ] || die "ds-* 赛道缺失: $ROOT/tracks/$d";; esac
   done

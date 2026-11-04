@@ -1,7 +1,39 @@
-变体 id:    hv1024x
-基础赛道:   hv1024（/opt/raceway/tracks/hv1024-s3）
-烘入设置:   无（hnsw m=32 efC=100，source excludes 基座）
-索引名:     vectors
-语料:       /testing/aijiami-perf-test/hv-bench/corpora/documents-jina-float.json（1,000,000 docs × 1024 维 float，22739096214 字节）
-_source:    excludes ["emb"]（docid 保留，向量不进 _source）
-生成:       setup-hv1024bbq.sh 20261103
+hv1024x 家族（1024 维量化/压缩四臂）—— 一份基座定义 + track-params 表达各臂
+════════════════════════════════════════════════════════════════════════════
+基座:      tracks/hv1024x（1M docs × 1024 维 float，dot_product，3 分片 0 副本，
+           HNSW m=32 / ef_construction=100，_source excludes ["emb"]）
+索引名:    vectors
+语料:      /testing/aijiami-perf-test/hv-bench/corpora/documents-jina-float.json
+           （1,000,000 docs × 1024 维 float，22739096214 字节）
+生成:      setup-hv1024bbq.sh 20261103（该脚本已退役）
+
+四臂（区别只在两个 track-params）：
+  臂                编排 id                     track-params
+  ─────────────────────────────────────────────────────────────────────
+  ES 基座 / ez 基座  hv1024x                     （无 → hnsw）
+  ES 标量量化        hv1024x-int8                vector_index_type:int8_hnsw
+  ES 二值量化        hv1024x-bbq                 vector_index_type:bbq_hnsw
+  ez 压缩变体        hv1024x-codec-zstd-sr       index_codec:ZSTD,source_reuse:true
+
+引擎兼容：
+  int8_hnsw / bbq_hnsw   两侧通用（ES 8.19.23 与 Easysearch 2.5.1 都能建，
+                         2026-11-03 hvbbq campaign 15 场已实跑）
+  ZSTD + source_reuse    仅 Easysearch（ES 认不了这两个设置）
+
+为什么收成一份：
+  四臂原本是四份目录，只差 index.json 里的一行（index_options.type / codec）。
+  同一份定义散在四个目录 = 改了一处忘了另一处的漂移风险。现在各臂的差异
+  全部由 track-params 显式表达，index.json 只有一份。
+  数据侧本来也是这个口径（入库按实测的 knn_index_type / codec / source_reuse
+  三列归类，hv1024x-int8 / -bbq 由 bench-history.base_of 剥后缀归到本基座）。
+
+⚠️ 静默失效风险（因此起跑前有守卫）：
+  index_options.type 在 **mappings** 里，不在 settings —— 条件块缺失时
+  rally 不报错，但该臂会静默跑成 hnsw 基座（"int8 跑过"其实跑的是 fp32）。
+  vm-bench-lib.sh 的 track_assert_storage_params 会检查定版 index.json 里有没有
+  vector_index_type / index_codec / source_reuse 条件块，缺一个就起跑前拦下。
+
+建索引探针：challenges/create-only.json（只建索引就停）——2026-11-03 ezs 臂
+  （ZSTD+source_reuse 撞 dense_vector）就是用它复现的：create-index 探针
+  err=1.0，查询全挂、写入"成功"，落盘膨胀 9 倍。结论见
+  REPORT-hvbbq-1024维量化压缩对比-20261104.md。

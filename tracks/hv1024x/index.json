@@ -3,7 +3,7 @@
     "index": {
       "number_of_shards": 3,
       "number_of_replicas": 0
-    }
+    }{% if index_codec is defined %}, "index.codec": "{{index_codec}}"{% endif %}{% if source_reuse is defined and source_reuse %}, "index.source_reuse": true{% endif %}
   },
   "mappings": {
     "dynamic": "false",
@@ -13,7 +13,7 @@
       "emb": {
         "type": "dense_vector", "dims": 1024,
         "index": true, "similarity": "dot_product",
-        "index_options": { "type": "hnsw", "m": 32, "ef_construction": 100 }
+        "index_options": { "type": "{{vector_index_type | default('hnsw')}}", "m": 32, "ef_construction": 100 }
       }
     }
   }

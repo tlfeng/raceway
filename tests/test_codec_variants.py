@@ -6,7 +6,7 @@
 
 | 实现 | 文件 | 谁用 |
 |---|---|---|
-| bash | `vm-bench-lib.sh` 的 track_canonical / track_base / track_compression / track_source_reuse / track_engines | runner（起跑前 fail-fast）、prepare 脚本 |
+| bash | `vm-bench-lib.sh` 的 track_canonical / track_base / track_compression / track_source_reuse / track_engines | runner（起跑前 fail-fast）、编排台侧参数拼装 |
 | python | `bench-history.py` 的同名函数 | 编排台（车×变体兼容矩阵）、入库/覆盖判定 |
 
 两边**必须**给出同样的答案，否则会出现"编排台说能跑、runner 跑不了"，
@@ -178,7 +178,7 @@ class TestCatalog(unittest.TestCase):
 
 
 class TestTrackParams(unittest.TestCase):
-    """分片口径：canonical 变体与 legacy 别名必须拿到同一份 track-params。
+    """track-params 口径：分片 + 存储设置（压缩档 / source_reuse）。
 
     geonames 的 index.json 是 Jinja 模板，分片数写的是
     `{{number_of_shards | default(5)}}` —— 不传 track-params 就落到模板默认的
@@ -187,9 +187,24 @@ class TestTrackParams(unittest.TestCase):
 
     这条曾经真的漏过：runner 原来按 id 名单判断（只列了 geo/nested 与几个
     legacy 短别名），canonical 名（geo-codec-*）不在名单里 → 静默走 5 分片。
+
+    压缩档与 source_reuse 现在也走 track-params（`index_codec:` / `source_reuse:true`），
+    由定版 index.json 的条件块写入 settings —— 变体不再另建目录。
     """
 
     PARAMS = 'number_of_shards:3,number_of_replicas:0'
+    # 变体 id → 期望的存储参数后缀（压缩档 + source_reuse 开关）
+    STORAGE = {
+        'gdef': ',index_codec:default',
+        'gzstd': ',index_codec:ZSTD,source_reuse:true',
+        'gbc': ',index_codec:best_compression',
+        'geo-codec-def': ',index_codec:default',
+        'geo-codec-def-sr': ',index_codec:default,source_reuse:true',
+        'geo-codec-zstd': ',index_codec:ZSTD',
+        'geo-codec-zstd-sr': ',index_codec:ZSTD,source_reuse:true',
+        'geo-codec-bc': ',index_codec:best_compression',
+        'geo-codec-bc-sr': ',index_codec:best_compression,source_reuse:true',
+    }
 
     def test_geo_family_gets_shard_params(self):
         """模板类基座（geo 族 + nested）必须传分片口径。"""
@@ -201,7 +216,8 @@ class TestTrackParams(unittest.TestCase):
         b = bash_derive('track_params', ids)
         for i in ids:
             self.assertIn(i, b, 'bash function did not run: %s' % i)
-            self.assertEqual(b[i], self.PARAMS, '分片口径不对: %s' % i)
+            want = self.PARAMS + self.STORAGE.get(i, '')
+            self.assertEqual(b[i], want, 'track-params 不对: %s' % i)
 
     def test_all_codec_names_share_one_params(self):
         """6 个 canonical 变体 + 3 个 legacy 别名，分片口径必须完全一致。
@@ -216,16 +232,60 @@ class TestTrackParams(unittest.TestCase):
         b = bash_derive('track_params', ids)
         for i in ids:
             self.assertIn(i, b, 'bash function did not run: %s' % i)
-            self.assertEqual(b[i], self.PARAMS, '分片口径不对: %s' % i)
+            self.assertTrue(b[i].startswith(self.PARAMS),
+                            '分片口径不对: %s → %s' % (i, b[i]))
+
+    def test_storage_params_follow_the_variant(self):
+        """压缩档 / source_reuse 必须跟着变体 id 走，且与 legacy 别名一一对应。
+
+        压缩档走 track-params 之后，索引设置就**只**由这两个参数决定 ——
+        少传一个 = 几个臂跑成同一个压缩档，而 rally 不会报错。
+        """
+        ids = list(self.STORAGE)
+        b = bash_derive('track_params', ids)
+        for i in ids:
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], self.PARAMS + self.STORAGE[i],
+                             '存储参数不对: %s → %s' % (i, b[i]))
+        # legacy 别名与 canonical 必须等价（gzstd = geo-codec-zstd-sr）
+        self.assertEqual(b['gzstd'], b['geo-codec-zstd-sr'], 'gzstd 别名与 canonical 不等价')
+        self.assertEqual(b['gdef'], b['geo-codec-def'], 'gdef 别名与 canonical 不等价')
+        self.assertEqual(b['gbc'], b['geo-codec-bc'], 'gbc 别名与 canonical 不等价')
+
+    def test_source_reuse_not_passed_when_off(self):
+        """source_reuse 关的变体**不能**传 source_reuse 参数。
+
+        index.json 的条件块是 `source_reuse is defined and source_reuse` ——
+        传字符串 "false" 在 Jinja 里是非空字符串（真值）→ 反而把 Easysearch 专有
+        设置打开了。所以只能"开就传、关就不传"。
+        """
+        ids = ['geo-codec-def', 'geo-codec-zstd', 'geo-codec-bc']
+        b = bash_derive('track_params', ids)
+        for i in ids:
+            self.assertNotIn('source_reuse', b[i],
+                             'source_reuse 关的变体不该传该参数: %s → %s' % (i, b[i]))
 
     def test_baked_tracks_get_nothing(self):
-        """分片已烘进 index.json 的赛道不传 track-params。"""
-        ids = ['hnsw', 'hv1024', 'ds-j1024', 'ds-g1920',
-               'hnsw-codec-zstd', 'hnsw-codec-def']
+        """分片已烘进 index.json 的赛道不传分片参数（存储参数另算）。"""
+        ids = ['hnsw', 'ds-j1024', 'ds-g1920']
         b = bash_derive('track_params', ids)
         for i in ids:
             self.assertIn(i, b, 'bash function did not run: %s' % i)
             self.assertEqual(b[i], '', '不该传分片参数: %s' % i)
+
+    def test_baked_base_still_carries_storage_params(self):
+        """基座分片已烘进 index.json 的压缩变体：分片不传，存储参数照传。"""
+        b = bash_derive('track_params', ['hnsw-codec-zstd', 'hnsw-codec-def'])
+        self.assertEqual(b['hnsw-codec-zstd'], 'index_codec:ZSTD')
+        self.assertEqual(b['hnsw-codec-def'], 'index_codec:default')
+
+    def test_hv1024_gets_shard_params(self):
+        """hv1024 的定版 index.json 已参数化分片 → 必须传，否则落到模板默认 3。
+
+        （旧版是 prepare 脚本硬写的 3 分片副本；定版后走 params，口径与 geo 族一致。）
+        """
+        b = bash_derive('track_params', ['hv1024'])
+        self.assertEqual(b['hv1024'], self.PARAMS)
 
     def test_shards_knob_is_honored(self):
         """SHARDS / REPLICAS 旋钮要真的生效（不能写死）。"""
@@ -239,7 +299,8 @@ class TestTrackParams(unittest.TestCase):
                 "SHARDS=5; REPLICAS=1\n"
                 "track_params geo-codec-def\n" % _bash_path(d))
             p = _run_bash(script, d)
-        self.assertEqual(p.stdout.strip(), 'number_of_shards:5,number_of_replicas:1')
+        self.assertEqual(p.stdout.strip(),
+                         'number_of_shards:5,number_of_replicas:1,index_codec:default')
 
 
 class TestTrackNameHelpText(unittest.TestCase):
@@ -394,26 +455,72 @@ class TestTrackNameHelpText(unittest.TestCase):
         bad = [n for n in names if self.REJECT in res.get(n, '')]
         self.assertEqual(bad, [], 'list 菜单里的赛道名被拒: %s' % bad)
 
-class TestPrepareDefaults(unittest.TestCase):
-    """prepare 脚本的默认变体集合要与清单里的 geo 族一致。"""
+class TestFrozenTrackDefinitions(unittest.TestCase):
+    """赛道定义定版在 tracks/ —— 压缩档靠条件块 + track-params，不再靠脚本烘副本。
 
-    def test_default_variants_match_catalog(self):
-        with open(os.path.join(ROOT, 'prepare-codec-track.sh'), encoding='utf-8') as f:
-            text = f.read()
-        line = [l for l in text.splitlines() if l.startswith('DEFAULT_VARIANTS=')][0]
-        defaults = line.split('=', 1)[1].strip().strip('"').split()
-        geo_family = sorted(n for n, v in C.TRACK_CATALOG.items()
-                            if v['base'] == 'geo' and v['variant'])
-        self.assertEqual(sorted(defaults), geo_family,
-                         'prepare 默认变体集合与清单里的 geo 族不一致')
+    两条断言方向相反，都要守住：
+      · 定版 index.json **必须**有 index_codec / source_reuse 条件块（否则压缩档
+        静默失效：参数传了，settings 里没有，几个臂跑成同一个）；
+      · 仓库里**不许**再有"运行时生成赛道定义"的脚本（那正是这次删掉的东西，
+        再加回来就又有了"脚本产物与 git 定义不一致"的老坑）。
+    """
 
-    def test_prepare_accepts_any_base(self):
-        """prepare 必须支持任意基础赛道（不只是 geonames）。"""
-        with open(os.path.join(ROOT, 'prepare-codec-track.sh'), encoding='utf-8') as f:
-            text = f.read()
-        self.assertIn('track_base', text)      # 基础赛道由规则推导
-        self.assertIn('track_canonical', text)  # 历史短名归一
-        self.assertIn('targets=("$@")', text)   # 可传变体 id
+    TRACKS = ['geonames', 'hv1024', 'nested']
+
+    def test_frozen_index_json_has_codec_conditions(self):
+        for t in self.TRACKS:
+            p = os.path.join(ROOT, 'tracks', t, 'index.json')
+            self.assertTrue(os.path.isfile(p), '缺少定版 index.json: %s' % p)
+            with open(p, encoding='utf-8') as f:
+                txt = f.read()
+            self.assertIn('index_codec', txt, '%s 缺 index_codec 条件块' % p)
+            self.assertIn('source_reuse', txt, '%s 缺 source_reuse 条件块' % p)
+
+    def test_geonames_has_write_and_query_challenges(self):
+        """full 挑战是运行时从 write-only + query-only 派生的，两者缺一不可。"""
+        ch = os.path.join(ROOT, 'tracks', 'geonames', 'challenges')
+        for f in ('write-only.json', 'query-only.json'):
+            p = os.path.join(ch, f)
+            self.assertTrue(os.path.isfile(p), '缺少挑战定义: %s' % p)
+            with open(p, encoding='utf-8') as fh:
+                txt = fh.read()
+            self.assertIn('"name": "%s"' % f[:-5], txt, '%s 的挑战名不对' % p)
+
+    def test_no_runtime_track_generator_scripts(self):
+        """仓库里不许再有 prepare-*.sh 之类的"运行时生成赛道定义"的脚本。"""
+        leftovers = [f for f in os.listdir(ROOT)
+                     if f.startswith('prepare-') and f.endswith('.sh')]
+        self.assertEqual(leftovers, [],
+                         '赛道定义已定版进 tracks/，这些生成脚本不该回来: %s' % leftovers)
+
+    def test_codec_ids_still_resolve(self):
+        """6 个 canonical 变体 id 仍然可用（编排记账靠它们，目录不再存在）。"""
+        ids = ['geo-codec-def', 'geo-codec-def-sr',
+               'geo-codec-zstd', 'geo-codec-zstd-sr',
+               'geo-codec-bc', 'geo-codec-bc-sr']
+        b = bash_derive('track_dir', ids)
+        for i in ids:
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], '/opt/raceway/tracks/geonames',
+                             '变体应指向基座目录（压缩档走 params）: %s → %s' % (i, b[i]))
+
+    def test_quant_arms_share_one_directory(self):
+        """量化族四臂共用一份基座目录 —— 差异由 track-params 表达，不另存目录。"""
+        ids = ['hv1024x', 'hv1024x-int8', 'hv1024x-bbq', 'hv1024x-codec-zstd-sr']
+        b = bash_derive('track_dir', ids)
+        for i in ids:
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], '/opt/raceway/tracks/hv1024x',
+                             '量化族应指向同一份基座定义: %s → %s' % (i, b[i]))
+
+    def test_quant_arms_carry_their_params(self):
+        """量化档走 vector_index_type；压缩档走 index_codec + source_reuse（两个独立维度）。"""
+        b = bash_derive('track_params',
+                        ['hv1024x', 'hv1024x-int8', 'hv1024x-bbq', 'hv1024x-codec-zstd-sr'])
+        self.assertEqual(b['hv1024x'], '', '基座臂不该带任何处理变量')
+        self.assertEqual(b['hv1024x-int8'], 'vector_index_type:int8_hnsw')
+        self.assertEqual(b['hv1024x-bbq'], 'vector_index_type:bbq_hnsw')
+        self.assertEqual(b['hv1024x-codec-zstd-sr'], 'index_codec:ZSTD,source_reuse:true')
 
 
 class TestDatasetLabels(unittest.TestCase):

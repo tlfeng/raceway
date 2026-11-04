@@ -189,8 +189,7 @@ def render_cars(cars, tag):
 # ds-* 用现成排程 dimsweep-24.conf 里的值 —— 那是在用口径，别另起一套。
 # 名字 → (展示名, est 默认分钟, 数据集标注)
 #
-# ds-* 族有**两套不同的数据集**（赛道名里的血统字母，见 prepare-dimsweep-track.sh
-# "ds-<血统><维度>；j=jina 系，g=GIST 系"）：
+# ds-* 族有**两套不同的数据集**（赛道名里的血统字母，j=jina 系，g=GIST 系）：
 #   jina 系：ds-j512 / ds-j768 / ds-j1024 / ds-j1536 / ds-j2048
 #   GIST 系：ds-g960 / ds-g1920
 # 两套都是 1M docs、float、dot_product HNSW，差的是**向量数据集本身** ——

@@ -41,8 +41,9 @@ tracks/**/truth.jsonl
 tracks/**/challenges/full.json
 
 # —— 部署机（/testing/raceway）本地留档：只留机器上，不入库 ——
-# prepare-*.sh 生成的赛道变体（幂等可再生；静态基座 geonames/hv1024/nested
-# 与 hv1024x 家族仍在库内）
+# 赛道定义已定版进库（tracks/geonames、tracks/hv1024、tracks/nested、tracks/hv1024x*）。
+# 下面这些只留在机器上：旧变体目录（切换前的残留）、ds-* 定义（还没回灌）、
+# hnsw2m-2m-s3（由 run-bench 的 prepare_hnsw_s3 生成）
 tracks/ds-*/
 tracks/geo-codec-*/
 tracks/hnsw-codec-*/
