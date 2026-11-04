@@ -218,22 +218,28 @@ force_merge_to_one() { # <index> <max_wait_sec>
 # 条件操作，rally 保证完成后才跑后续 op）；编排侧段数卡点（SEG-ASSERT）随拆分
 # 协议退役 —— merge 结果无验证是接受的取舍。
 derive_full_challenge() { # <track_dir> —— 从 write-only + query-only 拼出 challenges/full.json（幂等）
-  local dir="$1" w="$1/challenges/write-only.json" q="$1/challenges/query-only.json" out="$1/challenges/full.json"
+  # 2026-10-29 补丁（上游 0ed6911 缺陷，三处）：
+  #  (1) 原实现只认 challenges/write-only.json 与 challenges/query-only.json 两个独立文件；
+  #      geonames(codec-bench) 与 hnsw2m 把这两个挑战写在同一个 challenges/default.json（数组）里 → 派生失败 → 整场 RACE-FAIL。
+  #      本版：独立文件优先；否则遍历 challenges/*.json 按挑战名定位其 schedule 数组。
+  #  (2) 原自检把 {{占位}} 一律替换成 "X"，当占位符在引号内（"{{x}}"）会变成 ""X"" → 非法 JSON → 误判失败；
+  #      且 geo 赛道带 {%- if %} jinja 语句块。改进：先剥离语句标签 → 引号内占位→"X" → 裸占位→"X"；自检降级为告警（真错由 rally 拦）。
+  #  (3) 写段与查段合并后出现**重名任务** → rally 报 "contains multiple tasks with the name 'X'" → 整场 RACE-FAIL。
+  #      rally 的任务名规则：显式 "name" 优先，否则用 operation-type（再否则用 operation 字符串）。
+  #      本版：逐操作算有效任务名，冲突者显式补名（-2/-3…），保证挑战内唯一。
+  local dir="$1" out="$1/challenges/full.json"
   [ -s "$out" ] && return 0
-  if [ ! -s "$w" ] || [ ! -s "$q" ]; then
-    log "  full challenge 派生失败: $dir 缺 write-only/query-only"
-    return 1
-  fi
-  python3 - "$w" "$q" "$out" <<'PY' || return 1
-import json, re, sys
+  python3 - "$dir" "$out" <<'PY' || return 1
+import os, re, json, sys
 
-def schedule_of(path):
-    """取 challenge 文件里 schedule 数组的原文（文件含 jinja 模板，不能 json.load）。"""
-    txt = open(path, encoding="utf-8").read()
-    i = txt.index('"schedule"')
-    i = txt.index("[", i)
+d, out_path = sys.argv[1], sys.argv[2]
+ch_dir = os.path.join(d, "challenges")
+
+
+def arr_content_at(txt, i):
+    """txt[i]=='[' 处的数组**内容**原文（括号配平；字符串/转义感知）。"""
     depth, j, in_str, esc = 0, i, False, False
-    while True:
+    while j < len(txt):
         c = txt[j]
         if in_str:
             if esc:
@@ -252,24 +258,162 @@ def schedule_of(path):
                 if depth == 0:
                     return txt[i + 1:j]
         j += 1
+    return None
 
-w_path, q_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-w = schedule_of(w_path).strip().rstrip(",")
-q = schedule_of(q_path).strip().rstrip(",")
-merge = ""
-if '"force-merge"' not in w:  # 写段已自带 merge（如 nested-s3）就不重复插
-    merge = ''',
-        { "operation": { "operation-type": "force-merge", "max-num-segments": 1,
-                         "request-timeout": 7200 } },
-        { "name": "refresh-after-force-merge", "operation": "refresh" },
-        { "name": "wait-until-merges-finish",
-          "operation": { "operation-type": "index-stats", "index": "_all",
-            "condition": { "path": "_all.total.merges.current", "expected-value": 0 },
-            "retry-until-success": true, "include-in-reporting": false } }'''
+
+def split_top_level_ops(content):
+    """把 schedule 数组内容切成顶层操作对象的文本列表（保持原样）。"""
+    ops, i, n = [], 0, len(content)
+    while i < n:
+        c = content[i]
+        if c in " \t\r\n,":
+            i += 1
+            continue
+        if c != "{":
+            i += 1
+            continue
+        start = i
+        depth, in_str, esc = 0, False, False
+        while i < n:
+            ch = content[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in "[{":
+                    depth += 1
+                elif ch in "]}":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+            i += 1
+        ops.append(content[start:i])
+    return ops
+
+
+def op_fields(op_text):
+    """返回 (显式 name 或 None, operation-type 或 operation 字符串 或 None)。"""
+    op_idx = op_text.find('"operation"')
+    name_m = re.search(r'"name"\s*:\s*"([^"]+)"', op_text)
+    explicit = None
+    if name_m and (op_idx < 0 or name_m.start() < op_idx):
+        explicit = name_m.group(1)
+    otype = None
+    tm = re.search(r'"operation-type"\s*:\s*"([^"]+)"', op_text)
+    if tm:
+        otype = tm.group(1)
+    else:
+        sm = re.search(r'"operation"\s*:\s*"([^"]+)"', op_text)
+        if sm:
+            otype = sm.group(1)
+    return explicit, otype
+
+
+def uniquify_ops(ops):
+    """rally 要求挑战内任务名唯一：有效名 = 显式 name，否则 operation-type。冲突者显式补名。"""
+    seen = {}
+    out_ops = []
+    for op in ops:
+        explicit, otype = op_fields(op)
+        eff = explicit or otype
+        if eff is None:
+            out_ops.append(op)
+            continue
+        seen[eff] = seen.get(eff, 0) + 1
+        if seen[eff] == 1:
+            out_ops.append(op)
+            continue
+        new_name = "%s-%d" % (eff, seen[eff])
+        if explicit:
+            op = re.sub(r'"name"\s*:\s*"%s"' % re.escape(explicit),
+                        '"name": "%s"' % new_name, op, count=1)
+        else:
+            op = op[:1] + '"name": "%s", ' % new_name + op[1:]
+        out_ops.append(op)
+    return out_ops
+
+
+def named_schedule(path, want):
+    """取文件里名为 want 的挑战对象的 schedule 数组内容（文本级，保留 jinja 占位）。"""
+    try:
+        txt = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.search(r'"name"\s*:\s*"%s"' % re.escape(want), txt)
+    if not m:
+        return None
+    i = txt.find('"schedule"', m.end())
+    if i < 0:
+        return None
+    j = txt.find("[", i)
+    if j < 0:
+        return None
+    return arr_content_at(txt, j)
+
+
+def find(want):
+    p = os.path.join(ch_dir, want + ".json")
+    if os.path.isfile(p):
+        s = named_schedule(p, want)
+        if s:
+            return s
+    for fn in sorted(os.listdir(ch_dir)):
+        if not fn.endswith(".json") or fn in (want + ".json", "full.json"):
+            continue
+        if ".bak" in fn:
+            continue
+        s = named_schedule(os.path.join(ch_dir, fn), want)
+        if s:
+            return s
+    return None
+
+
+w = find("write-only")
+q = find("query-only")
+if not w or not q:
+    sys.stderr.write("  full challenge 派生失败: %s 缺 write-only/query-only\n" % d)
+    sys.exit(1)
+
+w = w.strip().rstrip(",")
+q = q.strip().rstrip(",")
+merge_ops = []
+if '"force-merge"' not in w:  # 写段已自带 merge（如 nested-s3 / geonames write-only）就不重复插
+    merge_ops = [
+        '{ "operation": { "operation-type": "force-merge", "max-num-segments": 1,'
+        ' "request-timeout": 7200 } }',
+        '{ "name": "refresh-after-force-merge", "operation": "refresh" }',
+        '{ "name": "wait-until-merges-finish",'
+        ' "operation": { "operation-type": "index-stats", "index": "_all",'
+        ' "condition": { "path": "_all.total.merges.current", "expected-value": 0 },'
+        ' "retry-until-success": true, "include-in-reporting": false } }',
+    ]
+
+ops = split_top_level_ops(w) + merge_ops + split_top_level_ops(q)
+ops = uniquify_ops(ops)
+sched = ",\n".join(ops)
 out = ('{\n  "name": "full",\n  "description": '
        '"Indexes the corpus, force-merges to one segment and runs the full query set in one race.",\n'
-       '  "schedule": [\n' + w + merge + ',\n' + q + '\n  ]\n}\n')
-json.loads(re.sub(r"\{\{.*?\}\}", '"X"', out, flags=re.S))  # 括号配平自检（jinja 占位替换成字符串）
+       '  "schedule": [\n' + sched + '\n  ]\n}\n')
+
+# 自检（告警级）：先剥 jinja 语句标签，再替换占位
+chk = re.sub(r"\{%.*?%\}", "", out, flags=re.S)
+chk = re.sub(r'"\{\{.*?\}\}"', '"X"', chk, flags=re.S)
+chk = re.sub(r"\{\{.*?\}\}", '"X"', chk, flags=re.S)
+try:
+    parsed = json.loads(chk)
+    if not parsed.get("schedule"):
+        raise ValueError("schedule 为空")
+    print("  full challenge 自检通过（%d 段）" % len(parsed["schedule"]))
+except Exception as e:
+    sys.stderr.write("  ⚠ full challenge 自检未通过（不阻断，交由 rally 校验）: %s\n" % e)
+
 open(out_path, "w", encoding="utf-8").write(out)
 print("full challenge 派生 →", out_path)
 PY
