@@ -42,7 +42,26 @@ DOCS = {"track": 11396503, "hnsw2m-2m-s3": 2000000, "nested-s3": 11203029,
         # 语料与基座同一份 → doc 数相同）
         "geo-codec-def": 11396503, "geo-codec-def-sr": 11396503,
         "geo-codec-zstd": 11396503, "geo-codec-zstd-sr": 11396503,
-        "geo-codec-bc": 11396503, "geo-codec-bc-sr": 11396503}
+        "geo-codec-bc": 11396503, "geo-codec-bc-sr": 11396503,
+        # ds-* 的 rally track 字段是同名形式（实测 track_raw）
+        "ds-j512": 1000000, "ds-j768": 1000000, "ds-j1024": 1000000,
+        "ds-j1536": 1000000, "ds-j2048": 1000000, "ds-g960": 1000000,
+        "ds-g1920": 1000000}
+# 语料名登记表（rally track 字段原值 → corpus_name），与 DOCS 并排用于 sidecar 缺席时兜底。
+# track ↔ corpus 严格 1:1（rally track 定义自带 corpora）；hvtp200k 一次性批次不登记不臆造。
+CORPUS_NAME = {"track": "geonames", "nested": "nested", "nested-s3": "nested",
+               "hnsw2m-2m-s3": "dense-vector", "hv1024-s3": "dense-vector-1024",
+               "geo-codec-def": "geonames", "geo-codec-def-sr": "geonames",
+               "geo-codec-zstd": "geonames", "geo-codec-zstd-sr": "geonames",
+               "geo-codec-bc": "geonames", "geo-codec-bc-sr": "geonames",
+               "ds-j512": "dense-vector-512", "ds-j768": "dense-vector-768",
+               "ds-j1024": "dense-vector-1024", "ds-j1536": "dense-vector-1536",
+               "ds-j2048": "dense-vector-2048", "ds-g960": "dense-vector-960",
+               "ds-g1920": "dense-vector-1920",
+               "dsj512-s3": "dense-vector-512", "dsj768-s3": "dense-vector-768",
+               "dsj1024-s3": "dense-vector-1024", "dsj1536-s3": "dense-vector-1536",
+               "dsj2048-s3": "dense-vector-2048", "dsg960-s3": "dense-vector-960",
+               "dsg1920-s3": "dense-vector-1920"}
 TRACK_NAME = {"track": "geo", "hnsw2m-2m-s3": "hnsw", "nested-s3": "nested", "hv1024-s3": "hv1024"}
 
 
@@ -92,7 +111,7 @@ CANON_CODEC = ("default", "zstd", "best_compression")
 # 规范赛道名封闭词表（12 个）。归一后命中不了登记表的场次**不写库**：
 # 归一不出来说明这一场的赛道身份不可信（实测：fid 形态脏、user_tags.track 是解析器
 # 写坏的字面量），留着它只会把看板的分线带偏 —— 挡住比带偏强。
-CANON_TRACK = ("geo", "hnsw", "nested", "hv1024",
+CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024",
                "hvtp200k-2s", "hvtp200k-3s",
                "ds-j512", "ds-j768", "ds-j1024", "ds-j2048",
                "ds-g960", "ds-g1920")
@@ -152,8 +171,9 @@ METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
 #      （实测教训：strict 下漏 unit_original → 7.9 万行只进 2442 行）。
 # 字段分四类（存储方案 §一）：
 #   身份正交六列      engine / version / engine_build / jdk_vendor / jdk_version / series_key
-#   声明证据列        jdk_want / jdk_measured / jdk_match_want / pkg* / heap_declared / cores_tag…
-#                     ——「编排当时想要什么」与「赛末实测到什么」分开存，比较永远以实测列为准
+#   声明证据列        jdk_want / jdk_measured / jdk_match_want / heap_declared / heap_measured / cores_declared / cores_tag…
+#                     —— 「想要什么」回显与「实测对账」双层均已退役：配置列只存实际生效值，
+#                     漂移检查由编排 heap_assert 起跑前承担；pkg* 保留（溯源）
 #   run 维度          track / campaign / round / dims / codec / env_id…
 #   派生便利列        write_task_duration_s / throughput_docs_per_s_whole（报表用，非看板聚合口径）
 #                     store_size_gb_post_merge / segments_post_merge（赛末 forcemerge 后快照）
@@ -162,24 +182,24 @@ METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
 # sidecar 源层仍保留原始值，需要时可从 pkg 重推。
 RACE_FIELDS = frozenset((
     "_index", "_id",
-    # 主键与时间。race_id 现在是**一次测量**的确定性标识（不再是 uuid）：
-    # {campaign}|{车}-{赛道}-r{轮}|a{attempt}。可重算 → 重跑同一批次 upsert 覆盖，
-    # 不像 uuid 那样每次导出都堆一批新行。
-    "race_id", "@timestamp", "run_start", "campaign", "attempt",
+    # 主键与时间。race_id 照搬 rally 原生 race-id（uuid，取主段；同批重跑双跑
+    # 字节一致幂等实测），另一段 race-id 记在 source。中途试过确定性键
+    # {campaign}|{车}-{赛道}-r{轮}|a{attempt}，已废——非 VALID 重试场与 rally
+    # 原生记账对不上，2026-11-03 用户拍板回归原生。
+    "race_id", "@timestamp", "run_start", "campaign",
     # 身份正交六列（唯一事实源在本索引；benchmark-result-metric 只带 series_key）
     "engine", "version", "engine_build", "jdk_vendor", "jdk_version", "series_key",
     "car_code",
     # 声明（JDK 想要什么）+ 配置身份（这台车配了什么）+ 实测校验（跑的时候实际是什么）
-    # 声明/配置层是**可比性**的依据（覆盖 99%，来自编排）；实测层只用来查漂移
-    # （实测覆盖 40%，缺实测的场次不因此被判不可信）。
-    "jdk_want_major", "jdk_want_vendor",
-    "heap_mb", "heap_measured_mb", "cores", "cores_measured",
+    # 配置列只存**实际生效值**（裸名，无 want/measured 双层）：JDK 靠节点实测读数，
+    # heap/cores 靠编排断言背书的标签（heap_assert 起跑前校验，fail-fast 替代赛后对账）。
+    "heap_mb", "cores",
     # 包指纹
     "pkg", "pkg_sha256",
     # run 维度。challenge 是**多值**：一次测量可以由多个 challenge 段组成
     # （老协议写赛+查赛分开跑 → ["write-only","query-only"]；新协议一次跑完 → ["full"]）。
     # 值全是源值，不新增词表。
-    "track", "track_variant", "challenge", "round", "dims", "lineage",
+    "track", "challenge", "round", "dims",
     "codec", "source_reuse", "env_id", "nnodes",
     "clients", "bulk_size", "shards", "replicas",
     # 向量参数（从 flattened 拆成标量）
@@ -1008,6 +1028,27 @@ def validate_payload(runs, metrics, envs=()):
         for cv in (r.get("challenge") or []):
             if cv not in CANON_CHALLENGE:
                 problems.append("challenge 越界（不在源值词表内）: %r  %s" % (cv, r.get("race_id")))
+    # ---- 指标行必须归属已入库的场次（2026-11-03 补）----
+    # 每行 metric 的 race_id 必须能在 race 索引里找到主人。主键是 rally 原生
+    # race-id（uuid），段级 SEG| 键是导出期中间量，合并后不得外流 ——
+    # 之前断言缺位，被剔场次漏出的 4 行 recall（SEG| 前缀）让自检假阴性。
+    run_ids = {r.get("race_id") for r in runs}
+    _orphans, _badfmt = {}, {}
+    for m in metrics:
+        rid = m.get("race_id")
+        if rid is None:
+            continue
+        if rid not in run_ids:
+            _orphans[rid] = _orphans.get(rid, 0) + 1
+        if rid.startswith("SEG|"):
+            _badfmt[rid] = _badfmt.get(rid, 0) + 1
+    for rid, n in sorted(_orphans.items()):
+        problems.append("metric 行的 race_id 在 race 索引不存在（被剔场次的行漏闸）: %s × %d 行" % (rid, n))
+    for rid, n in sorted(_badfmt.items()):
+        problems.append("race_id 是段级键（SEG| 外流）: %s × %d 行" % (rid, n))
+    for r in runs:
+        if (r.get("race_id") or "").startswith("SEG|"):
+            problems.append("race 行主键是段级键: %s" % r.get("race_id"))
     # 覆盖率（非致命）
     n = len(runs) or 1
     def cov(fn):
@@ -1017,14 +1058,11 @@ def validate_payload(runs, metrics, envs=()):
         "dims": cov(lambda r: r.get("dims") is not None),
         "codec": cov(lambda r: bool(r.get("codec"))),
         "source_reuse": cov(lambda r: r.get("source_reuse") is not None),
-        # 配置身份层 vs 实测校验层的覆盖率 —— 两者的差就是"没采到 sidecar"的场次
+        # 配置列覆盖率（实际生效值）
         "heap_mb": cov(lambda r: r.get("heap_mb") is not None),
-        "heap_measured_mb": cov(lambda r: r.get("heap_measured_mb") is not None),
         "cores": cov(lambda r: r.get("cores") is not None),
-        "cores_measured": cov(lambda r: r.get("cores_measured") is not None),
         "trusted_true": sum(1 for r in runs if r.get("trusted") is True),
         "trusted_false": sum(1 for r in runs if r.get("trusted") is False),
-        "attempt_gt1": sum(1 for r in runs if (r.get("attempt") or 1) > 1),
         "multi_segment": sum(1 for r in runs if isinstance(r.get("challenge"), list) and len(r["challenge"]) > 1),
     }
     for k, v in cover.items():
@@ -1124,36 +1162,31 @@ def arm_build_of(arms, car):
 
 
 def variant_from_fid(fid):
-    """真 fid（{车}-{变体}-r{轮}[-tryN]）→ 变体段（不做归一）。"""
+    """真 fid（{车}-{变体}-r{轮}[-tryN]）→ 变体段（不做归一）。
+
+    变体 id 不再入库（track_variant 已退役，覆盖判定由 codec/source_reuse 列派生，
+    见 bench-history.variant_id_of）；保留本函数供溯源/调试读取 fid 中段。
+    """
     base = _TRY_RE.sub("", fid or "")
     m = re.match(r"^[^\-]+-(.+)-r\w+$", base)
     return m.group(1) if m else None
-
-
-def variant_of(fid, raw_track):
-    """变体身份（**编排事实**）：这次测量用的是哪个赛道变体。
-
-    值 = 变体 id：`<基础赛道>-codec-<token>[-sr]`（如 `geo-codec-def`、`geo-codec-zstd-sr`），
-    基座赛道就是基础赛道名本身（`geo` / `hnsw` / `ds-g1920`…）。
-
-    为什么不用实测的 codec 顶上：基座 geo 与 geo-codec-def 的 index.codec 实测**一样**
-    （引擎默认 LZ4），分不开；实测有 62 场采到 sidecar 却没采到 index.codec，
-    哪天采到了就会变成 'default'，和 default 变体撞车。变体身份只能来自编排。
-    """
-    for cand in (variant_from_fid(fid), raw_track):
-        if not cand:
-            continue
-        c = H.canonical_id(str(cand))
-        return c if "-codec-" in c else H.base_of(c)
     return None
+
+
+# 赛道名对齐官方 rally-tracks（2026-11-03 定）：geonames 就叫 geonames。
+# 只作用于**输出层**（canon_track / 入库值）；fid 拼接与 RACES.md 回查仍用历史名
+# （TRACK_NAME 不动），否则 jdk25-geo-r1 拼成 jdk25-geonames-r1 查不到记账。
+_TRACK_RENAME = {"geo": "geonames"}
 
 
 def canon_track(raw):
     """原始赛道名 → 规范赛道名：历史短名（gdef/gzstd/gbc）→ 规范变体名
-    （geo-codec-*）→ 基础赛道名（geo）。"""
+    （geo-codec-*）→ 基础赛道名 → 官方名（geo → geonames）。
+    新编排直接用官方名（geonames），原样通过。"""
     if not raw:
         return None
-    return H.base_of(H.canonical_id(str(raw)))
+    base = H.base_of(H.canonical_id(str(raw)))
+    return _TRACK_RENAME.get(base, base)
 
 
 def attempt_of(fid):
@@ -1171,18 +1204,6 @@ def heap_mb_of(tag):
         return None
     n = int(m.group(1))
     return n * 1024 if m.group(2).lower() == "g" else n
-
-
-def measured_int(values):
-    """逐节点实测值 → 单值。节点之间不一致直接判 None（不是"取第一个"）。
-
-    同一台车的三个节点跑出不同的堆/核数属于部署异常 —— 静默取一个等于把异常洗掉。
-    契约要求这种情况判失败（DESIGN §2.5.2），这里返回 None 让上层记为"不可比"。
-    """
-    vals = {int(v) for v in (values or []) if v is not None}
-    if len(vals) != 1:
-        return None
-    return vals.pop()
 
 
 def codec_norm(c):
@@ -1423,9 +1444,10 @@ def main():
         heap_max = srp.get("heap_max_measured_mb") or []
         heap_gb = round(max(heap_max) / 1024, 2) if heap_max else None
         tp = d.get("track-params") or {}
-        # 实验变量：维度/血统/段形态 —— 从 user-tags 与 track params 提升为 typed 列（方案 §3.2）
+        # 实验变量：维度/段形态 —— 从 user-tags 与 track params 提升为 typed 列（方案 §3.2）
+        # lineage（j/g 语料血统）2026-11-03 退役：它只编码在 ds-j*/ds-g* 的 track 名里，
+        # 与 track/corpus_name 一一对应（9 语料 ↔ 9 赛道零交叉），纯派生列不再入库。
         dims = ut.get("dim") or tp.get("dim")
-        lineage = ut.get("lineage")
         segment_form = ut.get("segment_form") or tp.get("segment_form")
 
         # ---- 场次可信度（2026-10-20 复审新增）----
@@ -1467,8 +1489,8 @@ def main():
                   "run_start": campaign_run_start.get(camp),
                   # series_key：看板分线键 + 图例文案（引擎@版本@build@JDK）
                   "series_key": series_key,
-                  # 实验变量：这一场测的是什么（向量维度 / 语料血统）
-                  "dims": dims, "lineage": lineage,
+                  # 实验变量：这一场测的是什么（向量维度）
+                  "dims": dims,
                   # 处理变量：归一后的压缩方式 + 裸布尔 source_reuse。
                   # 两者都进 metric —— 面板按 series_key 分线，ES 不能 join，
                   # 指标行不带它们就没法排除存储变体（DESIGN §2.6）。
@@ -1481,28 +1503,25 @@ def main():
                   "env_id": (side.get("env") or {}).get("env_id")}
         # ---- 场次行（段级；同一测量的多段在循环后合并成一行）----
         _knn = knn_params_of(side) or {}
-        _corpus = side.get("corpus") or ({"docs": DOCS.get(d.get("track"))} if DOCS.get(d.get("track")) else None) or {}
+        # 语料兜底：sidecar 缺席时按 track 注册表补 name/docs（与 tracks/ 定版对齐；
+        # hvtp200k 一次性批次不登记，保持 null 不臆造）
+        _corpus = side.get("corpus")
+        if _corpus is None:
+            _cn, _cd = CORPUS_NAME.get(d.get("track")), DOCS.get(d.get("track"))
+            _corpus = {"name": _cn, "docs": _cd} if (_cn or _cd) else {}
         _cluster = d.get("cluster") or {}
-        _want = (side.get("jdk") or {}).get("want") or {}
-        # 配置身份层：编排声明优先（覆盖 99%），sidecar 的声明兜底（覆盖 40%）——
+        # 配置列（实际生效值）：编排标签优先（覆盖 99%），sidecar 声明兜底（覆盖 40%）——
         # 同一事实的两条来源路径，不是两列（"一个事实只占一列"）。
+        # 只记一层的前提：编排侧 heap_assert 起跑前断言实际生效堆=标签（fail-fast），
+        # 赛后漂移对账退役（实测层历史零冲突，且 ds3 1g 事故那批无 sidecar 本就测不到）。
         _cfg_heap = heap_mb_of(ut.get("heap")) or srp.get("heap_declared_mb")
         _cfg_cores = ut.get("cores") or srp.get("cores_declared")
-        # 实测校验层：三节点不一致直接判 None（部署异常不能静默取第一个）。
-        _meas_heap = measured_int(srp.get("heap_max_measured_mb"))
-        _meas_cores = measured_int(srp.get("available_processors_measured"))
-        # 配置漂移：实测与配置对不上 → 这场的数据不可比（不另开列，并入 trusted）。
-        _drift = False
-        if _cfg_heap is not None and _meas_heap is not None and int(_cfg_heap) != int(_meas_heap):
-            _drift = True
-        if _cfg_cores is not None and _meas_cores is not None and int(_cfg_cores) != int(_meas_cores):
-            _drift = True
         # 赛末体积：探针落的是 GiB，契约统一用 GB（×1.073741824）。
         _pm = (meta.get("post_merge", {}).get(real_fid or fid) or {})
         _pm_store_gb = (round(_pm["store_gb"] * 1.073741824, 4)
                         if _pm.get("store_gb") is not None else None)
         seg_row = {"_index": "benchmark-result-race", "_id": seg_key, "race_id": seg_key,
-                   "@timestamp": ts, "campaign": camp, "attempt": attempt,
+                   "@timestamp": ts, "campaign": camp,
                    # run_start：批次锚点 —— 跨 UTC 午夜的批次按它归到一个桶
                    "run_start": campaign_run_start.get(camp),
                    # ---- 身份维度（正交，唯一事实源在本索引）----
@@ -1511,18 +1530,15 @@ def main():
                    "engine_build": build_no,
                    "jdk_vendor": jdk_vendor, "jdk_version": jdk_version,
                    "series_key": series_key, "car_code": car,
-                   # ---- 声明 / 配置身份 / 实测校验 ----
-                   "jdk_want_major": _want.get("major"), "jdk_want_vendor": _want.get("vendor"),
+                   # ---- 配置（实际生效值，单层）----
                    "heap_mb": int(_cfg_heap) if _cfg_heap is not None else None,
-                   "heap_measured_mb": _meas_heap,
                    "cores": int(_cfg_cores) if _cfg_cores is not None else None,
-                   "cores_measured": _meas_cores,
                    # ---- 包指纹（sha256 只认本场 sidecar 实测，不跨批次借）----
                    "pkg": pkg, "pkg_sha256": (side.get("engine") or {}).get("pkg_sha256"),
                    # ---- run 维度 ----
-                   "track": tr, "track_variant": variant_of(fid, d.get("track")),
+                   "track": tr,
                    "challenge": d.get("challenge"), "round": rnd,
-                   "dims": dims, "lineage": lineage,
+                   "dims": dims,
                    "codec": common["codec"], "source_reuse": common["source_reuse"],
                    "env_id": (side.get("env") or {}).get("env_id"),
                    "nnodes": ut.get("nnodes"),
@@ -1545,35 +1561,39 @@ def main():
                    "store_size_gb_post_merge": _pm_store_gb,
                    "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
                    "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
-                   "trusted": (not degraded_tasks) and (not _drift)}
+                   "trusted": (not degraded_tasks)}
         if _drop_reason:
             dropped.append({"reason": _drop_reason, "campaign": camp, "fid": fid,
                             "attempt": attempt, "status": status,
                             "track": tr, "timestamp": ts})
         else:
             segments.append({"key": (camp, fid, attempt), "seg_key": seg_key, "phase": phase,
-                             "ts": ts, "row": seg_row, "warn": list(warn)})
+                             "ts": ts, "row": seg_row, "warn": list(warn),
+                             "rally_id": d.get("race-id")})
             emit_metrics(d, seg_key, ts, common, metrics, side=side, counters=counters)
-        # ---- 召回率行：挂到该场**查询** race 上 ----
-        # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
-        # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
-        if phase == "q":
-            _rec = recall_idx.get((camp, fid))
-            if not _rec:
-                for (_c2, f2), r2 in recall_idx.items():
-                    if _c2 == camp and fid.startswith(f2 + "-"):
-                        _rec = r2
-                        break
-            for _task, _stats in (_rec or {}).items():
-                for _stat, _v in _stats.items():
-                    metrics.append({"_index": "benchmark-result-metric",
-                                    "_id": "%s|%s|%s|recall|%s" % (seg_key, phase, _task, _stat),
-                                    "@timestamp": ts, "task": _task, "operation": None,
-                                    "family": "recall", "metric": "recall", "stat": _stat,
-                                    "value": _v, "unit": "ratio",
-                                    "value_original": _v, "unit_original": "ratio",
-                                    "direction": "higher-better",
-                                    **{k: v for k, v in common.items() if k in METRIC_FIELDS}})
+            # ---- 召回率行：挂到该场**查询** race 上 ----
+            # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
+            # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
+            # 必须和 emit_metrics 一样待在闸门的 else 里 —— 之前它缩进在闸门外，
+            # 被剔场次的 recall 行照写不误，SEG| race_id 在 race 索引查无此人
+            # （实测漏了 4 行，2026-11-03）。
+            if phase == "q":
+                _rec = recall_idx.get((camp, fid))
+                if not _rec:
+                    for (_c2, f2), r2 in recall_idx.items():
+                        if _c2 == camp and fid.startswith(f2 + "-"):
+                            _rec = r2
+                            break
+                for _task, _stats in (_rec or {}).items():
+                    for _stat, _v in _stats.items():
+                        metrics.append({"_index": "benchmark-result-metric",
+                                        "_id": "%s|%s|%s|recall|%s" % (seg_key, phase, _task, _stat),
+                                        "@timestamp": ts, "task": _task, "operation": None,
+                                        "family": "recall", "metric": "recall", "stat": _stat,
+                                        "value": _v, "unit": "ratio",
+                                        "value_original": _v, "unit_original": "ratio",
+                                        "direction": "higher-better",
+                                        **{k: v for k, v in common.items() if k in METRIC_FIELDS}})
         if side:
             e = side.get("env") or {}
             eid = e.get("env_id")
@@ -1621,12 +1641,18 @@ def main():
     seg_warnings = ["场次警告 %s：%d 场" % (_k, _v) for _k, _v in sorted(_warn_count.items())]
     seg2race = {}          # 段级 key → 合并后的 race_id
     seg2primary = {}       # 合并后的 race_id → 主段的 phase（段级 key 不含 phase，用行内 phase 区分来源段）
+    race2ts = {}           # 合并后的 race_id → 测量起点（最早段的时刻）
     dropped_race_level = 0
     for key, segs in seg_groups.items():
         # 主段：写段优先（赛级指标量的是写阶段结束时的状态），否则最早的一段
         segs_sorted = sorted(segs, key=lambda x: (x["phase"] != "w", x["ts"] or ""))
         primary = segs_sorted[0]
-        race_id = "%s|%s|a%d" % (key[0], key[1], key[2])
+        # 主键照搬 rally 原生 race-id：uuid 存在 race.json 文件里，重导出不变 →
+        # upsert 幂等成立（"uuid 不能幂等"是旧论据错误，它不是每次生成的新 id）。
+        # 两段测量主键取主段（写段优先）的，另一段的 uuid 在 source 溯源列里；
+        # 新协议 full 一场一段，主键与 rally id 一一对应。
+        # 兜底：极老 race.json 缺 race-id 时退回业务键（重导出核对覆盖率）。
+        race_id = primary.get("rally_id") or "%s|%s|a%d" % (key[0], key[1], key[2])
         row = dict(primary["row"])
         row["_id"] = race_id
         row["race_id"] = race_id
@@ -1635,6 +1661,7 @@ def main():
         # 场次时间 = 最早一段的时刻（一次测量的起点）
         _tss = [x["ts"] for x in segs if x["ts"]]
         row["@timestamp"] = min(_tss) if _tss else None
+        race2ts[race_id] = row["@timestamp"]
         # 可信度：任一段不可信 → 整场不可信
         row["trusted"] = all(x["row"].get("trusted") for x in segs)
         # 溯源：各段的路径合并
@@ -1671,6 +1698,12 @@ def main():
         if m.get("_id", "").startswith(sid + "|"):
             m["_id"] = rid + m["_id"][len(sid):]
         m["race_id"] = rid
+        # 时间统一到测量起点（与 race 行同款）：之前各行带的是来源段的 rally 时刻，
+        # 同一测量的写/查行带两个时间戳（实测 188/197 个测量），按 @timestamp
+        # 分桶会把一场比赛切进两个桶，与 race 行对不上。
+        _mts = race2ts.get(rid)
+        if _mts is not None:
+            m["@timestamp"] = _mts
         _kept.append(m)
     metrics = _kept
 
@@ -1781,9 +1814,6 @@ def main():
         "run_start": dict(_TS),
         # ---- 主键与归属 ----
         "race_id": {"type": "keyword"}, "campaign": {"type": "keyword"},
-        # attempt：重试号（同一 campaign 下同一 fid 的第几次尝试）。
-        # 它必须单独成列：车/赛道/轮次完全相同、只有重试号不同的两场是两次独立测量。
-        "attempt": {"type": "integer"},
         # ---- 身份正交六列 + 车代号 ----
         # jdk_vendor 必须单列：GraalVM 25 与 Kona 25 的完整版本号都是 25.0.4，只有厂商能分；
         # jdk_version 是实测完整版本号，粒度随 JDK 本身（有更新尾号的 25.0.4，GA 首版就是 27）
@@ -1791,28 +1821,17 @@ def main():
         "engine_build": {"type": "keyword"},
         "jdk_vendor": {"type": "keyword"}, "jdk_version": {"type": "keyword"},
         "series_key": {"type": "keyword"}, "car_code": {"type": "keyword"},
-        # ---- 声明 / 配置身份 / 实测校验 ----
-        # heap_mb 与 cores 是**配置身份**（编排声明，分组比较用）；
-        # heap_measured_mb 与 cores_measured 是**实测校验**（只用来查漂移）。
-        # 两层分开是因为实测只覆盖 40% 的场次 —— 让实测当唯一依据等于对多数场次无法分组。
-        "jdk_want_major": {"type": "keyword"}, "jdk_want_vendor": {"type": "keyword"},
-        "heap_mb": {"type": "integer"}, "heap_measured_mb": {"type": "integer"},
-        "cores": {"type": "integer"}, "cores_measured": {"type": "integer"},
+        # ---- 配置（实际生效值，单层；漂移检查由编排 heap_assert 起跑前承担）----
+        "heap_mb": {"type": "integer"},
+        "cores": {"type": "integer"},
         # ---- 包指纹 ----
         "pkg": {"type": "keyword"}, "pkg_sha256": {"type": "keyword"},
         # ---- run 维度 ----
         "track": {"type": "keyword"},
-        # track_variant：赛道**变体**身份（编排事实）——
-        # `<基础赛道>-codec-<token>[-sr]`（如 geo-codec-def），基座赛道就是基础赛道名本身。
-        # 为什么必须有这一列：track 是基础赛道，基座 geo 与 geo-codec-def 在 track 上一样；
-        # 而实测的 index.codec 分不开它们（引擎默认就是 LZ4，实测有 62 场采到 sidecar
-        # 却没采到 index.codec，一旦采到就变成 'default' 撞车）。变体身份只能来自编排。
-        "track_variant": {"type": "keyword"},
         # challenge 是多值 keyword：一次测量可由多个 challenge 段组成，值全是源值
         "challenge": {"type": "keyword"},
         # typed promote：dims 要能 range/排序，round 要能当整数分组
         "dims": {"type": "integer"}, "round": {"type": "integer"},
-        "lineage": {"type": "keyword"},
         "codec": {"type": "keyword"}, "source_reuse": {"type": "boolean"},
         "env_id": {"type": "keyword"}, "nnodes": {"type": "integer"},
         "clients": {"type": "integer"}, "bulk_size": {"type": "integer"},
