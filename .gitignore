@@ -39,3 +39,39 @@ tracks/**/queries.json
 tracks/**/queries*.jsonl
 tracks/**/truth.jsonl
 tracks/**/challenges/full.json
+
+# —— 部署机（/testing/raceway）本地留档：只留机器上，不入库 ——
+# prepare-*.sh 生成的赛道变体（幂等可再生；静态基座 geonames/hv1024/nested
+# 与 hv1024x 家族仍在库内）
+tracks/ds-*/
+tracks/geo-codec-*/
+tracks/hnsw-codec-*/
+tracks/hnsw2m-2m-s3/
+tracks/hv1024-s3/
+tracks/hvtp200k-*/
+tracks/nested-s3/
+# 部署机运维脚本（与库内脚本同名的本地版本）
+disk-janitor.sh
+mon-campaign.sh
+post-run-ez251.sh
+probe.sh
+reexport_p04_fix.sh
+# 已被库内工具取代的旧件：bench-report.py（库内已删 HTML 报告链路）、
+# car_label.py（车身份口径已由 identity.py 收口）
+bench-report.py
+car_label.py
+# 文档旧稿（上游 docs/ 已在 63631ec 重构，这几份是重构前的版本）
+docs/FLOW-benchmark.md
+docs/KIBANA-DASHBOARD-PANELS.md
+docs/KIBANA-DASHBOARD-SPEC.md
+docs/PENDING-RACES.md
+docs/RESULT-README.md
+docs/RUNBOOK.md
+# 派生件（由现场 PENDING-RACES 生成）
+docs/pending-derived.json
+docs/PENDING-RACES-derived-*.txt
+# 现场状态快照
+status-*.txt
+# 本地 ES+Kibana 编排件（库内 kibana/ 是 7.17 建板工具链，两者不同源）
+kibana/docker-compose.yml
+kibana/es-proxy.py
