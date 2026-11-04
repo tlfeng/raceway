@@ -108,12 +108,24 @@ CANON_QUALITY = ("ok", "degraded", "unknown")
 CANON_CHALLENGE = ("write-only", "query-only", "index-only", "full", "nested-search-challenge")
 # codec 归一后的封闭词表
 CANON_CODEC = ("default", "zstd", "best_compression")
-# 规范赛道名封闭词表（12 个）。归一后命中不了登记表的场次**不写库**：
+# 规范赛道名封闭词表（14 个）。归一后命中不了登记表的场次**不写库**：
 # 归一不出来说明这一场的赛道身份不可信（实测：fid 形态脏、user_tags.track 是解析器
 # 写坏的字面量），留着它只会把看板的分线带偏 —— 挡住比带偏强。
-CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024",
+#
+# 词表必须与编排台的 BASE_TRACKS（bench-compose）一致 —— 编排台能排的赛道，
+# 库里就得能查。两边对不上的后果是静默的：编排台排了、库里查不到。
+#   ds-j1536（2026-11-04 补登记）：语料登记表（CORPUS_NAME / DOCS）与编排台
+#   BASE_TRACKS 里一直有它，漏在本表之外 → 它的 2 场 VALID 被 track_unknown 挡掉，
+#   老看板的 ds-j1536 面板恒空。
+#
+# hv1024x（2026-11-04 新增）：hv1024x 家族的基座 —— 1M 文档 × 1024 维 float，
+# dot_product，HNSW m=32 / efC=100，3 分片。家族内的量化档（int8 / bbq）与压缩档
+# （zstd + source_reuse）由 knn_index_type / codec / source_reuse 三列承载，
+# 不另起赛道名（§2.6 同一套处理变量口径）。变体目录名 hv1024x-int8 / hv1024x-bbq
+# 由 bench-history.base_of 剥掉量化后缀归到本基座。
+CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024", "hv1024x",
                "hvtp200k-2s", "hvtp200k-3s",
-               "ds-j512", "ds-j768", "ds-j1024", "ds-j2048",
+               "ds-j512", "ds-j768", "ds-j1024", "ds-j1536", "ds-j2048",
                "ds-g960", "ds-g1920")
 CANON_LATENCY_MODE = ("open_loop", "closed_loop", "unknown")
 # ---------------------------------------------------------------------------
@@ -336,6 +348,29 @@ def knn_params_of(side):
     """
     p = ((side or {}).get("run_params") or {}).get("knn_params")
     return p if isinstance(p, dict) and p else None
+
+
+def measured_index_settings(side):
+    """索引级实测设置 → {shards, replicas}。
+
+    sidecar 的 index_settings_measured 记的是**建好之后**索引的实际设置
+    （index.number_of_shards / index.number_of_replicas），比编排声明的 shards
+    权威。声明缺了（sidecar run_params.shards 为 null）就用实测值补上；
+    声明已有的值不改（避免动到既有行的口径）。
+    """
+    out = {}
+    st = ((side or {}).get("run_params") or {}).get("index_settings_measured") or {}
+    for _idx, _st in st.items():
+        if not isinstance(_st, dict):
+            continue
+        for key, col in (("index.number_of_shards", "shards"),
+                         ("index.number_of_replicas", "replicas")):
+            try:
+                out[col] = int(_st.get(key))
+            except (TypeError, ValueError):
+                pass
+        break
+    return out
 
 
 def fid_of(d):
@@ -1447,7 +1482,12 @@ def main():
         # 实验变量：维度/段形态 —— 从 user-tags 与 track params 提升为 typed 列（方案 §3.2）
         # lineage（j/g 语料血统）2026-11-03 退役：它只编码在 ds-j*/ds-g* 的 track 名里，
         # 与 track/corpus_name 一一对应（9 语料 ↔ 9 赛道零交叉），纯派生列不再入库。
-        dims = ut.get("dim") or tp.get("dim")
+        # dims 的来源顺序（§五·17 定案）：编排 user-tags → track params → **侧车实测**
+        # knn_params.dims → 赛道登记表兜底。侧车实测排在登记表前面：它是本场实际建索引
+        # 用的维度，登记表只是赛道默认值。2026-11-04 补上侧车这一路后，hv1024x 家族的
+        # dims 从 null 变成 1024。
+        _knn_dims = (knn_params_of(side) or {}).get("dims")
+        dims = ut.get("dim") or tp.get("dim") or _knn_dims
         segment_form = ut.get("segment_form") or tp.get("segment_form")
 
         # ---- 场次可信度（2026-10-20 复审新增）----
@@ -1503,6 +1543,7 @@ def main():
                   "env_id": (side.get("env") or {}).get("env_id")}
         # ---- 场次行（段级；同一测量的多段在循环后合并成一行）----
         _knn = knn_params_of(side) or {}
+        _mis = measured_index_settings(side)
         # 语料兜底：sidecar 缺席时按 track 注册表补 name/docs（与 tracks/ 定版对齐；
         # hvtp200k 一次性批次不登记，保持 null 不臆造）
         _corpus = side.get("corpus")
@@ -1543,7 +1584,10 @@ def main():
                    "env_id": (side.get("env") or {}).get("env_id"),
                    "nnodes": ut.get("nnodes"),
                    "clients": srp.get("clients"), "bulk_size": srp.get("bulk_size"),
-                   "shards": srp.get("shards"), "replicas": srp.get("replicas"),
+                   "shards": (srp.get("shards") if srp.get("shards") is not None
+                              else _mis.get("shards")),
+                   "replicas": (srp.get("replicas") if srp.get("replicas") is not None
+                                else _mis.get("replicas")),
                    # ---- 向量参数（flattened 拆出的标量）----
                    "knn_index_type": _knn.get("index_type"),
                    "knn_element_type": _knn.get("element_type"),
@@ -1585,6 +1629,18 @@ def main():
                             _rec = r2
                             break
                 for _task, _stats in (_rec or {}).items():
+                    # recall 行的 trusted 取**它自己那个 task** 的判定，不是整场的判定。
+                    # 场级 trusted 是"任一 task 坏了就整场不可信"，而 recall 只回答
+                    # 一个 task 的召回率。两者混用会让同一 (场次, task) 出现 trusted
+                    # 不一致的行 —— 实测 jdk4-20261023-235532 的 jdk27-ds-j2048-r3：
+                    # knn-search-100-1000-x32 有 0.02% 失败 → 场级 false，而
+                    # knn-search-10-100 本身干净 → 它的 recall 行若取场级就是 false，
+                    # 与同 task 的时延行（true）打架，导出期断言直接拒收整批。
+                    # 探针的 task 名与 op_metrics 的 task 名同源（RECALL_TASK_BY_K），
+                    # 对不上就回落场级判定。
+                    _q = task_quality_map.get(_task)
+                    _trusted = (common.get("trusted") if _q is None
+                                else (_q != "degraded"))
                     for _stat, _v in _stats.items():
                         metrics.append({"_index": "benchmark-result-metric",
                                         "_id": "%s|%s|%s|recall|%s" % (seg_key, phase, _task, _stat),
@@ -1593,7 +1649,8 @@ def main():
                                         "value": _v, "unit": "ratio",
                                         "value_original": _v, "unit_original": "ratio",
                                         "direction": "higher-better",
-                                        **{k: v for k, v in common.items() if k in METRIC_FIELDS}})
+                                        **{k: v for k, v in common.items() if k in METRIC_FIELDS},
+                                        "trusted": _trusted})
         if side:
             e = side.get("env") or {}
             eid = e.get("env_id")
