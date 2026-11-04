@@ -14,3 +14,19 @@ kibana/kibana-objects.ndjson
 # 内部排程计划：含具体场次安排与本机路径，不随公共库公开。
 # 车定义排程用 --cars-file / RACEWAY_CARS_FILE 指定本地留存副本。
 schedules/
+
+# —— 部署机（/testing/raceway）运行时资产：只留本地，不入库 ——
+pkg/          # 发行包缓存
+corpora*/     # 语料本体
+ibs/          # ibs 独立部署（另一个仓库）
+stage/        # 落地暂存
+dsfix/        # 历史工件目录
+monitor/      # load-monitor 采样输出（MON_DIR）
+*.bak
+*.bak-*
+.bak-sync-*/
+.old-arm-*/
+# 现场私有配置与第三方件
+my3.conf
+echarts.min.js
+conf-*.conf
