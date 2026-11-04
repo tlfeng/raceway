@@ -32,3 +32,11 @@ monitor/
 my3.conf
 echarts.min.js
 conf-*.conf
+# tracks/ 只入库静态定义；语料本体与派生数据留在部署机（GB 级，可再生）
+tracks/**/documents-*
+tracks/**/*.offset
+tracks/**/queries.json
+tracks/**/queries*.jsonl
+tracks/**/truth.jsonl
+tracks/**/VARIANT.txt
+tracks/**/challenges/full.json
