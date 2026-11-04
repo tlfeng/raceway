@@ -141,6 +141,24 @@ TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
 CANONICAL_ALIAS = {'gdef': 'geo-codec-def', 'gzstd': 'geo-codec-zstd-sr',
                    'gbc': 'geo-codec-bc'}
 
+# ---- 向量量化变体（2026-11-04 新增）------------------------------------
+#
+# hv1024x 家族：hv1024x / hv1024x-int8 / hv1024x-bbq / hv1024x-codec-zstd-sr。
+# 变体台账（各变体目录的 VARIANT.txt）写明「基础赛道: hv1024」，但**赛道定义本身**
+# 与老 runner 的 hv1024-s3 不同（_source excludes vs enabled），所以库里的 track 存
+# **hv1024x**（家族基座，与变体目录名一致），不并进 hv1024 —— 同一规范名下混两套
+# 赛道定义比多一个名字更坏（§2.0「归一不出来就不写库」的同一条原则）。
+#
+# 量化档不是压缩档：它是**向量索引类型**（index_options.type），由 race 行的
+# knn_index_type 列承载（hnsw / int8_hnsw / bbq_hnsw）。压缩档仍由 codec /
+# source_reuse 承载（§2.6 同一套处理变量口径）。
+#
+# 覆盖判定必须带这一维，否则基座 / int8 / bbq 三格会并成一格 —— "int8 跑过"会被
+# 当成"基座也跑过"，编排台把没跑的格误判成已覆盖（与压缩变体同一类事故）。
+QUANT_BY_INDEX_TYPE = {'int8_hnsw': 'int8', 'bbq_hnsw': 'bbq'}
+# 变体 id 里的量化后缀 → base_of 剥掉它（hv1024x-int8 → hv1024x）
+QUANT_SUFFIXES = ('-int8', '-bbq')
+
 
 def canonical_id(tid):
     """历史短 id → 规范 id。"""
@@ -152,9 +170,20 @@ def is_variant(tid):
 
 
 def base_of(tid):
-    """变体 id → 基础赛道 id。"""
+    """变体 id → 基础赛道 id。
+
+    剥两层后缀：压缩档（-codec-...）与向量量化档（-int8 / -bbq）。
+    量化档不是压缩档的子集，所以要单独剥 —— 否则 hv1024x-int8 归一不出来，
+    整场会被 track_unknown 闸门挡掉（实测 15 场全被挡）。
+    """
     c = canonical_id(tid)
-    return c.split('-codec-', 1)[0] if '-codec-' in c else c
+    if '-codec-' in c:
+        c = c.split('-codec-', 1)[0]
+    for suf in QUANT_SUFFIXES:
+        if c.endswith(suf):
+            c = c[:-len(suf)]
+            break
+    return c
 
 
 def token_of(tid):
@@ -220,14 +249,19 @@ def variant_id_of(row):
     if raw is not None:
         # 旧契约行：track_raw 是变体目录名的权威载体
         return raw if '-codec-' in raw else (row.get('track') or raw)
+    # 新契约行：变体身份由**处理变量列**派生 —— 压缩（codec / source_reuse）
+    # 与向量量化（knn_index_type）两个维度。
+    track = row.get('track') or ''
+    q = QUANT_BY_INDEX_TYPE.get(row.get('knn_index_type') or '')
+    base = ('%s-%s' % (track, q)) if (q and track) else track
     codec = row.get('codec')
     if codec:
         sr = row.get('source_reuse')
         sr_s = {True: 'true', False: 'false'}.get(sr, sr if isinstance(sr, str) else None)
-        v = variant_of(row.get('track') or '', codec, sr_s)
+        v = variant_of(base, codec, sr_s)
         if v:
             return v
-    return row.get('track') or raw or ''
+    return base or raw or ''
 
 
 def split_codec(codec, sr=None):

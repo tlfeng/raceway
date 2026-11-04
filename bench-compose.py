@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, urlparse
 
 Q = importlib.import_module('bench-queue')  # 文件名带连字符
 order_for_round = Q.order_for_round
-H = importlib.import_module('bench-history')  # 已入库历史覆盖（指标库 bench-run）
+H = importlib.import_module('bench-history')  # 已入库历史覆盖（指标库 benchmark-result-race）
 
 DEFAULT_ROOT = '/opt/raceway'
 DEFAULT_WHAT = 'ds'
@@ -649,7 +649,7 @@ _PAGE = """<!doctype html>
  DS_HOURS <input id="dsh" type="number" value="12" min="0" style="width:5em">（0=不启用窗底守卫）
  tag <input id="tag" size="22" placeholder="留空自动生成"></fieldset>
 
-<fieldset><legend>已入库历史（指标库 bench-run）</legend>
+<fieldset><legend>已入库历史（指标库 benchmark-result-race）</legend>
  <div id="histbox" class="hist-sum">加载中…</div>
  <div class="legend">
   <span class="v-ok">✓已跑</span><span class="v-deg">~降级</span><span class="v-half">半(缺相位)</span>
