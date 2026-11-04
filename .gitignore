@@ -16,12 +16,14 @@ kibana/kibana-objects.ndjson
 schedules/
 
 # —— 部署机（/testing/raceway）运行时资产：只留本地，不入库 ——
-pkg/          # 发行包缓存
-corpora*/     # 语料本体
-ibs/          # ibs 独立部署（另一个仓库）
-stage/        # 落地暂存
-dsfix/        # 历史工件目录
-monitor/      # load-monitor 采样输出（MON_DIR）
+# pkg/ 发行包缓存；corpora* 语料本体；ibs 独立部署（另一个仓库）
+pkg/
+corpora*/
+ibs/
+# stage 落地暂存；dsfix 历史工件；monitor = load-monitor 采样输出（MON_DIR）
+stage/
+dsfix/
+monitor/
 *.bak
 *.bak-*
 .bak-sync-*/
