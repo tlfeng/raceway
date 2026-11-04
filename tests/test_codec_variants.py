@@ -185,11 +185,8 @@ class TestTrackParams(unittest.TestCase):
     **5 分片**，而本项目其余赛道都是 3 分片。一旦漏传，同一条赛道的新旧场次
     分片数就不同（跨变体/跨赛道的数字直接不可比），而且**不会报错**。
 
-    这条曾经真的漏过：runner 原来按 id 名单判断（只列了 geo/nested 与几个
-    legacy 短别名），canonical 名（geo-codec-*）不在名单里 → 静默走 5 分片。
-
-    压缩档与 source_reuse 现在也走 track-params（`index_codec:` / `source_reuse:true`），
-    由定版 index.json 的条件块写入 settings —— 变体不再另建目录。
+    压缩档与 source_reuse 也走 track-params（`index_codec:` / `source_reuse:true`），
+    由定版 index.json 的条件块写入 settings —— 变体不另建目录。
     """
 
     PARAMS = 'number_of_shards:3,number_of_replicas:0'
@@ -282,7 +279,7 @@ class TestTrackParams(unittest.TestCase):
     def test_hv1024_gets_shard_params(self):
         """hv1024 的定版 index.json 已参数化分片 → 必须传，否则落到模板默认 3。
 
-        （旧版是 prepare 脚本硬写的 3 分片副本；定版后走 params，口径与 geo 族一致。）
+        口径与 geo 族一致。
         """
         b = bash_derive('track_params', ['hv1024'])
         self.assertEqual(b['hv1024'], self.PARAMS)
@@ -306,9 +303,8 @@ class TestTrackParams(unittest.TestCase):
 class TestTrackNameHelpText(unittest.TestCase):
     """文案承诺的赛道名，必须真的能被 runner 接受。
 
-    踩过的坑：文案列了 6 个历史短名，实际 case 只认 3 个 —— 另外 3 个传进去
-    直接 die，文案却写着能用。这里做**行为测**（不解析源码）：从 runner 自己的
-    文案里抠出它承诺的名字，逐个跑一遍，确认没有"说了不算"的。
+    这里做**行为测**（不解析源码）：从 runner 自己的文案里抠出它承诺的名字，
+    逐个跑一遍，确认没有"说了不算"的。
 
     文案有三份（文件头注释 / 无参用法提示 / 错参报错消息），必须列同一份名单。
     """
@@ -456,13 +452,14 @@ class TestTrackNameHelpText(unittest.TestCase):
         self.assertEqual(bad, [], 'list 菜单里的赛道名被拒: %s' % bad)
 
 class TestFrozenTrackDefinitions(unittest.TestCase):
-    """赛道定义定版在 tracks/ —— 压缩档靠条件块 + track-params，不再靠脚本烘副本。
+    """赛道定义定版在 tracks/ —— 压缩档靠条件块 + track-params。
 
     两条断言方向相反，都要守住：
-      · 定版 index.json **必须**有 index_codec / source_reuse 条件块（否则压缩档
-        静默失效：参数传了，settings 里没有，几个臂跑成同一个）；
-      · 仓库里**不许**再有"运行时生成赛道定义"的脚本（那正是这次删掉的东西，
-        再加回来就又有了"脚本产物与 git 定义不一致"的老坑）。
+
+    · 定版 index.json **必须**有 index_codec / source_reuse 条件块
+      （否则压缩档静默失效：参数传了，settings 里没有，几个臂跑成同一个）；
+    · 仓库里**不许**再有"运行时生成赛道定义"的脚本
+      （否则又会"脚本产物与 git 定义不一致"）。
     """
 
     TRACKS = ['geonames', 'hv1024', 'nested']
@@ -494,7 +491,7 @@ class TestFrozenTrackDefinitions(unittest.TestCase):
                          '赛道定义已定版进 tracks/，这些生成脚本不该回来: %s' % leftovers)
 
     def test_codec_ids_still_resolve(self):
-        """6 个 canonical 变体 id 仍然可用（编排记账靠它们，目录不再存在）。"""
+        """6 个 canonical 变体 id 仍然可用（编排记账靠它们）。"""
         ids = ['geo-codec-def', 'geo-codec-def-sr',
                'geo-codec-zstd', 'geo-codec-zstd-sr',
                'geo-codec-bc', 'geo-codec-bc-sr']

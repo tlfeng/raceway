@@ -25,7 +25,7 @@ for 循环里），起跑后外部无法知道队列全貌；排程模式下也�
 它同时负责暴露四类"看不见的问题"：
 
 1. **同一 fid 多条判定且状态矛盾** —— 排程文件在运行期间被改过、重跑后
-   判定表没清干净时会出现（实测 ds2 campaign 已出现）
+   判定表没清干净时会出现
 2. **STATE 行号与排程行错位** —— `STATE.txt` 的 key 是排程文件的**行号**，
    排程文件一旦增删行，`OK 8` 就会指向另一场
 3. **排程文件在 campaign 运行期间被修改过** —— 文件 mtime 晚于起跑时间
@@ -318,11 +318,11 @@ class Campaign:
 RE_TS = re.compile(r'^\[([\d\-: ]+)\]')
 # tracks 是多词列表（"geo hnsw nested" / "ds-g1920 ds-j2048 ..."），
 # 必须用非贪婪 .+? 匹配到 rounds= 之前 —— 用 \S+ 会抓不到多赛道 campaign。
-# 第 2 组 configs/cars 是**版本判据**：10-19 之前的旧版 runner 写 cars=，
-# 之后的版本写 configs= 并带「轮内右旋配对交错」标记。
+# 第 2 组 configs/cars 是**版本判据**：老 runner 写 cars=，
+# 新 runner 写 configs= 并带「轮内右旋配对交错」标记。
 RE_HEADER = re.compile(
     r'campaign\s+(\S+)\s+启动:\s*(configs|cars)=\[([^\]]*)\]\s+tracks=(.+?)\s+rounds=(\d+)')
-# 旧版 runner 的排程模式起跑头：schedule=24 场, 窗口 12h, deadline ...
+# 老 runner 的排程模式起跑头：schedule=24 场, 窗口 12h, deadline ...
 RE_SCHED_OLD = re.compile(r'campaign\s+(\S+)\s+启动:\s*schedule=(\d+)\s*场')
 RE_SCHED_MODE = re.compile(r'排程模式:\s*(\S+)\s*（车定义\s*(\S+?)\s*）')
 RE_DEADLINE = re.compile(r'窗底守卫:\s*(\S+?)h（截止\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
@@ -537,8 +537,7 @@ def build_campaign(src, cid, schedule_override=None):
     # ---- 1) 排程清单（待跑队列的来源）
     # 实际执行顺序：时间线里每场的「开始」，按基础 fid 归并。
     # 归并规则是**首次出现去重**，不是折叠连续重复 —— 重跑是同一场的又一次尝试，
-    # 会把同一个 fid 再次插回时间线（实测 ds2：jdk26/jdk27 车先 COLD-START-FAIL，
-    # 修好 JVMCI 后重跑）。按连续折叠会把这些重跑当成"别处插进来的新场次"，
+    # 会把同一个 fid 再次插回时间线。按连续折叠会把这些重跑当成"别处插进来的新场次"，
     # 顺序比对必然对不上，于是把本来正确的排程误判成"推导不可信"。
     observed = []
     seen_obs = set()
@@ -573,7 +572,7 @@ def build_campaign(src, cid, schedule_override=None):
         # 非排程模式：按 run-bench.sh:1067-1075 的展平规则推导
         #（赛道外层 → 轮次 → 车右旋），但**推导必须自校验**：
         # 对不上实际执行顺序就说明这条规则不适用于这个 campaign
-        #（10-19 之前的旧版 runner 规则不同，或排程在运行期间被改过）。
+        #（老 runner 规则不同，或排程在运行期间被改过）。
         seq = 0
         plan = []
         for tk in c.tracks:
@@ -788,7 +787,7 @@ def _parse_ts(s):
 
 # ------------------------------------------------------------------ campaign 摘要
 # 进度页/历史页都要一份"全部 campaign 的轻量清单"。逐个 build_campaign 在 ssh
-# 模式下是每场 3+ 次远端调用（52 个 campaign 就是上百次 ssh），列表页吃不消 ——
+# 模式下是每场 3+ 次远端调用（campaign 一多就是上百次 ssh），列表页吃不消 ——
 # 这里一次调用/一次扫描拿全部：cid、PROGRESS.txt mtime、RACES 行数、VALID 数、
 # 最后一行（判定"是否已结束"用），细节留给点开后的 build_campaign。
 

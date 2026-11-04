@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
 # run-bench.sh —— 性能编排（配置 × 赛道 × 轮次，在压测机上运行；单入口，esrally 风格）
-#   ./run-bench.sh <geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
+#   ./run-bench.sh <geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
 #   ./run-bench.sh list                          # 列可用赛道/配置模板/近期 campaign
+#   ./run-bench.sh --help                        # 用法页（赛道、三种编排、前置条件）
 #
 # 配置文件（第 3 参数或 CONF= 环境变量）：每行一个配置，轮内按行序右旋配对交错——
 #   例（3 种配置 × 3 轮 = 9 场，r1: A,B,C / r2: C,A,B / r3: B,C,A）：
@@ -48,13 +49,79 @@ declare -F track_params >/dev/null 2>&1 \
   || die "vm-bench-lib.sh 版本过旧（缺 track_params）：请把整个仓库同步到压测机（scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/）"
 
 # 赛道/模式名单：用法提示、参数校验、文件头注释三处共用这一份（WHAT_ARGS）。
-# 踩过的坑：文案列了 6 个历史短名，实际 case 只认 3 个 —— 另外 3 个传进去直接 die，
-# 文案却写着能用。收敛成一份之后，这类漂移由 tests/test_codec_variants.py 挡住。
-WHAT_ARGS='geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|codec|both|all|ds|ds-<档名>|list'
+# 收敛成一份后，文案与实际 case 的漂移由 tests/test_codec_variants.py 挡住。
+WHAT_ARGS='geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|codec|both|all|ds|ds-<档名>|list'
 
-WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]}"
+# 用法页：./run-bench.sh --help —— 压测机是纯命令行环境，参数、赛道清单、前置条件、
+# 产物在哪全在这一页里，不用去翻源码。
+usage_help() {
+  cat <<'EOF'
+raceway · 压测编排入口（用法页）
+
+用法
+  ./run-bench.sh <赛道> [圈数=3] [配置文件]            跑一场 campaign
+  ./run-bench.sh --dry-run <赛道> [圈数] [配置文件]     只打印排程，不执行（秒回）
+  ./run-bench.sh list                                  列赛道 + 现在能跑哪些 + 近期 campaign
+  ./run-bench.sh --help                                本页
+
+三种编排方式
+  单配置     ./run-bench.sh geo 3
+             配置走环境变量：ENGINE_NAME / ENGINE_VERSION / ENGINE_BUILD /
+             JDK_DIR / CAR_LABEL / JDK_WANT
+  多配置     ./run-bench.sh geo 3 my3.conf              每行一个配置（同样 6 个键）
+  排程文件   SCHEDULE_FILE=… CARS_FILE=… DS_HOURS=12 ./run-bench.sh ds
+             逐场指定「哪台车 × 哪条赛道 × 第几圈」，带时间窗保护
+
+赛道（名字 → 赛道定义在哪）
+  geo                    geonames 官方基座           tracks/geonames
+  hnsw                   96 维 200 万向量            机器本地（vm-bench.env TRACK_HNSW_BASE）
+  hv1024                 1024 维 100 万向量          tracks/hv1024
+  nested                 nested 文档                 tracks/nested
+  hv1024x                1024 维四臂 · hnsw 基座      tracks/hv1024x
+  hv1024x-int8           1024 维四臂 · 标量量化       同上（vector_index_type=int8_hnsw）
+  hv1024x-bbq            1024 维四臂 · 二值量化       同上（vector_index_type=bbq_hnsw）
+  hv1024x-codec-zstd-sr  1024 维四臂 · ZSTD+复用源    同上（index_codec=ZSTD + source_reuse）仅 Easysearch
+  <赛道>-codec-<def|zstd|bc>[-sr]                    压缩变体（走 --track-params，不另存目录）
+  gdef / gzstd / gbc      上面几个压缩变体的历史别名
+  codec / both / all      批量跑法（geo-codec-* 六变体 / geo+hnsw / geo+hnsw+nested）
+  ds / ds-<档名>          维度扫描（定义待回灌，见 tracks/README.md）
+
+跑起来之后
+  tail -f campaigns/<campaign>/PROGRESS.txt   实时进度（当前场次 + 阶段）
+  cat    campaigns/<campaign>/RACES.md        逐场判定（只有 VALID 能进结论）
+  对比 / 入库 / 收尾：docs/GUIDE.md §5~§7
+
+前置条件（少一样都会在起跑前被拦下，并说清缺什么）
+  1. cp vm-bench.env.example vm-bench.env 并填写 —— 缺它连 list 都跑不动
+  2. ./doctor.sh —— 六组只读体检，✘ 的先修完再起跑
+  3. 仓库改动同步到压测机时**要带上 tracks/**（赛道定义在 git 里，漏了就跑不起来）：
+       scp -r *.sh *.py *.conf tracks/ kibana/ vm-bench.env <压测机>:/opt/raceway/
+EOF
+}
+
+case "${1:-}" in
+  --help|-h|help) usage_help; exit 0;;
+esac
+
+# 打错赛道名时给个最接近的（别让人去翻源码对名单）
+# 顺序：先精确命中，再子串命中（长的优先 —— "hv1024x-int8" 不该被猜成 "hv1024"）
+suggest_track() { # <错的名字> → 猜一个 id（空 = 猜不出来）
+  local w="$1" c
+  for c in hv1024x-codec-zstd-sr hv1024x-int8 hv1024x-bbq hv1024x hv1024 \
+           hnsw nested geo codec both all ds list gdef gzstd gbc; do
+    [ "$w" = "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  for c in hv1024x-codec-zstd-sr geo-codec-zstd-sr geo-codec-def-sr geo-codec-bc-sr \
+           geo-codec-zstd geo-codec-def geo-codec-bc \
+           hv1024x-int8 hv1024x-bbq hv1024x hv1024 hnsw nested geo codec both all ds; do
+    case "$w" in *"$c"*) printf '%s' "$c"; return 0;; esac
+  done
+  return 0
+}
+
+WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]（--help 看完整用法）}"
 [ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
-WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]}"
+WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]（--help 看完整用法）}"
 ROUNDS="${2:-3}"
 DRY=${DRY:-0}
 
@@ -73,8 +140,8 @@ PCTAG=$([ "$PRECHECK_MODE" = once ] && echo campaign-once || echo PASS)
 FP_DIR=""; LAST_RACE_ID=""; ENV_ID=${ENV_ID:-bench-3node-32c32g}
 CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默卡点阈值内置默认在 precheck.sh）
 # 赛后 ENV 判定阈值（主旋钮在 vm-bench.env；缺键回退脚本内置默认）。
-# 经 ssh 显式传给虚机侧 load-monitor summary —— 不透传的话虚机侧只能用它的内置默认，
-# 用户在 env 里改了也不生效（这正是当年 VERDICT_* 没法放进 env 的原因）。
+# 必须经 ssh 显式传给虚机侧 load-monitor summary —— 不透传的话虚机侧只用内置默认，
+# 用户在 env 里改了也不生效。
 : "${VERDICT_STEAL_MAX:=2.0}"; : "${VERDICT_FOREIGN_MAX:=5}"
 
 # ds-*（维度扫描）赛道超时：≥1536 维写入给 14400s，其余 10800s；查询统一 5400s
@@ -87,7 +154,7 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 #   DS_HOURS      >0 时启用窗底守卫：放不下下一场就 DEADLINE-SKIP 并继续后面更便宜的场
 #   CAMP_ID       显式指定可复用同一 campaign 目录 → STATE.txt 断点续跑
 SCHEDULE_FILE=${SCHEDULE_FILE:-}
-CARS_FILE=${CARS_FILE:-${ARMS_FILE:-}}   # 旧名 ARMS_FILE 仍认（改名前的排程命令照抄能用）
+CARS_FILE=${CARS_FILE:-${ARMS_FILE:-}}   # 旧名 ARMS_FILE 仍认（兼容旧排程命令）
 DS_HOURS=${DS_HOURS:-0}
 CUR_RECALL=${RECALL:-0}     # 单跑模式是否打 recall 探针（RECALL=1）；排程模式由排程行的 recall 列决定
 
@@ -108,26 +175,37 @@ else
 fi
 
 if [ "$WHAT" = list ]; then
-  echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested codec both all ds"
+  echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr codec both all ds"
+  echo "  单跑某个压缩变体：<赛道>-codec-<def|zstd|bc>[-sr]（如 geo-codec-zstd-sr、geo-codec-bc）"
+  echo
+  echo "赛道 → 定义目录 → 现在能不能跑："
+  track_availability_table
+  echo
   echo "配置模板: $(ls "$LIB_DIR"/campaign-configs.example.conf 2>/dev/null || echo campaign-configs.example.conf)"
   echo "近期 campaign（RACES.md 的 VALID/总场）:"
-  # 不限 jdk3-* 前缀：campaign 前缀已随车族分化（jdk3/vm3/esrm/ds3/ds2/es819…），
-  # 只列 jdk3-* 会把 es819 车批次、维度扫描批次整批漏掉。
+  # 不限 jdk3-* 前缀：车族已分化（jdk3/vm3/esrm/ds3/ds2/es819…），只列 jdk3-*
+  # 会把 es819 车批次、维度扫描批次整批漏掉。
   for d in $(ls -dt "$RESULTS_ROOT"/*/ 2>/dev/null | head -8); do
     [ -f "$d/RACES.md" ] || continue
     v=$(grep -c "| VALID |" "$d/RACES.md"); t=$(grep -c "^| " "$d/RACES.md")
     echo "  $(basename "$d")  VALID $v/$((t-2))"
   done
+  echo
+  echo "完整用法：./run-bench.sh --help"
   exit 0
 fi
 
 case "$WHAT" in
   geo)  TRACKS=(geo);;
   *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道；压缩档走 --track-params）
-  gdef|gzstd|gbc) TRACKS=("$WHAT");; # 历史短名（= geo-codec-* 的别名）
+  gdef|gzstd|gbc) TRACKS=("$WHAT");; # 仍认的短名别名（= geo-codec-*）
   hnsw) TRACKS=(hnsw);;
   hv1024) TRACKS=(hv1024);;
-  hv1024x*) TRACKS=("$WHAT");;   # 服务器侧变体（hv1024x/-int8/-bbq/-codec-zstd-sr）
+  hv1024x|hv1024x-int8|hv1024x-bbq) TRACKS=("$WHAT");;
+           # 量化族：四臂 = hnsw 基座 / int8 / bbq / 压缩臂。
+           # ⚠ 这里用**白名单**而不是 hv1024x* 前缀匹配：前缀匹配会把拼错的
+           # "hv1024x-int88" 当成合法赛道，一路走到 rally 才炸（报错跟"名字打错"毫无关系）。
+           # 压缩臂（hv1024x-codec-*）由上面的 *-codec-* 分支接住。
   nested) TRACKS=(nested);;
   codec) TRACKS=(geo-codec-def geo-codec-def-sr geo-codec-zstd geo-codec-zstd-sr geo-codec-bc geo-codec-bc-sr);;
            # geonames 一族的压缩×source_reuse 全套 6 变体
@@ -136,7 +214,16 @@ case "$WHAT" in
   all) TRACKS=(geo hnsw nested);;
   ds) TRACKS=(ds-g1920 ds-j2048 ds-j1024 ds-g960 ds-j768 ds-j512 ds-j1536);;
   ds-*) TRACKS=("$WHAT");;
-  *) die "track 参数必须是 $WHAT_ARGS";;
+  *)
+    _sug=$(suggest_track "$WHAT")
+    if [ -n "$_sug" ]; then
+      die "track 参数必须是 $WHAT_ARGS
+  你可能想跑的是：$_sug
+  （--help 看完整用法，list 看现在能跑哪些）"
+    else
+      die "track 参数必须是 $WHAT_ARGS
+  （--help 看完整用法，list 看现在能跑哪些）"
+    fi;;
 esac
 
 # ---- 配置解析与校验（fail-fast 在建 campaign 目录之前） -------------------------
@@ -186,7 +273,7 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
       ENGINE_BUILD)   ENGINE_BUILD=$v;;
       JDK_DIR)        JDK_DIR=$v;;
       CAR_LABEL)      CAR_LABEL=$v;;
-      ARM_LABEL)      CAR_LABEL=$v;;    # 旧名兼容：改名前的配置行用 ARM_LABEL
+      ARM_LABEL)      CAR_LABEL=$v;;    # 旧名 ARM_LABEL 仍然认
       JDK_WANT)       JDK_WANT=$v;;
       *) die "配置行未知键: $k（允许: ENGINE_NAME ENGINE_VERSION ENGINE_BUILD JDK_DIR CAR_LABEL JDK_WANT）";;
     esac
@@ -198,7 +285,7 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
 declare -a CONF_LABELS CONF_PKGS
 if [ -n "${SCHEDULE_FILE:-}" ]; then
   # 排程模式：配置在排程推进时逐条注册（见主流程），此处只校验车定义文件存在
-  # 旧名兼容：排程命令里还指向 dimsweep-arms.conf 的，自动落到旧名文件上
+  # 旧名兼容：指向 dimsweep-arms.conf 的自动落到旧名文件上
   if [ -n "$CARS_FILE" ] && [ ! -s "$CARS_FILE" ]; then
     _leg="${CARS_FILE%cars.conf}arms.conf"
     if [ "$_leg" != "$CARS_FILE" ] && [ -s "$_leg" ]; then
@@ -207,9 +294,9 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
     fi
   fi
   [ -s "$CARS_FILE" ] || die "排程模式需要车定义文件: CARS_FILE=$CARS_FILE"
-  # CONFIGS 也必须清空：上面 else 分支留的单配置哨兵 ("") 还在，
-  # 而 CONF_LABELS 是空的 → 写 PACKAGES.txt 时 "${CONF_LABELS[0]}"
-  # 在 set -u 下直接报 unbound variable（起跑即崩，DRY 走不到这行所以发现不了）。
+  # CONFIGS 也必须清空：else 分支留的单配置哨兵 ("") 还在，而 CONF_LABELS 是空的
+  # → 写 PACKAGES.txt 时 "${CONF_LABELS[0]}" 在 set -u 下报 unbound variable
+  #   （起跑即崩，DRY 走不到这行所以发现不了）。
   CONFIGS=(); CONF_LABELS=(); CONF_PKGS=()
 elif [ -n "${CONFIGS[0]:-}" ]; then
   _seen="|"
@@ -245,8 +332,8 @@ car_config() { # <车名>
 }
 
 # 排程模式：这一轮会用到的**所有**安装包（引擎包 + 用户自管 JDK 包 + 修补版 agent）。
-# 排程是推进时逐条注册配置的，起跑那一刻还不知道将来用哪些包；
-# 但车定义文件是静态的，按它把包全列出来才有可回溯性（对齐 ds3 的 PACKAGES.txt 口径）。
+# 排程是推进时逐条注册配置的，起跑那一刻还不知道将来用哪些包；车定义文件是静态的，
+# 按它把包全列出来才有可回溯性。
 schedule_packages() {
   local car cfg
   while read -r car cfg; do
@@ -279,8 +366,8 @@ schedule_lines() {
 car_engine() { printf '%s' "$1" | grep -o 'ENGINE_NAME=[^ ]*' | cut -d= -f2 | tr 'A-Z' 'a-z'; }
 
 # 排程起跑前复核「车的引擎 × 变体」兼容性 —— fail-fast。
-# 为什么要拦：ZSTD / index.source_reuse 是 Easysearch 专有设置，ES 上 create-index
-# 直接拒（unknown setting）。不拦的话要等建索引那一步才炸，白烧一台机器的建库时间。
+# ZSTD / index.source_reuse 是 Easysearch 专有设置，ES 上 create-index 直接拒
+# （unknown setting）→ 不拦要等建索引那步才炸，白烧一台机器的建库时间。
 # 排程模式是用户**逐行写死**的组合 → 有不兼容就 die（在 campaign 起跑前）。
 check_track_engine_compat() {
   local car tk rnd dr est cfg eng allow bad=0
@@ -344,8 +431,8 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   exit 0
 fi
 
-# campaign 名前缀默认沿用 jdk3（历史惯例）；可用 CAMP_PREFIX 覆盖，
-# 让车名进 campaign 维度——es819 的批次不该叫 jdk3-*（按批次过滤时看板上会认错车）
+# campaign 名前缀默认 jdk3，可用 CAMP_PREFIX 覆盖（车名进 campaign 维度，
+# 否则按批次过滤时看板上会认错车）。
 # CAMP_ID 显式指定 = 复用同一 campaign 目录 → STATE.txt 断点续跑（排程模式用）
 CAMP_ID="${CAMP_ID:-${CAMP_PREFIX:-jdk3}-$(date +%Y%m%d-%H%M%S)}"
 CAMP_DIR="$RESULTS_ROOT/$CAMP_ID"
@@ -354,11 +441,11 @@ PROG="$CAMP_DIR/PROGRESS.txt"; RACES="$CAMP_DIR/RACES.md"
 STATE="$CAMP_DIR/STATE.txt"
 PROGSTEP() { echo "[$(date '+%F %T')] $*" | tee -a "$PROG"; }
 
-# 中止收尾：进度台判"已结束"只认 PROGRESS.txt 的 "campaign 结束: N/M 场有效" 行，而这行
-# 以前只有自然跑完才写 —— 被 TERM/INT/HUP 或 die 掉的 campaign 永远显示"运行中"。
-# 这里兜住：EXIT trap 在没写过自然结束行时补一条（N/M 取当前计数，不编数）。
+# 中止收尾：进度台判"已结束"只认 PROGRESS.txt 的 "campaign 结束: N/M 场有效" 行。
+# EXIT trap 在没写过自然结束行时补一条（N/M 取当前计数，不编数）—— 否则被
+# TERM/INT/HUP 或 die 掉的 campaign 永远显示"运行中"。
 # KILL -9 拦不住，那条路由 stop-campaign.sh → close-campaign.sh 兜底。
-# RUNNER.pid 给 close-campaign.sh 判活用；退出时删掉，免得 pid 复用误判。
+# RUNNER.pid 给 close-campaign.sh 判活；退出即删，免得 pid 复用误判。
 echo $$ > "$CAMP_DIR/RUNNER.pid"
 CAMPAIGN_CLOSED=0; ABORT_REASON=''
 _close_on_exit() {
@@ -382,7 +469,7 @@ svc2_of()      { case "$1" in elasticsearch) echo elasticsearch;; easysearch) ec
 ip_node_names_of(){ case "$1" in elasticsearch) echo "${VM_NODES_ES[@]}";; *) echo "${VM_NODES_EZ[@]}";; esac; }
 
 # ---------- ibs 生命周期 ------------------------------------------------------
-# 依赖 ibs 副本含 af01883（gate version-core）/ 8b1489a（wipe stop-first）修复
+# 依赖 ibs 副本含 gate version-core / wipe stop-first 修复（缺失即 die）
 ibs_selfcheck() {
   local miss=""
   grep -q "expected_core" "$IBS_ROOT/ops/status.py" || miss="$miss af01883(gate-version)"
@@ -449,8 +536,8 @@ ibs_ready_wait() { # <engine> <timeout_sec> <logfile>
   return 1
 }
 
-# 确保引擎已安装且 build 正确。以 ip.txt 第4列完整 build 号为部署状态单一事实来源：
-# REST 只报 version core（2.5.0），无法区分 build 号，live 探测对 build 差异必然漏判。
+# 确保引擎已安装且 build 正确。以 ip.txt 第4列完整 build 号为部署状态单一事实来源
+# （REST 只报 version core，无法区分 build 号 → live 探测对 build 差异必然漏判）。
 ensure_engine() { # <engine>
   local eng="$1" dir svc want cur installed
   load_topology "$eng"          # 拓扑单事实源：NNODES/NODE_RANGE 随 ip.txt 刷新
@@ -474,9 +561,10 @@ ensure_engine() { # <engine>
 }
 
 # ---------- JDK 就位（用户自管：JDK_DIR=虚机上的目录；空=回 bundle 自带） --------
-# 首次换装自动把当前 JDK 归档为 jdk.bundled（旧版归档 jdk.bundled-25 复用）；按
-# jdk.path.stamp 幂等跳过；java -version 校验失败回退 jdk.old。不设硬性卡点——身份
-# 元数据 = CAR_LABEL + sidecar 逐节点实测 java -version（results/<fid>-<ph>-sidecar.json）。
+# 首次换装自动把当前 JDK 归档为 jdk.bundled（已有归档 jdk.bundled-25 也复用）；按
+# jdk.path.stamp 幂等跳过；java -version 校验失败回退 jdk.old。
+# 不设硬性卡点——身份元数据 = CAR_LABEL + sidecar 逐节点实测 java -version
+# （results/<fid>-<ph>-sidecar.json）。
 ensure_jdk() {
   local ip dir="$EZ_DIR" arch want
   [ "$IS_ES" = 1 ] && return 0                 # ES 用自带 JDK
@@ -576,9 +664,10 @@ prepare_hnsw_s3() {
 }
 
 # ---------- 赛道准备（定义定版在 tracks/，这里只补 git 收不了的产物）----------
+
 # 赛道定义（index.json / challenges / operations / track.json）全部来自仓库 tracks/，
 # 运行前只补三类产物：① 语料软链（GB 级）② 查询集生成（hv1024 系）③ .offset 断点处理。
-# 压缩变体**不再生成目录**：压缩档与 source_reuse 由 --track-params 传给定版 index.json
+# 压缩变体不生成目录：压缩档与 source_reuse 由 --track-params 传给定版 index.json
 # 的条件块（{% if index_codec is defined %} / {% if source_reuse ... %}）。
 link_corpus() { # <赛道目录> <语料文件名> [候选源...]
   local d="$1" f="$2"; shift 2
@@ -615,9 +704,8 @@ prepare_track_corpus() { # <赛道目录>
 
 # hv1024 系查询集：官方 queries.json.bz2 前 2000 条（与 96 维 s3 赛道条数对齐）。
 # queries.json 不进 git（.gitignore）→ 缺失时按需生成。
-# ⚠️ 已有 queries.json 就**直接复用**（不重生成）：压测机上的它来自 ds-j1024 的查询集，
-# 而 truth.jsonl / queries-recall.jsonl 这两份 recall 真值正是按同一批查询算出来的 ——
-# 换一份 queries 就和真值对不上了，recall 数字直接作废。
+# ⚠️ 已有 queries.json 就**直接复用**（不重生成）：truth.jsonl / queries-recall.jsonl
+# 这两份 recall 真值是按同一批查询算的 → 换一份 queries 就对不上，recall 数字作废。
 prepare_queries() { # <赛道目录>
   local d="$1" q="$d/queries.json" n=2000
   grep -q 'queries.json' "$d/track.py" 2>/dev/null || return 0
@@ -636,7 +724,9 @@ prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处�
   local tk d
   for tk in "${TRACKS[@]}"; do
     d=$(track_dir "$tk")
-    [ -d "$d" ] || die "赛道目录不存在: $d（$tk）"
+    [ -d "$d" ] || die "赛道目录不存在: $d（$tk）
+  多半是仓库没同步全 —— 同步时记得带上 tracks/（scp -r tracks/ <压测机>:/opt/raceway/）
+  若这条赛道的定义还没进 git，见 tracks/README.md「还没切完的部分」"
     prepare_track_corpus "$d"
     prepare_queries "$d"
     case "$tk" in
@@ -652,9 +742,8 @@ prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处�
 }
 
 # ds-*（维度扫描）赛道：语料软链修链 + 维度/条数/字节/查询维数自检。
-# ds-* 的定义还没进 git（语料与真值在 $ROOT/corpora-ds/），语料软链曾因目录搬迁全部
-# BROKEN → 这里按同名在 corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，
-# 记录落进 campaign 台账（不留档就只剩一句"当时看着对"）。
+# ds-* 的定义还没进 git（语料与真值在 $ROOT/corpora-ds/），软链断了就按同名在
+# corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，记录落进 campaign 台账。
 prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道直接跳过）
   local CORPORA_DS="${CORPORA_DS:-$ROOT/corpora-ds}"
   local tk d dims f base cand want_n want_b srcf corpus real_b qdims got
@@ -714,10 +803,9 @@ prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道�
 }
 
 # ds-*（维度扫描）赛道：目录固定在 $ROOT/tracks/<名字>，索引名 vectors
-# 维度 → 写入超时：≥1536 维给 14400s，其余 10800s（PLAN §五 时间预算）
+# 维度 → 写入超时：≥1536 维给 14400s，其余 10800s
 #
-# 变体的索引名 / 超时 / 维度都沿用**基础赛道**（hnsw-codec-zstd 的索引是 vectors，
-# 不是 geonames —— 变体只改存储设置，不改索引语义）。
+# 变体的索引名 / 超时 / 维度都沿用**基础赛道**（变体只改存储设置，不改索引语义）。
 # 变体 id ↔ 目录 ↔ 压缩/sr/引擎 的推导在 vm-bench-lib.sh（与编排台同一套规则）。
 track_dims() { local b; b=$(track_base "$1"); case "$b" in ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;; ds-g960) echo 960;; ds-j768) echo 768;; ds-j512) echo 512;; *) return 1;; esac; }
 track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
@@ -753,7 +841,7 @@ monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/（分相位时
     vm "$ip" "rm -f $MON_DIR/mon-$fid.csv" >/dev/null 2>&1
   done
   # PROGRESS 里的监控摘要：只报三节点最坏的 steal_max（逐节点明细在
-  # monitors/*-summary.txt，重复 3 组数字没法一眼判读"脏没脏"）
+  # monitors/*-summary.txt）
   local worst
   worst=$(grep -ho 'steal_max=[0-9.]*' "$mondir/$fid"-*-summary.txt 2>/dev/null \
           | cut -d= -f2 | sort -g | tail -1)
@@ -845,8 +933,8 @@ env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw
 race_metric_ok() { # <fid> <w|q> —— 断言 race.json 真有非 null 的吞吐指标
   # rally rc=0 不等于有数据：写赛若整段落在 warmup 里，op_metrics 的 throughput
   # 全为 null，场会被静默判 VALID。
-  # race.json 缺失（raceId 没解析出来 / race store 没落文件）比"指标全 null"更糟
-  # —— 零机读数据 —— 同样不能放行，必须按断言失败计。
+  # race.json 缺失（raceId 没解析出来 / race store 没落文件）= 零机读数据，
+  # 同样不能放行，必须按断言失败计。
   local f="$CAMP_DIR/results/$1-$2-race.json"
   if [ ! -s "$f" ]; then
     log "  警告: race.json 未落档 $1-$2，指标断言按失败计"
@@ -893,9 +981,9 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
     "https://${VM_IPS[0]}:$HTTP_PORT/_nodes/_all/stats/jvm,os,process,indices" > "$d/nodes-stats.txt" 2>&1 || true
   # 完整 stats：thread_pool(拒绝/排队) / breaker(熔断) / query_cache(命中) /
   # indices.search.query_time(引擎侧累计查询耗时) / fs(磁盘) 只在全量里有。
-  # EasySearch 不认 _nodes/stats/<metric> 形式的指定路径（会 400），所以抓不带 metric 名的全量。
-  # 缺这一路的后果：压测中"是不是把线程池打爆了""缓存命中多少""引擎侧累计查询耗时"
-  # 全部无从回答 —— 饱和与限流在数据上不可区分。
+  # EasySearch 不认 _nodes/stats/<metric> 形式（会 400）→ 抓不带 metric 名的全量。
+  # 缺这一路的后果：线程池是否打爆、缓存命中、引擎侧累计查询耗时全部无从回答 ——
+  # 饱和与限流在数据上不可区分。
   curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
     "https://${VM_IPS[0]}:$HTTP_PORT/_nodes/_all/stats" > "$d/nodes-stats-full.txt" 2>&1 || true
   for ip in "${VM_IPS[@]}"; do vm "$ip" "$dir/jdk/bin/java -version 2>&1" > "$d/jdk-$ip.txt" 2>/dev/null; done
@@ -936,27 +1024,20 @@ recall_probe() { # <fid> <track_dir> <track_key>
 }
 
 # ---------- JDK 26/27 车：场前无条件推送修补组合 + JDK 身份断言 -------------------
-# 为什么每场都要推：easysearch 重装/切车会把 config/jvm.options 与 lib 下的
-# security agent 还原成发行版原版（原版 agent 1.18.8 不支持 Java 25+，
-# 原版 jvm.options 的 javaagent 作用域只到 21），不推就等于没修。
+# 每场都要推：重装/切车会把 config/jvm.options 与 lib 下的 security agent 还原成
+# 发行版原版（原版 agent 不支持 Java 25+，原版 jvm.options 的 javaagent 作用域只到 21），
+# 不推就等于没修。
 #
 # 作用域固定，不跟随目标 JDK 主版本：
-#   javaagent      → 21-:（21 及以上都挂修补版 agent 1.18.15）
-#   UseJVMCICompiler→ 21-26:（OpenJDK 26+ 默认开 JVMCI 必须关；OpenJDK 27 已移除该选项，
-#                              作用域带上 27 会直接报 "Unrecognized VM option 'UseJVMCICompiler'"）
+#   javaagent        → 21:（21 及以上都挂修补版 agent 1.18.15）
+#   UseJVMCICompiler → 21-26:（OpenJDK 26+ 默认开 JVMCI 必须关）
 #
-# 顺序陷阱（2026-10-21 实测踩坑）：UseJVMCICompiler 在 OpenJDK 26/27 上属实验选项，
-#   显式设置（哪怕是 -XX:- 关掉）也必须先 -XX:+UnlockExperimentalVMOptions 解锁，
-#   且解锁必须排在它前面。发行版原版是「解锁 → 关 → 重新锁上」三连行，
-#   补丁把中间那行删掉后只在文件末尾追加一行 → 解锁早在文件中部就被撤销 →
-#   JVM 直接拒绝启动：
-#     "VM option 'UseJVMCICompiler' is experimental and must be enabled via
-#      -XX:+UnlockExperimentalVMOptions. The unlock option must precede 'UseJVMCICompiler'."
-#   （GraalVM 25 不把它当实验选项，jdk25 车因此侥幸没炸，换 OpenJDK 26/27 就 3 节点全灭。）
-#   所以追加块必须自带完整三连：解锁 → 关 → 重新锁上。
-#   第二个坑：作用域必须止于 26。OpenJDK 27 已经移除了 UseJVMCICompiler 选项，
-#   作用域带上 27 会让 JDK 27 直接报 "Unrecognized VM option 'UseJVMCICompiler'"。
-#   JDK 27 里没有 JVMCI 这个概念，不去动它等价于「JVMCI 关」，三车口径一致。
+# ⚠️ 顺序陷阱：UseJVMCICompiler 在 OpenJDK 26/27 上属实验选项，显式设置（哪怕 -XX:- 关掉）
+# 也必须先 -XX:+UnlockExperimentalVMOptions 解锁，且解锁要排在它前面。
+#
+# 追加块必须自带完整三连：解锁 → 关 → 重新锁上，否则 JVM 拒绝启动
+# （"VM option 'UseJVMCICompiler' is experimental and must be enabled via
+#   -XX:+UnlockExperimentalVMOptions"）。
 jdk_fix_apply() { # <目标 JDK 主版本号>
   local major="${1:-25}"
   [ "$ENGINE_NAME" = easysearch ] || return 0
@@ -970,9 +1051,9 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
   #   所以三个车（GraalVM25 / OpenJDK26 / OpenJDK27）的向量加速路径保持一致。
   local jci_hi=26
   # 2.5.1+ 新式 bundle 自带不带版本号的 agent（lib/easysearch-security-agent.jar），
-  # 原版 agent 已适配新 JDK，整段修补不适用 —— 保持原版直接跳过。旧逻辑的过滤
-  # 只匹配 -2.5.0.jar 文件名，滤不掉新式 javaagent 行，追加后会双 agent 叠加，
-  # JVM 报 "jar hell!" 拒绝启动 → CLUSTER-NOT-READY（2026-10-29 ez251 六连败根因）。
+  # 原版 agent 已适配新 JDK，整段修补不适用 —— 保持原版直接跳过。
+  # ⚠️ 否则旧过滤只匹配 -2.5.0.jar 文件名，滤不掉新式 javaagent 行 → 双 agent
+  # 叠加 → JVM 报 "jar hell!" 拒绝启动 → CLUSTER-NOT-READY。
   if [ "$(vm "${VM_IPS[0]}" "[ -f $EZ_DIR/lib/easysearch-security-agent.jar ] && echo Y || echo N")" = Y ]; then
     log "  检测到新式自带 agent（easysearch-security-agent.jar），保持 bundle 原版，跳过修补组合"
     return 0
@@ -1076,8 +1157,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   cpu_affinity_assert "$eng" || { echo "| $fid | CPU-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-ASSERT-FAIL"; return 1; }
 
   # 4) full race（单挑战：写段 → forcemerge(1) → 查段，一次调用跑完，phase=wq）
-  #    merge 的完成等待由赛道自带（force-merge 同步 API / wait-until-merges-finish）；
-  #    编排侧段数卡点（SEG-ASSERT）已退役 —— merge 结果无验证是接受的简化取舍。
+  #    merge 的完成等待由赛道自带（force-merge 同步 API / wait-until-merges-finish）。
   derive_full_challenge "$track" || {
     echo "| $fid | RACE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
     PROGSTEP "[$seq] $fid full challenge 派生失败"; return 1; }
@@ -1086,10 +1166,8 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   PROGSTEP "[$seq] $fid full race 开始（timeout ${TMO}s）"
   local rc=0
   local ctag=""; [ -n "${EXPECT_CPU_CORES:-}" ] && ctag=",cores:${EXPECT_CPU_CORES}"
-  # 压缩与 source_reuse 是**两个独立标签**（不再糅成 "ZSTD+source_reuse"）：
-  # 入库侧把它们拆成两个维度，任意一维都能单独分组对比。
-  # 旧 campaign 的 user_tags.codec 是糅合串（"ZSTD+source_reuse"），
-  # 入库侧做兼容解析 → 新旧数据落到同一套干净维度上，可比。
+  # 压缩与 source_reuse 是**两个独立标签**：入库侧拆成两个维度，任意一维都能单独分组对比。
+  # 旧 campaign 的 user_tags.codec 是糅合串（"ZSTD+source_reuse"），入库侧做兼容解析 → 新旧可比。
   local cdc="" _comp _sr
   _comp=$(track_compression "$tk"); _sr=$(track_source_reuse "$tk")
   [ -n "$_comp" ] && cdc=",codec:$_comp"
@@ -1174,7 +1252,7 @@ PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_C
 {
   echo "campaign: $CAMP_ID"
   if [ -n "${SCHEDULE_FILE:-}" ]; then
-    # 排程模式：整份排程内联存档 + 所有车的包指纹（ds3 的 PACKAGES.txt 就是这个口径）
+    # 排程模式：整份排程内联存档 + 所有车的包指纹
     echo "schedule: $(schedule_lines | tr '\n' ' ')"
     echo "cars: $CARS_FILE"
     schedule_packages | sort -u | while read -r _p; do
@@ -1205,8 +1283,12 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
   check_track_engine_compat
 fi
 
-prepare_hnsw_s3
-[ -d "$TRACK_HNSW_S3" ] || die "hnsw 3 分片变体准备失败"
+# hnsw 3 分片变体只在**真要跑 hnsw 族**时才生成（判据见 vm-bench-lib.sh 的 tracks_need_hnsw_prep）：
+# 无条件生成时，机器上缺 hnsw 基座定义会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
+if tracks_need_hnsw_prep "${TRACKS[@]}"; then
+  prepare_hnsw_s3
+  [ -d "$TRACK_HNSW_S3" ] || die "hnsw 3 分片变体准备失败"
+fi
 
 # 赛道准备：定义已定版在仓库 tracks/，这里只补 git 不入库的产物（语料软链 / 查询集 / 断点）
 prepare_tracks
@@ -1215,8 +1297,8 @@ prepare_tracks
 # （各臂跑成同一个，数据看着正常、结论全废）→ 起跑前挡住
 for _t in "${TRACKS[@]}"; do track_assert_storage_params "$_t"; done
 
-# 存储设置台账：压缩档 / source_reuse 现在是 --track-params（不再烘进 index.json 副本），
-# 逐场可回溯靠这一段 —— 参数没落进台账，事后没法解释"这一场的索引设置是什么"
+# 存储设置台账：压缩档 / source_reuse 走 --track-params，逐场可回溯靠这一段 ——
+# 参数没落进台账，事后没法解释"这一场的索引设置是什么"
 {
   echo "--- 存储设置（--track-params）---"
   for _t in "${TRACKS[@]}"; do
@@ -1241,10 +1323,8 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
   fi
   [ -f "$STATE" ] || : > "$STATE"
   PROGSTEP "排程模式: $SCHEDULE_FILE（车定义 $CARS_FILE）"
-  # ⚠️ 排程输入必须挂到**独立 FD**：循环体里的子命令（ssh / ibs / rally / tar …）
-  # 全部继承 stdin，而 `while read ... done < <(schedule_lines)` 的 stdin 就是排程管道。
-  # 任何一个子命令读一下 stdin，后面还没跑的排程行就被它吃干净了 ——
-  # 实测 24 场只跑了第 1 场：跑完第 1 场后第 2 次 read 立刻 EOF，循环直接收尾。
+  # ⚠️ 排程输入必须挂到**独立 FD**：循环体里的子命令（ssh / ibs / rally / tar …）全部
+  # 继承 stdin，会把排程管道读空（后面的排程行被吃干净 → 循环提前 EOF 收尾）。
   # 修法：排程从 FD 3 读，循环体用 read -u 3；子命令的 stdin 与排程彻底隔离。
   exec 3< <(schedule_lines)
   while read -r -u 3 car tk rnd do_recall est; do

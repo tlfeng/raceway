@@ -2,21 +2,22 @@
 # -*- coding: utf-8 -*-
 """hv1024 与 hv1024x 两族：共享文件必须逐字节相同，差异只允许在白名单里
 
-背景（为什么要有这个测试）：
-  `tracks/hv1024` 与 `tracks/hv1024x` 是**两条不同的赛道**（不是同一条赛道的两个档）：
-  唯一的实质差异是 `_source` 策略 ——
+**为什么要有这个测试**：`tracks/hv1024` 与 `tracks/hv1024x` 是**两条不同的赛道**
+（不是同一条赛道的两个档），唯一的实质差异是 `_source` 策略 ——
 
     hv1024   : "_source": { "enabled": false }            整个 _source 关掉
     hv1024x  : "_source": { "excludes": ["emb"] }          保留 docid、排除向量
 
-  这是**写入/存储口径**（影响 translog、segment 体积、写入耗时），不是被测变量，
-  所以两族分开定版、各自一份目录。而且 `_source` 是 mappings 里的东西，
-  sidecar 只采 `_settings`（index settings）→ **入库数据里查不到这一口径**，
-  合并成一个目录后就只剩"track id + 参数台账"能反推，比 quant/codec 弱一档。
+这是**写入/存储口径**（影响 translog、segment 体积、写入耗时），不是被测变量，
+所以两族分开定版、各自一份目录。
 
-  但两份目录里有 3 个文件是**逐字节相同**的（challenges/default.json、
-  operations/default.json、track.py）—— 同一份定义存两处，就是"改一处忘另一处"的
-  漂移源。这个测试就是那道闸门：共享文件一旦分叉就红。
+`_source` 是 mappings 里的东西，sidecar 只采 `_settings`（index settings）→
+**入库数据里查不到这一口径**，合并成一个目录后就只剩"track id + 参数台账"能反推，
+比 quant/codec 弱一档。
+
+两份目录里有 3 个文件是**逐字节相同**的（challenges/default.json、
+operations/default.json、track.py）—— 同一份定义存两处，就是"改一处忘另一处"的
+漂移源。这个测试就是那道闸门：共享文件一旦分叉就红。
 
 跑法：
     python3 -m unittest discover -s tests -t . -v
@@ -28,8 +29,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRACKS = os.path.join(ROOT, 'tracks')
-A = os.path.join(TRACKS, 'hv1024')       # 老族：_source 关掉
-B = os.path.join(TRACKS, 'hv1024x')      # 新族：_source 排除 emb
+A = os.path.join(TRACKS, 'hv1024')       # _source 整个关掉
+B = os.path.join(TRACKS, 'hv1024x')      # _source 排除 emb
 
 # 两族之间**必须**逐字节相同的文件
 SHARED_FILES = ['challenges/default.json', 'operations/default.json', 'track.py']

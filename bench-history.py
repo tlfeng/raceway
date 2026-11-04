@@ -5,9 +5,8 @@
 为什么需要它
 ------------
 编排台（bench-compose）只会排新活：矩阵勾什么就排什么，**不知道哪些格已经跑过**。
-指标库里躺着几百行 benchmark-result-race（三十多个 campaign、上百个 车×赛道×轮次 组合），
-用户却要在编排界面里凭记忆避开已做过的组合 —— 结果要么重复跑已经跑过的场次
-（白烧几小时机器，还把轮间时序摊薄的前提搞脏），要么漏掉没跑的那一格。
+不查历史就只能凭记忆避开已做过的组合 —— 结果要么重复跑（白烧机器，还把轮间时序
+摊薄的前提搞脏），要么漏掉没跑的那一格。
 
 本模块把指标库 benchmark-result-race 索引读成一张**覆盖表**：
 
@@ -66,17 +65,11 @@ DEFAULT_ES_URL = 'https://127.0.0.1:9237'
 PAGE_SIZE = 2000
 
 # benchmark-result-race 里要取的字段（只取覆盖判定用得到的，省带宽也省内存）
-# 注意 track_raw / codec / source_reuse 都要取：
-#   track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
+# track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
 #   codec 相同，靠 codec 分不出，只能靠目录名）
-#   codec / source_reuse = 压缩与复用的两个独立维度
-# v3 契约（2026-11-03）：race 一行 = 一次测量（写赛与查赛合并），
-# status/quality/phase/fid/user_tags/track_raw 全部退役。
-#   car_code    = 车代号（原来在 user_tags.car 里）
-#   track_variant = 赛道变体身份（编排事实，基座与 default 变体靠它分开）
-#   challenge   = **多值**，这次测量由哪些 challenge 段组成 → 相位完整性靠它反推
-#   trusted     = 不可信标记（原来叫 quality=degraded）
-# 旧库的行仍能读：下面几个字段取不到时按旧名回落。
+# codec / source_reuse = 压缩与复用的两个独立维度
+# challenge 是**多值**（这次测量由哪些 challenge 段组成）→ 相位完整性靠它反推
+# trusted = 不可信标记；旧库的行仍能读：下面几个字段取不到时按旧名回落。
 _SOURCE_FIELDS = ['campaign', 'car_code', 'engine', 'engine_build',
                   'track', 'track_variant', 'track_raw', 'round',
                   '@timestamp', 'dims', 'pkg', 'attempt',
@@ -88,9 +81,9 @@ _SOURCE_FIELDS = ['campaign', 'car_code', 'engine', 'engine_build',
 def row_build_key(r):
     """一行的 build 标识：`车@build`（无 build 号的车就是车名本身，如 es819）。
 
-    索引里不再存 car_build 字段（那是「车代号」的重复编码），这里用
-    车代号 + engine_build 合成 —— 与旧的 car_build 字段等价。
-    v3：车代号是顶层 car_code；旧库的行仍从 user_tags.car 取。
+    索引不存 car_build（那是「车代号」的重复编码），这里用车代号 + engine_build
+    合成 —— 与旧的 car_build 字段等价。车代号取顶层 car_code，旧库的行仍从
+    user_tags.car 取。
     """
     car = r.get('car_code') or car_of(r)
     b = r.get('engine_build')
@@ -123,15 +116,13 @@ class HistoryUnavailable(Exception):
 
 
 # ------------------------------------------------------------------ 变体推导
-# 压缩与 source_reuse 是**索引级设置**，对任何基础赛道都成立 → 变体 id 用
-# 规则推导（与压测机 vm-bench-lib.sh 的 track_canonical / track_base 等同一套，
+# 变体 id = <基础赛道>-codec-<def|zstd|bc>[-sr]（与变体目录名一致），按规则推导
+# （与压测机 vm-bench-lib.sh 的 track_canonical / track_base 等同一套，
 # tests/test_codec_variants.py 会比对两边推导结果）。
 #
-#   变体 id = <基础赛道>-codec-<def|zstd|bc>[-sr]      （与变体目录名一致）
-#   历史短 id（只作兼容输入）：gdef / gzstd / gbc
-#     gzstd 实为 geo-codec-zstd-sr —— 历史名不改，免得旧 campaign 场次名漂移
+# 历史短 id（只作兼容输入）：gdef / gzstd(=geo-codec-zstd-sr) / gbc
 #
-# 为什么覆盖判定必须带变体：库里 track 字段是**基础赛道**（"geo"/"hnsw"/…），
+# 覆盖判定必须带变体：库里 track 字段是**基础赛道**（"geo"/"hnsw"/…），
 # 压缩与 source_reuse 是另外两个维度。若覆盖键只用 (车, 赛道, 轮次)，6 个变体的
 # 历史会混成一格 —— "ZSTD+sr 跑过"会被当成"default 也跑过"，把没跑的格误判成已覆盖。
 CODEC_TOKEN = {'default': 'def', 'ZSTD': 'zstd', 'zstd': 'zstd', 'best_compression': 'bc'}
@@ -141,11 +132,11 @@ TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
 CANONICAL_ALIAS = {'gdef': 'geo-codec-def', 'gzstd': 'geo-codec-zstd-sr',
                    'gbc': 'geo-codec-bc'}
 
-# ---- 向量量化变体（2026-11-04 新增）------------------------------------
+# ---- 向量量化变体 --------------------------------------------
 #
 # hv1024x 家族：hv1024x / hv1024x-int8 / hv1024x-bbq / hv1024x-codec-zstd-sr。
 # 变体台账（各变体目录的 VARIANT.txt）写明「基础赛道: hv1024」，但**赛道定义本身**
-# 与老 runner 的 hv1024-s3 不同（_source excludes vs enabled），所以库里的 track 存
+# 与 hv1024-s3 不同（_source excludes vs enabled），所以库里的 track 存
 # **hv1024x**（家族基座，与变体目录名一致），不并进 hv1024 —— 同一规范名下混两套
 # 赛道定义比多一个名字更坏（§2.0「归一不出来就不写库」的同一条原则）。
 #
@@ -174,7 +165,7 @@ def base_of(tid):
 
     剥两层后缀：压缩档（-codec-...）与向量量化档（-int8 / -bbq）。
     量化档不是压缩档的子集，所以要单独剥 —— 否则 hv1024x-int8 归一不出来，
-    整场会被 track_unknown 闸门挡掉（实测 15 场全被挡）。
+    整场会被 track_unknown 闸门挡掉。
     """
     c = canonical_id(tid)
     if '-codec-' in c:
@@ -234,13 +225,11 @@ def variant_of(track, codec, sr):
 def variant_id_of(row):
     """一行 benchmark-result-race → 变体 id（覆盖判定的 key 维度）。
 
-    v3.1（2026-11-03）：track_variant 列退役。**旧契约行**（带 track_variant /
-    track_raw）仍以它们为准——基座与 def 变体的实测 codec 相同（引擎默认 LZ4），
-    靠 codec 反推分不出，测试 test_base_and_default_variant_are_distinguishable
-    锁定这条；**新契约行**（两者皆无）才由 codec / source_reuse **派生**
-    （variant_of）——codec 列有三层兜底（sidecar 实测 → user_tags 声明 → 变体名
-    规则，见 bench-export.codec_dims），编排传了存储档的场次必有值；基座场次
-    codec 为空 → 派生回基座名。
+    **旧契约行**（带 track_variant / track_raw）仍以它们为准 —— 基座与 def 变体的
+    实测 codec 相同（引擎默认 LZ4），靠 codec 反推分不出；**新契约行**（两者皆无）
+    才由 codec / source_reuse **派生**（variant_of）——codec 列有三层兜底
+    （sidecar 实测 → user_tags 声明 → 变体名规则，见 bench-export.codec_dims）；
+    基座场次 codec 为空 → 派生回基座名。
     """
     v = row.get('track_variant') or ''
     if v:
@@ -368,7 +357,7 @@ def fetch_rows(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
 
 # ------------------------------------------------------------------ 覆盖模型
 def _challenges_of(row):
-    """一次测量的 challenge 集合。v3 里是**多值**（写赛+查赛合并成一行）。"""
+    """一次测量的 challenge 集合。race 行里是**多值**（写赛+查赛合并成一行）。"""
     ch = row.get('challenge')
     if isinstance(ch, str):
         ch = [ch]
@@ -407,7 +396,7 @@ def _expected_phases(row):
 def _verdict_of(rows):
     """把一场次（若干行）合并成一个判定。
 
-    v3：库里的行全都过了写入侧闸门（非 VALID / host-noise 的场次根本不写库），
+    库里的行全都过了写入侧闸门（非 VALID / host-noise 的场次根本不写库），
     所以 **status 已退役**，FAIL / SKIP / UNKNOWN 只在读旧库时还可能出现。
     相位也不再是列 —— 一次测量合并成一行，包含哪些赛段由 challenge 集合说。
     """
@@ -444,10 +433,10 @@ class Cell:
     （库里 track 字段是基础赛道，压缩与 source_reuse 是另外两个维度 ——
     不合成变体 id 的话，6 个变体的历史会混成一格。）
 
-    注意：同一格可能有**多个 build** 的记录 —— ds3 跑的是 3009（有些场次
-    DEADLINE-SKIP），ds2 拿 3015 重跑（成功）。所以判定必须**按 build 分开**：
-    对 3015 而言这一格是"跑过"，对 3009 而言是"没跑过"。把两个 build 的行
-    混在一起取最坏判定，会把后来成功的重跑也一起抹掉。
+    注意：同一格可能有**多个 build** 的记录（一个 build 跑失败、另一个 build 重跑成功）。
+    所以判定必须**按 build 分开**：对重跑那个 build 而言这一格是"跑过"，对另一个
+    build 而言是"没跑过"。把两个 build 的行混在一起取最坏判定，会把后来成功的
+    重跑也一起抹掉。
     """
     car: str
     track: str
@@ -534,7 +523,7 @@ class Cell:
     def warnings(self):
         """这一格有什么值得提示的。
 
-        v3：索引行里不再有 caliber_warnings（警告改走 manifest），
+        索引行里不再有 caliber_warnings（警告改走 manifest），
         剩下的行级信号只有 trusted 与 track_variant。
         """
         out = []

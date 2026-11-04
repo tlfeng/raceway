@@ -91,10 +91,9 @@ LOWER_BETTER = ("latency", "service_time", "processing_time", "error_rate", "dur
 # ---------------------------------------------------------------------------
 # 口径契约（词表）：stat / unit 只允许出现在这两个闭集里。
 #
-# 为什么要闭集（2026-10-20 复审）：
+# 闭集的三个理由：
 #  1) rally 的原始 stat 名有 "50_0"/"90_0"/"99_0"/"99_9"/"99_99"/"100_0"/"median"…
-#     旧映射漏了 "99_99"（rally 的 99.99 分位）→ 它原样漏进 stat 列，
-#     于是 stat 列同时存在 p999 与 99_99 两个名字指同一类分位，画图按 stat 过滤会静默漏一半。
+#     漏一个就原样漏进 stat 列，于是同一类分位出现两个名字，画图按 stat 过滤会静默漏一半。
 #  2) rally 的 "median"（吞吐块）与 "50_0"（时延块）是同一个统计量，
 #     却落成 p50 与 median 两个名字 —— 同一根 stat 轴上混两种标签，不可比。
 #  3) unit 同理：漏一个就多一种量纲，跨 family 求和/对比会出错。
@@ -114,15 +113,12 @@ CANON_CODEC = ("default", "zstd", "best_compression")
 #
 # 词表必须与编排台的 BASE_TRACKS（bench-compose）一致 —— 编排台能排的赛道，
 # 库里就得能查。两边对不上的后果是静默的：编排台排了、库里查不到。
-#   ds-j1536（2026-11-04 补登记）：语料登记表（CORPUS_NAME / DOCS）与编排台
-#   BASE_TRACKS 里一直有它，漏在本表之外 → 它的 2 场 VALID 被 track_unknown 挡掉，
-#   老看板的 ds-j1536 面板恒空。
 #
-# hv1024x（2026-11-04 新增）：hv1024x 家族的基座 —— 1M 文档 × 1024 维 float，
-# dot_product，HNSW m=32 / efC=100，3 分片。家族内的量化档（int8 / bbq）与压缩档
-# （zstd + source_reuse）由 knn_index_type / codec / source_reuse 三列承载，
-# 不另起赛道名（§2.6 同一套处理变量口径）。变体目录名 hv1024x-int8 / hv1024x-bbq
-# 由 bench-history.base_of 剥掉量化后缀归到本基座。
+# hv1024x 家族的基座 —— 1M 文档 × 1024 维 float，dot_product，HNSW m=32 / efC=100，
+# 3 分片。家族内的量化档（int8 / bbq）与压缩档（zstd + source_reuse）由
+# knn_index_type / codec / source_reuse 三列承载，不另起赛道名（§2.6 同一套处理变量
+# 口径）。变体目录名 hv1024x-int8 / hv1024x-bbq 由 bench-history.base_of 剥掉量化
+# 后缀归到本基座。
 CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024", "hv1024x",
                "hvtp200k-2s", "hvtp200k-3s",
                "ds-j512", "ds-j768", "ds-j1024", "ds-j1536", "ds-j2048",
@@ -133,27 +129,24 @@ CANON_LATENCY_MODE = ("open_loop", "closed_loop", "unknown")
 #
 # 指标行只保留三类东西：
 #   ① 指标事实：family / metric / stat / value / unit / 原值备查 / direction；
-#   ② 口径契约：quality / latency_mode / backlog_ratio（面板闸门要用）；
+#   ② 口径契约：trusted / latency_mode / backlog_ratio（面板闸门要用）；
 #   ③ 看板真正用得到的维度：track（按赛道拆看板）、series_key（身份分线键）、
-#      valid（看板级闸门）、campaign（批次过滤）。
+#      campaign（批次过滤）。
 # run 维度（车代号 / engine / version / build / JDK / dims / segment_form / env_id /
 # round / phase / codec / knn_params…）一律回 benchmark-result-race 查 —— 指标行上带一份只是重复：
 # 既白付体积（每行 20+ 个身份字段，7.9 万行就是几十 MB），又多一份漂移面。
 # 白名单是**导出期硬约束**：越界即判失败，脏载荷不进库（与 stat/unit 词表同级）。
 #
-# ⚠️ 2026-10-22 修复：c8f341b 只移植了 20da15e 的 kibana 适配，把本白名单与
-# benchmark-result-metric 的 strict 模板一起丢了 —— 导出器又变回「common 全量展开」，
-# 指标行 33 字段、模板 dynamic 不再 strict。重导会把已入库的 21 字段契约打回
-# 旧形状（体积 +30%，且白名单护栏失效）。此处按 20da15e 补回，并在 ES 侧
-# 用 dynamic:strict 让越界行直接被拒收。
+# ⚠️ 白名单与 benchmark-result-metric 的 strict 模板必须成套存在：少了白名单，
+# 导出器会退回「common 全量展开」，已入库的 21 字段契约被打回旧形状
+# （体积 +30%，白名单护栏失效）→ ES 侧用 dynamic:strict 让越界行直接被拒收。
 # ---------------------------------------------------------------------------
 METRIC_FIELDS = frozenset((
     "_index", "_id",
     "race_id", "@timestamp", "task", "operation", "family", "metric", "stat",
     "value", "unit", "value_original", "unit_original", "value_text", "direction",
-    # trusted：行级布尔「这一行的数字能不能用」。v1 的 quality(ok/degraded/unknown)
-    # 与 valid(true/false/null) 一起退役：场次级闸门（非 VALID / host-noise）移到
-    # 导出期 —— 不该入库的场次根本不写库，库里只剩行级可信度一个标记。
+    # trusted：行级布尔「这一行的数字能不能用」。场次级闸门（非 VALID / host-noise）
+    # 移到导出期 —— 不该入库的场次根本不写库，库里只剩行级可信度一个标记。
     "trusted", "latency_mode", "backlog_ratio",
     "track", "series_key", "campaign",
     # run_start：批次锚点（该批次最早一场 race 的时刻）。同一批次的所有行共享同一个值，
@@ -173,31 +166,21 @@ METRIC_REQUIRED = frozenset(("@timestamp", "family", "metric", "stat", "unit",
 # ---------------------------------------------------------------------------
 # benchmark-result-race / benchmark-result-env 字段白名单（存储方案 §2.2/§2.3 定稿）
 #
-# metric 有白名单而 race/env 长期没有 → 这两张表的 mapping 是「跑出来的」：
-# 模板声明 47，实写 env=59 / race=80，差额全是 ES 按写入自动补的（宽松 dynamic），
-# 拼错字段名静默进库、某个字段在不在 mapping 里取决于历史运气。
-# 定稿口径（与 metric 同一机制）：
+# 与 metric 同一机制：
 #   ① 白名单 = 导出期硬约束，越界即判失败；
 #   ② 模板逐字段显式声明 + dynamic:strict，ES 侧越界直接拒收（双重拦截）；
-#   ③ 导出期自检「文档字段 ⊆ 模板声明」，漏声明一个入库就是整批拒收
-#      （实测教训：strict 下漏 unit_original → 7.9 万行只进 2442 行）。
+#   ③ 导出期自检「文档字段 ⊆ 模板声明」，漏声明一个入库就是整批拒收。
 # 字段分四类（存储方案 §一）：
 #   身份正交六列      engine / version / engine_build / jdk_vendor / jdk_version / series_key
 #   声明证据列        jdk_want / jdk_measured / jdk_match_want / heap_declared / heap_measured / cores_declared / cores_tag…
-#                     —— 「想要什么」回显与「实测对账」双层均已退役：配置列只存实际生效值，
-#                     漂移检查由编排 heap_assert 起跑前承担；pkg* 保留（溯源）
+#                     —— 配置列只存实际生效值，漂移检查由编排 heap_assert 起跑前承担；pkg* 保留（溯源）
 #   run 维度          track / campaign / round / dims / codec / env_id…
 #   派生便利列        write_task_duration_s / throughput_docs_per_s_whole（报表用，非看板聚合口径）
 #                     store_size_gb_post_merge / segments_post_merge（赛末 forcemerge 后快照）
-# 已裁撤（2026-10-27 定稿）：build（包名主干，与 pkg 全冗余）、version_from_pkg
-# （包名推导版本，与 version+engine_build 冗余）—— 两列全仓零消费方，
-# sidecar 源层仍保留原始值，需要时可从 pkg 重推。
 RACE_FIELDS = frozenset((
     "_index", "_id",
     # 主键与时间。race_id 照搬 rally 原生 race-id（uuid，取主段；同批重跑双跑
-    # 字节一致幂等实测），另一段 race-id 记在 source。中途试过确定性键
-    # {campaign}|{车}-{赛道}-r{轮}|a{attempt}，已废——非 VALID 重试场与 rally
-    # 原生记账对不上，2026-11-03 用户拍板回归原生。
+    # 字节一致幂等实测），另一段 race-id 记在 source。
     "race_id", "@timestamp", "run_start", "campaign",
     # 身份正交六列（唯一事实源在本索引；benchmark-result-metric 只带 series_key）
     "engine", "version", "engine_build", "jdk_vendor", "jdk_version", "series_key",
@@ -390,14 +373,13 @@ def fid_of(d):
 # JDK 发行版（jdk25 车是 Oracle GraalVM 25，kona25 车是 Tencent Kona 25，
 # 两者主版本号都是 25，车名区分得开但看不出是两种发行版）。
 #
-# 系列键口径（2026-10-21 sam 确认）：引擎名@版本号@build号@JDK名
+# 系列键口径：引擎名@版本号@build号@JDK名
 #   ez@2.4.0@2975@graalvm21     ez@2.5.0@3015@graalvm25
 #   ez@2.5.0@3015@kona25        es@8.19.23@—@openjdk27
 # 口径代码在 identity.py（唯一来源），这里只做引用 —— 别在这里另写一份。
 #
-# 身份维度正交拆列（2026-10-21 sam 确认）：engine / version / engine_build /
-# jdk_vendor / jdk_version / series_key。索引里不再存 car / car_build / car_label /
-# arm* —— 那些都是「车代号」的重复编码，车代号只留在 user_tags.car。
+# 身份维度正交拆列：engine / version / engine_build / jdk_vendor / jdk_version /
+# series_key。车代号只留在 user_tags.car。
 # jdk_vendor 必须单列：GraalVM 25 与 Kona 25 的完整版本号都是 25.0.4，
 # 只有厂商能区分，而 JDK 厂商对比正是本项目要回答的问题。
 
@@ -493,9 +475,8 @@ def load_store(races_dir):
 #      与包名一一对应（见 REVISION_IDENTITY，由①②实测归纳）
 #
 # 为什么不用 campaign 的 PACKAGES.txt：那是"这一批装了哪些包"的清单，
-# 不是"这个车实际跑的是哪个包" —— ez240 车在 jdk3-20261016-* 批次里跑的是
-# 2.4.0-2975，PACKAGES.txt 里写的却是该批默认包 2.5.0-3015，
-# 按它推会把 ez240 标成 "ez240@3015"（引擎版本还是 2.4.0，自相矛盾）。
+# 不是"这个车实际跑的是哪个包" —— 按它推会把车标成自相矛盾的组合
+# （引擎版本还是 2.4.0，build 却是该批默认包的 3015）。
 #
 # revision → 身份对照表（每条都有部署日志或 sidecar 实测背书）：
 #   d8d3be54… → EasySearch 2.5.0-3015（部署日志 ×6 + sidecar 实测）
@@ -589,14 +570,14 @@ def load_campaign_meta(camp_dir):
     if os.path.isfile(pp):
         m["packages"] = open(pp, encoding="utf-8", errors="replace").read()
     # 本 campaign 自证的引擎包名（从 PACKAGES.txt 的 sha256+包名行解析）：
-    #   没有 sidecar 的历史 campaign（如 ds3-20261015）只能靠它，
+    #   没有 sidecar 的 campaign 只能靠它，
     #   否则会套用别的 campaign 实测到的车身份，把 3009 的场次标成 3015。
     for _mm in re.finditer(r"(easysearch|elasticsearch)-[0-9][^\s]*\.tar\.gz", m.get("packages") or ""):
         m.setdefault("pkg_own", {}).setdefault(_mm.group(1), _mm.group(0))
     # 受污染场次清单（每行一个 fid）：给该场 benchmark-result-race 文档打 caliber_warnings 标注。
     # 为什么单独存文件而不是写进 RACES.md：RACES.md 的状态列直接决定 valid，
     # 写成 CONTAMINATED 会让 valid=false，看板闸门 valid:true 会把这一场整个滤掉
-    # （ds-j2048 只有 jdk25 车有数据，一滤就空面板）。状态保持 VALID，
+    # （有数据的场一滤就空面板）。状态保持 VALID，
     # 污染事实走这个清单 + 文档 caliber_warnings 双通道留痕。
     # 臂级 build 表（PROGRESS.txt / SUMMARY.md 的臂头行）——与有没有 CONTAMINATED.txt 无关
     m["arm_builds"] = load_arm_builds(camp_dir)
@@ -610,8 +591,9 @@ def load_campaign_meta(camp_dir):
         except (ValueError, OSError):
             continue
         m["sidecar"][s["run"]["fid"] + "-" + s["run"]["phase"]] = s
-        # 重试场的 fid 带 -tryN，而 race.json 里没有轮试号——只有 sidecar 同时握有 race_id 与真实 fid，
-        # 用它做连接键，否则重试场会丢 sidecar（实测 JDK/heap 全 null）并套错 RACES.md 状态
+        # 连接键用 race_id（sidecar_by_race），不能用场次名拼：重试场的 fid 带 -tryN，
+        # 而 race.json 里没有轮试号 —— 拼名会丢 sidecar（实测 JDK/heap 全 null）
+        # 并套错 RACES.md 状态
         rid = (s.get("run") or {}).get("race_id")
         if rid:
             m["sidecar_by_race"][rid] = s
@@ -641,8 +623,8 @@ def load_campaign_meta(camp_dir):
         m.setdefault("mon", {})[base] = {
             "cpu_steal_avg": g("steal_avg"), "cpu_steal_max": g("steal_max"),
             "foreign_cpu_max": g("foreign_max"), "swapin": g("swapin"),
-            # load-monitor.sh 每 5 秒就采到、但摘要里一直只吐 5 个键的其余量 ——
-            # 现在补进摘要，这里一并接住（无需新增探针、无需改采样节奏）：
+            # load-monitor.sh 每 5 秒就采到、但摘要里只吐 5 个键的其余量 ——
+            # 这里一并接住（无需新增探针、无需改采样节奏）：
             "cpu_usr_avg": g("cpu_usr_avg"), "cpu_usr_max": g("cpu_usr_max"),
             "cpu_sys_avg": g("cpu_sys_avg"), "cpu_sys_max": g("cpu_sys_max"),
             "bench_cpu_avg": g("bench_cpu_avg"), "bench_cpu_max": g("bench_cpu_max"),
@@ -654,19 +636,17 @@ def load_campaign_meta(camp_dir):
     return m
 
 
-# 写入阶段的 degraded 阈值（2026-10-21 定）
+# 写入阶段的 degraded 阈值
 #
-# degraded 的原始动机：error_rate=1.0（该 task 全部请求失败）时，
+# degraded 的动机：error_rate=1.0（该 task 全部请求失败）时，
 # rally 吐出的时延量的是"失败响应有多快"（实测 nested p99 只有 0.22s），
 # 混进延迟曲线会把引擎显得比实际更快 —— 所以这类行不能进图。
 #
-# 但"error_rate > 0"一刀切过严：实测 GIST 系向量赛道（ds-g1920 / ds-g960）
-# 的 index-append error_rate 稳定在 0.0017~0.0023（约 0.2%，
-# 100 万条里丢 2000 条），ds3 与本轮复测（2.5.0-3015）都复现 ——
-# 是**可复现的血统特性**，不是测量事故。这种量级的 bulk 偶发失败不影响
-# 吞吐/时延的量级（rally 按成功处理量计吞吐），检索质量也没塌
-# （实测 recall k=10 0.9643 / k=100 0.996），却会让这两个赛道的写入数据
-# 整批被 quality 闸门挡在看板外。
+# 但"error_rate > 0"一刀切过严：GIST 系向量赛道（ds-g1920 / ds-g960）的
+# index-append error_rate 稳定在 0.0017~0.0023（约 0.2%，100 万条里丢 2000 条），
+# 多个批次都复现 —— 是**可复现的血统特性**，不是测量事故。这种量级的 bulk 偶发失败
+# 不影响吞吐/时延的量级（rally 按成功处理量计吞吐），检索质量也没塌，
+# 却会让这两个赛道的写入数据整批被 quality 闸门挡在看板外。
 #
 # 所以：写入阶段 error_rate > 1% 才降级；查询侧维持 > 0 即降级
 # ——查询 task 全失败的时延污染才是主要风险，查询侧不放松。
@@ -745,7 +725,7 @@ def latency_semantics(lat_blk, svc_blk, gt_mode):
 # 召回率是方案 §一 的硬护栏（Recall@10 ≥ 0.95 / Recall@100 ≥ 0.99），
 # 但探针（hv-recall-self.py）是查询跑完之后离线跑的，结果落在
 # campaigns/<campaign>/results/recall-<fid>[-k<k>].json ——
-# 既不在 race.json 里，也没进 sidecar，于是导出器的 recall 分支（读 sidecar["recall"]）
+# 既不在 race.json 里，也没进 sidecar，导出器的 recall 分支（读 sidecar["recall"]）
 # 一直是空的：全库 family 分布里查不到 recall，护栏形同虚设。
 #
 # 这里把它接进导出：campaign + fid 对上该场**查询** race，就随该场一起出指标行，
@@ -940,14 +920,14 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
 
 
 # ---------------------------------------------------------------------------
-# 导出期口径契约断言（2026-10-20 复审新增）
+# 导出期口径契约断言
 #
 # 导出是纯函数、产出可 diff 的载荷快照 —— 架构上完全有能力在写出前发现口径缺陷。
-# 上一版没有这一步，于是下面三类问题全部静默进了 ES：
+# 下面三类问题会全部静默进 ES，必须在导出期拦住：
 #   1) stat 词表越界：rally 的 99_99 分位原样漏进 stat 列，与 p999 并存
-#   2) 失败 task 的时延行与成功 task 混在同一张延迟曲线里（15 场 nested，valid=true）
+#   2) 失败 task 的时延行与成功 task 混在同一张延迟曲线里
 #   3) 同一 (family, stat) 在不同 task 下量着不同的东西（开环/闭环的 latency）
-# 现在这三条是**致命**的：导出直接非零退出，不让脏数据进库。
+# 这三条是**致命**的：导出直接非零退出，不让脏数据进库。
 # 覆盖率与一致性提示是**非致命**的：写进 manifest 供核对，不阻断流水线。
 # ---------------------------------------------------------------------------
 def validate_payload(runs, metrics, envs=()):
@@ -1063,10 +1043,10 @@ def validate_payload(runs, metrics, envs=()):
         for cv in (r.get("challenge") or []):
             if cv not in CANON_CHALLENGE:
                 problems.append("challenge 越界（不在源值词表内）: %r  %s" % (cv, r.get("race_id")))
-    # ---- 指标行必须归属已入库的场次（2026-11-03 补）----
+    # ---- 指标行必须归属已入库的场次 ----
     # 每行 metric 的 race_id 必须能在 race 索引里找到主人。主键是 rally 原生
     # race-id（uuid），段级 SEG| 键是导出期中间量，合并后不得外流 ——
-    # 之前断言缺位，被剔场次漏出的 4 行 recall（SEG| 前缀）让自检假阴性。
+    # 外流出去的 SEG| race_id 在 race 索引查无此人，自检会假阴性。
     run_ids = {r.get("race_id") for r in runs}
     _orphans, _badfmt = {}, {}
     for m in metrics:
@@ -1110,14 +1090,12 @@ def validate_payload(runs, metrics, envs=()):
 # ---------------------------------------------------------------------------
 # 场次身份：真 fid 与重试号的恢复
 # ---------------------------------------------------------------------------
-# race.json 里**没有 fid** —— 它是导出器用 user-tags 的「车/赛道/轮次」拼出来的，
-# 拼的时候会丢掉重试号（-tryN）。真 fid 只存在于两个地方：
+# race.json 里**没有 fid**（导出器用 user-tags 拼的会丢掉重试号 -tryN），
+# 真 fid 只存在于两个地方：
 #   ① campaign 的 results/<fid>[-tryN]-<phase>-race.json 的**文件名**
 #   ② sidecar 的 run.fid
 # ① 覆盖更广：文件名里有 race-id，能与 rally store 里的 uuid 目录对上；
-# ② 只有 40% 的场次有 sidecar。
-# 实测：含 -tryN 的 4 场全部能从 ① 精确还原；其余 135 场（早期批次）本来就没有重试，
-# 拼出来的 fid 就是对的 —— 所以恢复是 100% 正确的，不靠猜。
+# ② 只有一部分场次有 sidecar。恢复只认这两个来源，不靠猜。
 _FID_FILE_RE = re.compile(r"^(.*)-(w|q|m|wq)-race\.json$")
 _TRY_RE = re.compile(r"-try(\d+)$")
 
@@ -1146,7 +1124,7 @@ def track_from_fid(fid):
     """真 fid（{车}-{赛道}-r{轮}[-tryN]）→ 赛道名。
 
     fid 的赛道段是**唯一可靠**的来源：user_tags.track 在早期批次里被解析器写成了
-    键名（字面量 "track"，实测 923 场），而 fid 是编排时定的。
+    键名（字面量 "track"），而 fid 是编排时定的。
     赛道名本身含 '-'（ds-g1920 / hvtp200k-3s），所以用贪婪匹配。
     """
     if not fid:
@@ -1166,9 +1144,8 @@ _SUMMARY_ARM_RE = re.compile(r"^##\s+(\S+)\s*\((\d[\d.]*)-(\d+)\)", re.M)
 def load_arm_builds(camp_dir):
     """批次级的「臂 → build」表。
 
-    esrm-20261014-003226 那批没有 sidecar，臂头行里却写着 ez250 (2.5.0-3008) ——
-    之前导出器只能把它写成 "—"，15 场挤进同一条线。臂头行是**批次级**证据：
-    同一批次里这个臂用的就是这个 build。
+    没有 sidecar 的批次靠臂头行拿 build（否则只能写 "—"，所有未知 build 的车挤进
+    同一条线）。臂头行是**批次级**证据：同一批次里这个臂用的就是这个 build。
     """
     out = {}
     for name, rx in (("PROGRESS.txt", _ARM_BUILD_RE), ("SUMMARY.md", _SUMMARY_ARM_RE)):
@@ -1199,8 +1176,8 @@ def arm_build_of(arms, car):
 def variant_from_fid(fid):
     """真 fid（{车}-{变体}-r{轮}[-tryN]）→ 变体段（不做归一）。
 
-    变体 id 不再入库（track_variant 已退役，覆盖判定由 codec/source_reuse 列派生，
-    见 bench-history.variant_id_of）；保留本函数供溯源/调试读取 fid 中段。
+    变体 id 不入库（track_variant 已退役，覆盖判定由 codec/source_reuse 列派生，
+    见 bench-history.variant_id_of）；本函数供溯源/调试读取 fid 中段。
     """
     base = _TRY_RE.sub("", fid or "")
     m = re.match(r"^[^\-]+-(.+)-r\w+$", base)
@@ -1208,7 +1185,7 @@ def variant_from_fid(fid):
     return None
 
 
-# 赛道名对齐官方 rally-tracks（2026-11-03 定）：geonames 就叫 geonames。
+# 赛道名对齐官方 rally-tracks：geonames 就叫 geonames。
 # 只作用于**输出层**（canon_track / 入库值）；fid 拼接与 RACES.md 回查仍用历史名
 # （TRACK_NAME 不动），否则 jdk25-geo-r1 拼成 jdk25-geonames-r1 查不到记账。
 _TRACK_RENAME = {"geo": "geonames"}
@@ -1296,17 +1273,15 @@ def main():
     # (campaign, fid) → 场次回填材料（track/时间/valid/quality/series_key），
     # monitors 补的 system 行从这里取自己批次的值。
     # 键必须带 campaign：fid（{car}-{track}-r{round}）**只在一个 campaign 内唯一**，
-    # 跨 campaign 反复出现（jdk25-geo-r3 在 jdk3 与 jdk4 时代都跑过）——旧版用
-    # 跨批次全局字典 + setdefault（先到先得），后跑的批次会把 system 行挂到
-    # 别的批次的场次上（实测 jdk4 批次因此多出 10-14~10-22 的假日期，批次跨度虚报成 11 天）。
+    # 跨 campaign 反复出现 —— 用跨批次全局字典 + setdefault（先到先得）会把 system 行
+    # 挂到别的批次的场次上（批次跨度虚报）。
     camp_fid = {}
     seen = set()
     unmatched = 0
     skipped_no_campaign = 0
     # ---- 批次锚点预扫描：campaign → 该批次最早一场 race 的时刻 ----
-    # 一次发压批次可能跨 UTC 午夜（实测 esrm-20261014-003226 跑了
-    # UTC 10-13 16:36 → 10-14 01:49），按 @timestamp 分桶会把**一次实验切成两段**，
-    # 写入阶段与查询阶段落到不同日桶，日均值因此塌陷（nested 10-14 实测 12.59 vs 正常 ~750）。
+    # 一次发压批次可能跨 UTC 午夜，按 @timestamp 分桶会把**一次实验切成两段**，
+    # 写入阶段与查询阶段落到不同日桶，日均值因此塌陷。
     # run_start 给每行一个批次锚点：同一批次的所有行共享同一个值，按它分桶恒为一个桶。
     # 不落 run_day（本地日）：批次归属日可由 run_start + 时区折算，落一个派生列只会多一处
     # 口径分叉；run_start 是绝对时刻，唯一真相。
@@ -1355,10 +1330,9 @@ def main():
             fid = real_fid   # 真 fid 才是本场唯一身份（含变体名与 -tryN），比 car-track-rN 拼出来的准
         # 赛道名有两条来源，**谁命中规范名登记表就用谁**：
         #   ① 真 fid 的赛道段 —— user_tags.track 在早期批次里是解析器写坏的字面量
-        #      （"track"，实测 923 场），而 fid 是编排时定的，可靠；
+        #      （"track"），而 fid 是编排时定的，可靠；
         #   ② rally 记的 track 字段 —— 有几场它的 fid 形态本身是脏的
-        #      （jdk25-3009-hvtp200k-3s-rNone，车代号段多带了 build 号），
-        #      但 track 字段是规范名。
+        #      （车代号段多带了 build 号），但 track 字段是规范名。
         # 两条都不命中 → 归一不出来，这场不写库（见写入侧闸门）。
         _tr_fid = canon_track(track_from_fid(fid))
         _tr_tag = canon_track(d.get("track"))
@@ -1376,7 +1350,7 @@ def main():
                 warn.append("受宿主旁路负载污染：该场写赛窗口内落过宿主侧全量导出，吞吐可能偏低，结论以重跑为准")
                 break
         if camp.startswith("ds3-") and eng_tag != "es819":
-            warn.append("heap 声明不实：user_tags heap:16g 但 ds3 campaign 的 easysearch 车实测 -Xmx1g（2026-10-16 事故），绝对值不可与他批比较")
+            warn.append("heap 声明不实：user_tags heap:16g 但 ds3 campaign 的 easysearch 车实测 -Xmx1g，绝对值不可与他批比较")
         if not side:
             warn.append("no-sidecar：JDK/heap/clients/bulk 无实测值，仅有 user_tags 声明")
         if status is None:
@@ -1387,7 +1361,7 @@ def main():
         #   ① 非 VALID（RACES.md 记 SKIP / QUERY-FAIL，或根本没记账）→ 整场不写
         #   ② host-noise（CONTAMINATED.txt 人工登记：宿主旁路负载污染）→ 整场不写
         # 场次级过滤放在写入侧，而不是"入库后再让每个面板记得加过滤"——
-        # 后者漏一个面板就混进脏数据（旧数据里那 733 行未记账场次就是这么留下的）。
+        # 后者漏一个面板就混进脏数据。
         # 被剔的场次在 manifest 的 dropped 段留清单，可审计。
         _drop_reason = None
         if status != "VALID":
@@ -1418,7 +1392,7 @@ def main():
         if not engine and rev_id:
             engine = rev_id[0]
         if not engine:
-            # 没有 sidecar 的早期 campaign（如 ds3 维度扫描）：rally 记的 distribution-flavor
+            # 没有 sidecar 的 campaign：rally 记的 distribution-flavor
             # 足以区分产品线 —— easysearch=oss，elasticsearch=default
             flavor = (d.get("cluster") or {}).get("distribution-flavor")
             engine = {"oss": "easysearch", "default": "elasticsearch"}.get(flavor)
@@ -1436,8 +1410,8 @@ def main():
                    or (deploy_eng[1] if deploy_eng else None)
                    or (rev_id[1] if rev_id else None)
                    or (d.get("cluster") or {}).get("distribution-version"))
-        # build（包名主干）与 version_from_pkg 已裁撤（2026-10-27 定稿）：
-        # 与 pkg / version / engine_build 完全冗余且全仓零消费方 —— 不再产出。
+        # build（包名主干）与 version_from_pkg 不再产出：与 pkg / version /
+        # engine_build 完全冗余且全仓零消费方。
         # 构建号（3015 / 3009 …）：version 字段只有主次版本（如 2.5.0），无法区分
         # 跨 build 的两批数据。ds3 首轮是 2.5.0-3009、ds2 是 2.5.0-3015，
         # 车标签相同（jdk25/jdk26/jdk27）时看板上会混成一条线，必须能按 build 过滤。
@@ -1480,21 +1454,18 @@ def main():
         heap_gb = round(max(heap_max) / 1024, 2) if heap_max else None
         tp = d.get("track-params") or {}
         # 实验变量：维度/段形态 —— 从 user-tags 与 track params 提升为 typed 列（方案 §3.2）
-        # lineage（j/g 语料血统）2026-11-03 退役：它只编码在 ds-j*/ds-g* 的 track 名里，
-        # 与 track/corpus_name 一一对应（9 语料 ↔ 9 赛道零交叉），纯派生列不再入库。
         # dims 的来源顺序（§五·17 定案）：编排 user-tags → track params → **侧车实测**
         # knn_params.dims → 赛道登记表兜底。侧车实测排在登记表前面：它是本场实际建索引
-        # 用的维度，登记表只是赛道默认值。2026-11-04 补上侧车这一路后，hv1024x 家族的
-        # dims 从 null 变成 1024。
+        # 用的维度，登记表只是赛道默认值。
         _knn_dims = (knn_params_of(side) or {}).get("dims")
         dims = ut.get("dim") or tp.get("dim") or _knn_dims
         segment_form = ut.get("segment_form") or tp.get("segment_form")
 
-        # ---- 场次可信度（2026-10-20 复审新增）----
+        # ---- 场次可信度 ----
         # RACES.md 的 status 只反映"这场跑完了没有"，不反映"结果可不可用"。
-        # 实测 15 场 nested 的某个 operation error_rate=1.0（该 task 全部请求失败），
-        # status 却是 VALID → valid:true → 这些失败 task 的"漂亮延迟"（失败响应很快，
-        # p99 只有 0.22s）被混进查询延迟曲线，把引擎显得比实际更快。
+        # 某个 operation error_rate=1.0（该 task 全部请求失败）时，status 仍是 VALID
+        # → valid:true → 这些失败 task 的"漂亮延迟"（失败响应很快）被混进查询延迟曲线，
+        # 把引擎显得比实际更快。
         # 这里按 task 逐个判 error_rate，场次级取最差；行级 quality 由 emit_metrics 落。
         op_metrics = (d.get("results") or {}).get("op_metrics") or []
         task_quality_map = {}
@@ -1509,15 +1480,15 @@ def main():
         else:
             race_quality = "ok"
         # 赛级指标（store_size / segment_count / GC / merge…）量的是**写阶段**的状态，
-        # 一个查询 task 失败不该把它们一起降级 —— 否则 15 场 nested 的磁盘与 GC 数据
-        # 会因为一个查询 task 挂了而从看板上消失。只有写阶段自己失败才降级。
+        # 一个查询 task 失败不该把它们一起降级 —— 否则磁盘与 GC 数据会因为一个查询
+        # task 挂了而从看板上消失。只有写阶段自己失败才降级。
         write_degraded = any(is_write_task(t) for t in degraded_tasks)
         race_row_quality = "degraded" if write_degraded else "ok"
 
         # ---- common = 场次级 + 指标行共用的维度 ----
         # 身份维度只在 benchmark-result-race 存全套（engine/version/engine_build/jdk_vendor/
         # jdk_version/series_key）；benchmark-result-metric 只带 series_key（看板分线的唯一依赖）。
-        # 车代号（car/arm/car_build/car_label）不再入库 —— 那是「车代号」的重复编码，
+        # 车代号（car/arm/car_build/car_label）不入库 —— 那是「车代号」的重复编码，
         # 车代号只留在 user_tags.car，身份靠上面六个正交字段表达。
         # ---- 段级标识：一次测量 = (批次 × 真fid × 重试号) ----
         # seg_key 是导出期中间量；合并后映射到最终 race_id。
@@ -1551,10 +1522,9 @@ def main():
             _cn, _cd = CORPUS_NAME.get(d.get("track")), DOCS.get(d.get("track"))
             _corpus = {"name": _cn, "docs": _cd} if (_cn or _cd) else {}
         _cluster = d.get("cluster") or {}
-        # 配置列（实际生效值）：编排标签优先（覆盖 99%），sidecar 声明兜底（覆盖 40%）——
+        # 配置列（实际生效值）：编排标签优先，sidecar 声明兜底 ——
         # 同一事实的两条来源路径，不是两列（"一个事实只占一列"）。
-        # 只记一层的前提：编排侧 heap_assert 起跑前断言实际生效堆=标签（fail-fast），
-        # 赛后漂移对账退役（实测层历史零冲突，且 ds3 1g 事故那批无 sidecar 本就测不到）。
+        # 只记一层的前提：编排侧 heap_assert 起跑前断言实际生效堆=标签（fail-fast）。
         _cfg_heap = heap_mb_of(ut.get("heap")) or srp.get("heap_declared_mb")
         _cfg_cores = ut.get("cores") or srp.get("cores_declared")
         # 赛末体积：探针落的是 GiB，契约统一用 GB（×1.073741824）。
@@ -1618,16 +1588,12 @@ def main():
             # ---- 召回率行：挂到该场**查询** race 上 ----
             # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
             # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
-            # 必须和 emit_metrics 一样待在闸门的 else 里 —— 之前它缩进在闸门外，
-            # 被剔场次的 recall 行照写不误，SEG| race_id 在 race 索引查无此人
-            # （实测漏了 4 行，2026-11-03）。
+            # 必须和 emit_metrics 一样待在闸门的 else 里 —— 放在闸门外，
+            # 被剔场次的 recall 行照写不误，SEG| race_id 在 race 索引查无此人。
             # 召回率行：**查询相**的场次才发。
-            # phase=="q" 是老协议（读写分跑）；phase=="wq" 是 2026-10-28 起的单挑战
-            # `full` 协议（读写同一段跑）—— 查询相就在同一段里。
-            # 2026-11-04 修：原来只判 phase == "q"，把 full 协议场次的 recall 行全漏了 ——
-            # 实测 hv1024x 家族 15 场在 campaign 里都产出了真 recall 文件（30 个 × ~210 字节），
-            # 却一行都没进库（库里 recall 只有 ds-* 赛道）。query 相漏掉就是「数据在库里
-            # 但从没被查过」那一类（DESIGN §七·2 记录过同款）。
+            # phase=="q" 是老协议（读写分跑）；phase=="wq" 是单挑战 `full` 协议
+            # （读写同一段跑）—— 查询相就在同一段里。两个都要判，
+            # 只判 q 会把 full 协议场次的 recall 行全漏了（"数据在库里但从没被查过"）。
             if phase in ("q", "wq"):
                 _rec = recall_idx.get((camp, fid))
                 if not _rec:
@@ -1639,10 +1605,7 @@ def main():
                     # recall 行的 trusted 取**它自己那个 task** 的判定，不是整场的判定。
                     # 场级 trusted 是"任一 task 坏了就整场不可信"，而 recall 只回答
                     # 一个 task 的召回率。两者混用会让同一 (场次, task) 出现 trusted
-                    # 不一致的行 —— 实测 jdk4-20261023-235532 的 jdk27-ds-j2048-r3：
-                    # knn-search-100-1000-x32 有 0.02% 失败 → 场级 false，而
-                    # knn-search-10-100 本身干净 → 它的 recall 行若取场级就是 false，
-                    # 与同 task 的时延行（true）打架，导出期断言直接拒收整批。
+                    # 不一致的行 —— 与同 task 的时延行打架，导出期断言直接拒收整批。
                     # 探针的 task 名与 op_metrics 的 task 名同源（RECALL_TASK_BY_K），
                     # 对不上就回落场级判定。
                     _q = task_quality_map.get(_task)
@@ -1691,9 +1654,9 @@ def main():
             unmatched += 1
 
     # ---- 合并：同一次测量的多个段合成一行 race ----
-    # 老协议一次测量跑两段（写赛 + 查赛），老脚本把它们存成两场；新协议一次跑完只有一段。
+    # 拆分协议一次测量跑两段（写赛 + 查赛），存成两场；单挑战协议一次跑完只有一段。
     # 合并后「一次比赛 = 一行」。赛级指标（results 块：disk/gc/merge/throttle）也只剩一份 ——
-    # 两段实测同值（实测 1947 个 (family,metric,stat) 两场完全一致），留两份就是重复计数。
+    # 两段实测同值，留两份就是重复计数。
     seg_groups = {}
     for seg in segments:
         seg_groups.setdefault(seg["key"], []).append(seg)
@@ -1712,9 +1675,9 @@ def main():
         segs_sorted = sorted(segs, key=lambda x: (x["phase"] != "w", x["ts"] or ""))
         primary = segs_sorted[0]
         # 主键照搬 rally 原生 race-id：uuid 存在 race.json 文件里，重导出不变 →
-        # upsert 幂等成立（"uuid 不能幂等"是旧论据错误，它不是每次生成的新 id）。
+        # upsert 幂等成立。
         # 两段测量主键取主段（写段优先）的，另一段的 uuid 在 source 溯源列里；
-        # 新协议 full 一场一段，主键与 rally id 一一对应。
+        # 单挑战 full 一场一段，主键与 rally id 一一对应。
         # 兜底：极老 race.json 缺 race-id 时退回业务键（重导出核对覆盖率）。
         race_id = primary.get("rally_id") or "%s|%s|a%d" % (key[0], key[1], key[2])
         row = dict(primary["row"])
@@ -1783,15 +1746,15 @@ def main():
             fid, node = (m.group(1), m.group(2)) if m else (key.partition("-")[0], key.partition("-")[2])
             # 相位后缀 -w/-m/-q/-wq（分相位或单挑战全程采集，与 race 行 phase 同词汇）；
             # 剥掉后缀让环境行与 race 行同 fid 对上，相位记进 phase 字段。
-            # 报告侧按 fid 聚合取最坏即自动跨相位；历史 campaign 无后缀 → phase=""
+            # 报告侧按 fid 聚合取最坏即自动跨相位；无后缀的 campaign → phase=""
             ph = ""
             if fid.endswith("-wq"):
                 ph, fid = "wq", fid[:-3]
             elif fid.endswith(("-w", "-m", "-q")):
                 ph, fid = fid[-1], fid[:-2]
             # 该 campaign 里找不到这场 race → monitors/ 目录被别的批次的产物污染
-            # （服务器侧目录混放）。这种行的时间戳/身份只能取自别的批次（全局字典时代的
-            # 串味根源），宁缺毋滥：直接丢弃，manifest 记数。治本 = 清理源层 monitors/。
+            # （服务器侧目录混放）。这种行的时间戳/身份只能取自别的批次（串味），
+            # 宁缺毋滥：直接丢弃，manifest 记数。治本 = 清理源层 monitors/。
             src = camp_fid.get((camp, fid))
             if src is None:
                 orphan_fids.setdefault(camp, set()).add(fid)
@@ -1807,7 +1770,7 @@ def main():
                     metrics.append({"_index": "benchmark-result-metric", "_id": "env|%s|%s|%s|value" % (camp, key, mk),
                                     "@timestamp": src["ts"], "campaign": camp, "node": node,
                                     # race_id 指回这次测量（合并后的主键）——
-                                    # 旧版 system 行没有它，只能靠文件名反查，孤儿行查不到就丢。
+                                    # 无 race_id 的旧 system 行只能靠文件名反查，孤儿行查不到就丢。
                                     "race_id": src["race_id"],
                                     # run_start：system 行也归属该批次 → 同一个锚点，
                                     # 否则同一批次里一半行有锚点一半没有，按它分桶会裂成两个桶。
@@ -1967,7 +1930,7 @@ def main():
                  "benchmark-result-metric": TPL_METRIC}
     # 自检：三张 strict 模板必须覆盖各自文档的**全部字段** ——
     # 漏声明一个字段，ES 侧会整批拒收（strict_dynamic_mapping_exception）：
-    # 载荷看着正常、库里却少几万行（实测漏 unit_original → 7.9 万行只进 2442 行）。
+    # 载荷看着正常、库里却少几万行。
     # 这种错不能留到入库时才发现 —— 这里先验后写。
     for _idx, _docs in (("benchmark-result-race", runs), ("benchmark-result-env", list(envs.values())),
                         ("benchmark-result-metric", metrics)):
@@ -1982,7 +1945,7 @@ def main():
     with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"generated_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                    # races_scanned = 扫到的 rally run 数（段）；bench_run = 合并后的**测量次数**
-                   # （一次比赛 = 一行）。两者不等是正常的：老协议一次测量跑写赛+查赛两段。
+                   # （一次比赛 = 一行）。两者不等是正常的：拆分协议一次测量跑写赛+查赛两段。
                    "races_scanned": len(seen), "segments_scanned": len(segments),
                    "bench_run": len(runs), "bench_metric": len(metrics),
                    "bench_env": len(envs), "system_rows": sysrows,

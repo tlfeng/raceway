@@ -34,14 +34,9 @@ IDX = ("benchmark-result-env", "benchmark-result-race", "benchmark-result-metric
 def flatten_fields(template):
     """从 index template 里取出映射为 flattened 的字段名。
 
-    flattened 是「对象」型 mapper，但 EasySearch 2.5.0 的实现比 ES 8.x 少一层
-    保护：ES 的 FlattenedFieldMapper.parse 对 null 早返回，EasySearch 没有，
-    于是文档里出现显式 null 时报
-        "tried to parse field [x] as object, but got EOF"
-    flattened 也不认 null_value 参数（实测 unsupported parameters），
-    所以唯一可行的处理是：值为 null 时把字段整个省掉。
-    对 ES 语义等价 —— null 与缺失同样不进倒排、不参与聚合与 exists 查询，
-    只是 _source 里少一个键。
+    EasySearch 的 flattened 不认 null_value，且显式 null 会报
+    "tried to parse field [x] as object, but got EOF"（ES 的 parse 对 null 早返回）
+    → 值为 null 时只能把字段整个省掉（对 ES 语义等价）。
     """
     props = ((template or {}).get("template", {}).get("mappings", {}) or {}).get("properties", {}) or {}
     return {name for name, spec in props.items()
@@ -192,7 +187,7 @@ def caused_text(cb):
 def fmt_fail(action):
     """把 bulk 里的单条失败压成一行可读摘要（保留 ES 给的 reason / caused_by）。
 
-    整条 action JSON 动辄几百字符，真正定位问题的是 status / error.type /
+    整条 action JSON 动辄几百字符；定位问题的是 status / error.type /
     error.reason / error.caused_by / _id，其余部分不打印。
     """
     err = action.get("error")
@@ -216,8 +211,8 @@ def fmt_fail(action):
 def flush(args, buf, sent):
     """提交一批 bulk，返回 (失败条数, 本批失败样例列表)。
 
-    strict 拒收是静默的：ES 会整条丢掉类型冲突的文档，而 bulk 仍然返回 200 ——
-    不看 per-item 的 status 就会以为灌成功了。所以失败条数要一路带回 main，
+    strict 拒收是静默的：ES 会整条丢掉类型冲突的文档，而 bulk 仍返回 200 ——
+    不看 per-item 的 status 就会以为灌成功了。失败条数要一路带回 main，
     最后以非 0 退出码结束，而不是打印一句"完成"就当重灌成功。
     """
     try:

@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """hv1024x 家族：四臂一份定义 + track-params —— 渲染结果必须逐臂正确
 
-2026-11-04 之前，这家族是四份目录（hv1024x / -int8 / -bbq / -codec-zstd-sr），
-只差 `index.json` 里的一行。现在收成一份基座 + 两个参数维度：
+一份基座 + 两个参数维度：
 
     量化档  → vector_index_type=int8_hnsw | bbq_hnsw  （index_options.type）
     压缩档  → index_codec=ZSTD + source_reuse=true     （settings）
@@ -120,7 +119,7 @@ class TestHv1024xFamily(unittest.TestCase):
             self.assertIn(needle, self.tmpl, '定版 index.json 缺条件块: %s' % needle)
 
     def test_no_duplicate_arm_directories(self):
-        """家族只剩一份基座目录（旧的四份目录不要再回来）。"""
+        """家族只剩一份基座目录（差异应由 track-params 表达）。"""
         tracks = os.path.join(ROOT, 'tracks')
         leftovers = [d for d in os.listdir(tracks)
                      if d.startswith('hv1024x-') and os.path.isdir(os.path.join(tracks, d))]
@@ -128,7 +127,7 @@ class TestHv1024xFamily(unittest.TestCase):
                          '量化族又出现多份目录（差异应由 track-params 表达）: %s' % leftovers)
 
     def test_create_only_probe_still_available(self):
-        """建索引探针（复现 ezs 臂故障用）必须随基座保留。"""
+        """建索引探针必须随基座保留（用于复现建索引类故障）。"""
         p = os.path.join(TRACK_DIR, 'challenges', 'create-only.json')
         self.assertTrue(os.path.isfile(p), '缺建索引探针: %s' % p)
         self.assertIn('"name": "create-only"', _read(p))

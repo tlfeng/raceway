@@ -33,16 +33,40 @@
 
 ```bash
 cp vm-bench.env.example vm-bench.env && vi vm-bench.env   # 填路径、凭据、阈值（真身不入库）
-scp *.sh *.py *.conf vm-bench.env 压测机:/opt/raceway/      # 脚本在压测机上跑
+scp -r *.sh *.py *.conf vm-bench.env tracks kibana 压测机:/opt/raceway/   # 脚本 + 赛道定义 + 建板工具链
 ./doctor.sh                                                # 新环境体检：六组只读检查，✘ 的项给出修法
 ./run-bench.sh --dry-run geo 3 my3.conf                    # 预览排程：秒回，不碰集群
 ```
+
+⚠️ **`scp` 必须带上 `tracks/`**（和 `kibana/`）：赛道定义在 git 里，压测机没有它就跑不起来。漏同步的典型症状是起跑时找不到赛道定义。
 
 节点清单从 ibs 的 `ip.txt` 推导，**不用手抄 IP**；还没规划拓扑就先跑 ibs 的一键初始化。
 
 `vm-bench.env` 是硬前置 —— 缺了它连 `./run-bench.sh list` 都跑不动。
 
-### 二、三种编排方式
+压测机上随时可以问这两个命令，**不用翻文档**：
+
+```bash
+./run-bench.sh --help    # 完整用法页：参数、三种编排、赛道清单、前置条件、产物在哪
+./run-bench.sh list      # 可用赛道 + 每个赛道的定义目录 + 现在能不能跑 + 近期 campaign
+```
+
+### 二、我想跑什么 → 敲什么
+
+| 我要跑的 | 命令 | 备注 |
+|---|---|---|
+| geonames 基座 | `./run-bench.sh geo 3` | 官方基座；语料 rally 自动下载 |
+| geonames 存储压缩对比 | `./run-bench.sh codec 3` | 六个变体（压缩 × source_reuse）；ES 只认 default / best_compression |
+| 1024 维向量 | `EXPECT_CPU_CORES=8 ./run-bench.sh hv1024 3` | 先 `./cpu-affinity.sh apply 8`；语料路径见 `HV_CORPUS` |
+| 1024 维四臂（量化/压缩） | `./run-bench.sh hv1024x-int8 3` | `hv1024x` / `-int8` / `-bbq` / `-codec-zstd-sr` 四臂；压缩臂仅 Easysearch |
+| 96 维 200 万向量 | `./run-bench.sh hnsw 3` | 定义在机器上（`TRACK_HNSW_BASE`） |
+| nested 文档 | `./run-bench.sh nested 3` | 官方基座 |
+| 维度扫描（多档位） | `SCHEDULE_FILE=… CARS_FILE=… DS_HOURS=12 ./run-bench.sh ds` | 定义待回灌，见 [tracks/README.md](tracks/README.md) |
+| 冒烟 / 补跑一场 | `./run-bench.sh geo 1` | 断点续跑：已 VALID 的场自动跳过，`FRESH=1` 强制重跑 |
+
+每场时长与多配置对比的写法见 [docs/GUIDE.md §1](docs/GUIDE.md)。
+
+### 三、三种编排方式
 
 | 方式 | 命令 | 什么时候用 |
 |---|---|---|
@@ -60,14 +84,14 @@ ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819
 
 > 排程模式的两个文件格式、能调的旋钮、断点续跑规则，见 [docs/GUIDE.md §3](docs/GUIDE.md#3-三种编排方式)。
 
-### 三、跑起来之后
+### 四、跑起来之后
 
 ```bash
 tail -f campaigns/<campaign>/PROGRESS.txt    # 实时日志：当前场次 + 阶段
 cat    campaigns/<campaign>/RACES.md          # 逐场判定表（VALID / 各类失败）
 ```
 
-### 四、对比与入库
+### 五、对比与入库
 
 ```bash
 # 两个配置对比；--assert 的阈值表是 CSV：track,task,metric,>=|<=,value
@@ -82,7 +106,7 @@ python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--inse
 
 `--assert` 只要有一条不达标就以退出码 1 结束，可以直接接进 CI 做发版回归。三张索引的口径见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md)。
 
-### 五、控制台（可选）
+### 六、控制台（可选）
 
 ```bash
 python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 排程 / 进度 / 历史，三页合一
@@ -95,9 +119,10 @@ python3 bench-compose.py start --cars-file <f> --tracks ds-* --rounds 3 --ds-hou
 
 | 文档 | 内容 |
 |---|---|
-| [docs/GUIDE.md](docs/GUIDE.md) | 使用手册：上篇「怎么跑」，下篇「跑起来之后」（分层、脚本清单、单场流程、赛道、控制台、踩过的坑） |
+| [docs/GUIDE.md](docs/GUIDE.md) | 使用手册：上篇「怎么跑」，下篇「跑起来之后」（分层、脚本清单、单场流程、赛道、控制台、规则与后果） |
 | [docs/METHODOLOGY.md](docs/METHODOLOGY.md) | 方法学与口径：卡点链、统计口径、时延口径、三张索引的字段与词表 |
 | [docs/hv1024-track.md](docs/hv1024-track.md) | hv1024 赛道的数据来源与制作方法 |
+| [tracks/README.md](tracks/README.md) | 赛道定义定版目录：规矩、目录现状、压测机侧待办 |
 
 ## 环境要求
 
@@ -119,7 +144,7 @@ tracks/                       赛道定义定版目录（index.json / challenges
 car-compare.py / car-env-table.py / codec-compare.py  结果对比
 bench-compose.py / bench-queue.py / bench-history.py  控制台与只读观测
 build-race-store.py → bench-export.py → bench-apply.py  入库链路
-flatten_settings.py          赛道 settings 结构审计/修复（回归闸门见 tests/）
+audit_track_settings.py     赛道 settings 结构审计（codec/source_reuse 必须是顶层键；回归闸门见 tests/）
 kibana/                      Kibana 7.17 建板工具链（安装器 + 起停 + 建板 + 验收）
 ```
 

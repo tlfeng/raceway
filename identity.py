@@ -30,12 +30,11 @@
   ④ 车代号兜底表（CAR_FALLBACK，只在上面都没有时用）
 
 ⛔ 批次清单（PACKAGES.txt）不参与身份推导 —— 它是"这批装了哪些包"，
-   不是"这个车跑的哪个包"（旧口径造成过三处真实错标，见 ENV 文档 §7.8）。
+   不是"这个车跑的哪个包"。
 ⛔ 不知道就是不知道，不猜：查不到来源的写 None（不写值），不拿车代号反推。
-⛔ **不设跨场次回填池**：不再从"同车其他场次的 sidecar"借用包/JDK 身份——
-   那是 campaign 作为证据池的残余语义，且池随导出范围漂移（同样的场次换个
-   导出范围值就变，破坏确定性）。JDK 的跨批次事实改走 ③ 的显式登记表；
-   包指纹（pkg_sha256）无本场实测就写 null，绝不借用。
+⛔ **不设跨场次回填池**：包/JDK 身份绝不从"同车其他场次的 sidecar"借用 ——
+   池随导出范围漂移（同样的场次换个导出范围值就变，破坏确定性）。JDK 的跨批次
+   事实改走 ③ 的显式登记表；包指纹（pkg_sha256）无本场实测就写 null，绝不借用。
 
 术语：**车（car）= 一套固定的被测配置**（引擎 + 引擎版本 + 引擎 build + JDK + 堆）。
 沿用 Rally 的原生词汇 —— Rally 官方定义：a Rally "car" is a specific configuration
@@ -60,7 +59,7 @@ JDK_VENDOR_PREFIX = {"GraalVM": "graalvm", "TencentKonaJDK": "kona", "OpenJDK": 
 # 标签前缀 → 厂商名（兜底表反解用：CAR_FALLBACK 里存的是 graalvm25 这种短名）
 VENDOR_BY_PREFIX = {v: k for k, v in JDK_VENDOR_PREFIX.items()}
 
-# 无 sidecar 的早期批次按车代号兜底身份（实测值，见 ENV-perf-metric-store §环境台账）。
+# 无 sidecar 的场次按车代号兜底身份（实测值，见 ENV-perf-metric-store §环境台账）。
 CAR_FALLBACK = {
     "ez240": {"engine": "easysearch", "version": "2.4.0", "jdk": "graalvm21"},
     "ez250": {"engine": "easysearch", "version": "2.5.0", "jdk": "graalvm25"},
@@ -74,8 +73,7 @@ CAR_FALLBACK = {
 
 BUILD_UNKNOWN = "—"     # 该产品**没有** build 概念（ES 8.19.23）—— "不适用"，不是"不知道"
 # 有 build 概念但查不到时按车代号隔开（unk-<车>），与 JDK 位的策略一致：
-# 写 "—" 会把所有未知 build 的车挤进同一条线 —— 实测 15 场 build=3008 的 ez250
-# 被写成 ez@2.5.0@—@graalvm25，和别的 build 混成一条曲线。
+# 写 "—" 会把所有未知 build 的车挤进同一条线（和别的 build 混成一条曲线）。
 #
 # build 号只认**源头**：sidecar 的包名 / version_from_pkg、部署日志
 # （ibs-deploy-<车>.log 的 "Deploying Easysearch 2.5.0-3015"）、revision 指纹。
@@ -86,15 +84,14 @@ BUILD_UNKNOWN = "—"     # 该产品**没有** build 概念（ES 8.19.23）—�
 # JDK 版本登记表：车代号 → (厂商, 主版本, 完整版本号)
 #
 # 这是**补充的车级原始数据**，替代已删除的跨场次回填池：每个条目都有 sidecar
-# 的 java -version 实测背书（多个批次的场次一致），且只利用了一条不对称性——
+# 的 java -version 实测背书，且只利用了一条不对称性——
 #   **JDK 与车代号绑定，跨部署期不变；引擎 build 才会跨批次更换。**
-#   （实测：jdk25 车在 2.5.0-3009 与 2.5.0-3015 两个部署期的 sidecar 实测
-#    都是 GraalVM 25.0.4 —— 所以 JDK 版本可以按车登记，包指纹不可以。）
+#   （jdk25 车在 2.5.0-3009 与 2.5.0-3015 两个部署期的 sidecar 实测都是
+#    GraalVM 25.0.4 —— 所以 JDK 版本可以按车登记，包指纹不可以。）
 # 引擎版本 / build / 包 sha256 **不进**本表：那些随部署更换，逐场查源头。
 # 没有实测背书的车（ez250 / jdk21）不登记 —— 不知道就是不知道。
 #
-# 实测背书明细（DESIGN §2.5.2 有完整计数）：es819×26、ez240×18、jdk25×62、
-# jdk26×6、jdk27×6、kona25×42（本地 402 场 store 口径；服务器全量只多不少）。
+# 实测背书明细见 DESIGN §2.5.2。
 JDK_MEASURED_BY_CAR = {
     "es819":      ("OpenJDK", "27", "27"),
     "ez240":      ("GraalVM", "21", "21.0.9"),
@@ -107,7 +104,7 @@ JDK_MEASURED_BY_CAR = {
     "kona25":     ("TencentKonaJDK", "25", "25.0.4"),
 }
 
-# java -version 原文里的完整版本号（openjdk version "25.0.4" 2025-01-21）
+# java -version 原文里的完整版本号（openjdk version "25.0.4"）
 _VERSION_RE = re.compile(r'(?:java version|openjdk version)\s+"([0-9][0-9.]*)')
 
 
@@ -225,8 +222,8 @@ def series_key_of(engine, version, build_no, jdk_vendor=None, jdk_major=None, ca
 def car_of(doc):
     """文档里的**车代号**（配置代号，如 jdk25 / ez240 / es819）。
 
-    索引里不再存顶层 car 字段 —— 车代号只作为 user_tags.car（编排时定的名字）留着，
-    身份靠 engine/version/engine_build/jdk_vendor/jdk_version/series_key 表达。
+    车代号只作为 user_tags.car（编排时定的名字）留着，身份靠
+    engine/version/engine_build/jdk_vendor/jdk_version/series_key 表达；
     旧文档（车代号在顶层 car/arm）仍能读出来。
     """
     doc = doc or {}

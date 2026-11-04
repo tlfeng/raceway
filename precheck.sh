@@ -15,7 +15,7 @@ MODE="${1:-quiet}"
 # 拓扑单事实源 = ibs ip.txt（esrally 行是驱动器，不参与卡点）
 load_topology
 
-# 静默卡点阈值（vm-bench.env 可覆盖；缺键时用内置默认，旧 env 不用改也能跑）
+# 静默卡点阈值（vm-bench.env 可覆盖；缺键时用内置默认）
 QUIET_LOAD1=${QUIET_LOAD1:-3}              # 虚机 1 分钟负载
 QUIET_STEAL=${QUIET_STEAL:-${VERDICT_STEAL_MAX:-2}}
 #   ^ cpu steal %：与赛后 ENV 判定**同源**（主旋钮 VERDICT_STEAL_MAX，vm-bench.env 一处改两边生效）
@@ -29,18 +29,14 @@ QUIET_FREE_GB=${QUIET_FREE_GB:-20}         # 磁盘可用 GB
 # 这三个服务跑在**压测机**上，而压测机就是这三台虚机的 hypervisor ——
 # 它们和被测引擎抢同一批物理 CPU，还会在压测期间做 ES 后台活动
 # （refresh / segment merge）、Kibana 定时轮询、看板渲染。
-# 压测窗口里跑这些，测出来的数字就带着"旁路负载"的味道：
-# 不是引擎慢，是宿主被占了。实测一次全量导出（nice 19、单线程）就落在
-# 某场写赛窗口内 —— steal 恰好还是 0.00%，但"steal=0"不等于"环境干净"，
-# 可信度的前提是宿主安静，不能靠事后看 steal 恰好没超。
+# 压测窗口里跑这些，测出来的数字带着"旁路负载"的味道：不是引擎慢，是宿主被占了。
+# ⚠️ "steal=0"不等于"环境干净" —— 可信度的前提是宿主安静，不能靠事后看 steal 没超。
 #
 # 只查"这几个端口有没有人在听"，不查进程名（避免误伤别人的同端口服务）。
 # 逃生阀：HOST_QUIET_PORTS="" 可关掉这条检查（vm-bench.env 里设）。
 HOST_QUIET_PORTS=${HOST_QUIET_PORTS:-"9202 9237 5601"}
 
 # 另查指标库的**开机自启**状态：端口查不到 ≠ 窗口期不会被拉回来。
-# 压测机 = 虚机 hypervisor，窗口期内一旦重启，enabled 的指标库会被 systemd
-# 拉起来重新监听 9237 —— 污染当场、事后极难察觉。
 # 逃生阀：HOST_QUIET_AUTOSTART="" 可关掉这条检查（vm-bench.env 里设）。
 
 host_busy_ports() { # 列出宿主上正在监听的旁路端口（空格分隔）
@@ -98,6 +94,7 @@ quiet_check() {
   # 自启状态卡点：端口查不到 ≠ 窗口期不会被拉回来。
   # 压测机 = 虚机 hypervisor，窗口期内一旦重启，enabled 的指标库会被 systemd
   # 拉起来重新监听 9237 —— 污染当场、事后极难察觉（比 steal 偏差更难归因）。
+  #
   # 注意：压测后用 systemctl start 看数**不会**改变 enable 状态，只有显式
   # enable 才会；所以这里只在"显式 enable 过"时拦。
   # 逃生阀：HOST_QUIET_AUTOSTART="" 可关掉这条检查（vm-bench.env 里设）。

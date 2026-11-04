@@ -8,14 +8,17 @@
 机械派生 = 可复现 = 能被测试盯住：上游定义一改，这里就红，红了就得重新派生。
 
 派生规则（与 tracks/nested/challenges/ 同构）：
-  · 写/查分界 = `wait-until-merges-finish`（最后一个写段操作）
-  · 唯一口径改动 = force-merge 的 max-num-segments 由上游的可选参数改为
-    `{{max_num_segments | default(1)}}`（raceway 口径 = 强制单段）
-  · Jinja 控制标签（`{% if %}`）剥掉 → 各自文件里是静态定义；
-    唯独 `post_ingest_sleep` 保留条件块（它是默认关的参数开关，固化就变成
-    "每次都睡 30s"）
-  · 逗号归属：普通 op 的逗号在 op 之后；条件块的逗号在块内（条件为假时
-    整块消失且不留悬空逗号）
+
+· 写/查分界 = `wait-until-merges-finish`（最后一个写段操作）
+
+· 唯一口径改动 = force-merge 的 max-num-segments 由上游的可选参数改为
+  `{{max_num_segments | default(1)}}`（raceway 口径 = 强制单段）
+
+· Jinja 控制标签（`{% if %}`）剥掉 → 各自文件里是静态定义；唯独 `post_ingest_sleep`
+  保留条件块（它是默认关的参数开关，固化就变成"每次都睡 30s"）
+
+· 逗号归属：普通 op 的逗号在 op 之后；条件块的逗号在块内
+  （条件为假时整块消失且不留悬空逗号）
 
 跑法：
     python3 -m unittest discover -s tests -t . -v

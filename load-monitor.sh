@@ -7,19 +7,18 @@
 #   ./load-monitor.sh probe [seconds] # 快速探测 N 秒并输出均值（供赛前卡点，1s 采样）
 #   ./load-monitor.sh summary <csv>   # 赛后判定 ENV-VERDICT
 #
-# 采样间隔 MON_INTERVAL（默认 5s；probe 固定 1s）。summary 只消费 avg/max，
-# 5s 已够，且把采样器自身 fork 噪声降到 1/5（其进程不匹配 ENGINE_MARK，
-# 本会计入 foreign——被测指标里含采样器自己）。编排按相位分 tag 采集
-# （<fid>-w 写入 / -q 查询；merge 相位不采——forcemerge 的 HTTP 调用是同步的、
-# 秒级完成，5s 间隔一次都赶不上，实测 -m CSV 全部只有表头），
-# 分相位 summary 即"写入/查询时的系统占用"画像；整场拍成一份均值无法区分相位。
+# 采样间隔 MON_INTERVAL（默认 5s；probe 固定 1s）。summary 只消费 avg/max，5s 已够，
+# 且把采样器自身 fork 噪声降到 1/5（其进程不匹配 ENGINE_MARK，会计入 foreign）。
+#
+# 编排按相位分 tag 采集（<fid>-w 写入 / -q 查询；merge 相位不采 —— forcemerge 的
+# HTTP 调用同步秒级完成，5s 间隔赶不上）；分相位 summary 即"写入/查询时的系统占用"画像，
+# 整场拍成一份均值无法区分相位。
 #
 # ENGINE_MARK：进程归因标记。cmdline 含此串的进程计入 bench 列（被测引擎），
-# 其余计入 foreign 列（外来负载）。注意 merge 写回是内核线程（kworker 无
-# cmdline）→ 计入 foreign，forcemerge 相位 foreign 偏高属正常。
-# 标记必须与部署根一致（ibs 模式即安装根 /infini）；错位时 bench 恒为 0、
-# 引擎 CPU 被计入 foreign，"外来进程"判定失明（202610 教训：legacy
-# /opt/bench 匹配不到任何进程 → bench 恒 0、判定全盲）。
+# 其余计入 foreign 列（外来负载）。merge 写回是内核线程（kworker 无 cmdline）
+# → 计入 foreign，forcemerge 相位 foreign 偏高属正常。
+# ⚠️ 标记必须与部署根一致（ibs 模式即安装根 /infini）；错位时 bench 恒为 0、
+#    引擎 CPU 被计入 foreign，"外来进程"判定失明。
 #
 # CSV 列:
 # ts,cpu_usr,cpu_sys,cpu_steal,load1,mem_avail_gb,swpin_s,
@@ -164,9 +163,7 @@ summary() {
       if(mn==""||$6+0<mn+0)mn=$6
     } END {
       if(n==0){print "ENV-VERDICT: NO-DATA"; exit 1}
-      # 这些量**每 5 秒都在采**，只是摘要里一直只吐 steal/foreign/swapin 三个，
-      # 其余全被扔掉了。补进摘要后 bench-export 直接就能落库 —— 不用新增探针，
-      # 也不用改采样节奏。补的是"引擎到底吃了多少 CPU/IO"这类真口径：
+      # 摘要量纲（都是每 5 秒采到的值）：
       #   bench_cpu = 被测引擎进程的 CPU 占用（跨引擎直接可比）
       #   cpu_usr/cpu_sys = 整机 CPU 占用（负载占比）
       #   disk_rw_mbs = 磁盘读写吞吐（IO 瓶颈与否）

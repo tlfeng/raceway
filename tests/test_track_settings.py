@@ -13,7 +13,7 @@
 那批 hvbbq 的 3 场 create-index error_rate=1.0、后续 knn 全废、赛末 42.7 GB 是
 坏索引残留（同规模基座只有 4.7 GB）—— 整批数据作废重来。
 
-判据的实现在 flatten_settings.py（审计/修复工具），本测试只做「不许再犯」：
+判据的实现在 audit_track_settings.py（只审计、不修复），本测试只做「不许再犯」：
 扫仓库里所有赛道的 index.json（含压测机上生成的变体），结构不对就红。
 """
 import glob
@@ -25,7 +25,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-F = importlib.import_module('flatten_settings')  # noqa: E402
+F = importlib.import_module('audit_track_settings')  # noqa: E402
 
 TRACKS = os.path.join(ROOT, 'tracks')
 
