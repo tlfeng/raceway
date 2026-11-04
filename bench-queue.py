@@ -37,8 +37,7 @@ for 循环里），起跑后外部无法知道队列全貌；排程模式下也�
     python3 bench-queue.py list                                --root <campaigns 目录>
     python3 bench-queue.py status <campaign>                   --root ... [--json] [--watch]
     python3 bench-queue.py plan   <campaign>                   --root ...   # 只看待跑清单
-    python3 bench-queue.py html   <campaign> -o q.html          --root ...
-    python3 bench-queue.py serve  <campaign> --port 8801        --root ...   # 实时页
+    # 网页版（进度卡/停跑）在 bench-compose.py serve —— 本脚本只留命令行
     # 远端读（默认 ssh host 走 key）：
     python3 bench-queue.py status ds2-20261021-021151 \
         --root /testing/raceway/campaigns --ssh root@203.0.113.10
@@ -56,7 +55,6 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, asdict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ------------------------------------------------------------------ 状态词表
 # 来源：run-bench.sh 写 RACES.md 的全部状态（run_field / run_field_with_retry）
@@ -918,17 +916,6 @@ def pick_active(summaries):
 
 
 # ------------------------------------------------------------------ 输出
-STATUS_STYLE = {
-    STATUS_VALID: 'ok',
-    STATUS_RUNNING: 'run',
-    STATUS_PENDING: 'pend',
-    STATUS_SKIP: 'skip',
-    STATUS_DEADLINE: 'skip',
-}
-
-
-def style(status):
-    return STATUS_STYLE.get(status, 'bad')
 
 
 def render_table(c):
@@ -1006,105 +993,6 @@ def campaign_json(c):
     }
 
 
-HTML_TMPL = """<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<title>raceway 队列 · __CID__</title>
-<style>
- :root{color-scheme:dark}
- body{background:#11151c;color:#d8dee9;font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;margin:0;padding:24px}
- h1{font-size:18px;margin:0 0 4px}
- .meta{color:#8b98a9;font-size:12px;margin-bottom:16px}
- .bar{height:8px;background:#1f2630;border-radius:4px;overflow:hidden;margin:12px 0 20px}
- .bar>i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22c55e)}
- .cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}
- .card{background:#171c24;border:1px solid #232b36;border-radius:8px;padding:10px 14px;min-width:88px}
- .card b{display:block;font-size:20px}
- .card span{color:#8b98a9;font-size:11px}
- table{width:100%;border-collapse:collapse;font-size:13px}
- th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #1e2530;white-space:nowrap}
- th{color:#8b98a9;font-weight:500;font-size:11px;letter-spacing:.04em}
- tr.now td{background:#16222e}
- .ok{color:#4ade80}.bad{color:#f87171}.run{color:#60a5fa}.skip{color:#fbbf24}.pend{color:#6b7280}
- .warn{background:#2a1f12;border:1px solid #4b3a20;border-left:3px solid #f59e0b;border-radius:6px;padding:8px 12px;margin:6px 0;color:#fcd9a3}
- .note{color:#8b98a9;font-size:12px;margin-top:18px}
-</style></head><body>
-<h1>raceway 队列 · __CID__</h1>
-<div class="meta">模式 __MODE__ · 起跑 __START__ · __UPDATED__</div>
-<div class="bar"><i id="bar" style="width:__PCT__%"></i></div>
-<div class="cards">__CARDS__</div>
-<div id="warns">__WARNS__</div>
-<table><thead><tr><th>seq</th><th>场次</th><th>状态</th><th>用时</th><th>recall</th><th>说明</th></tr></thead>
-<tbody id="rows">__ROWS__</tbody></table>
-<div class="note">本页面由 bench-queue.py 生成；由 <code>bench-queue.py serve</code> 提供时每 5 秒自动刷新。</div>
-<script>
-async function tick(){
-  try{
-    const r = await fetch('/api/queue',{cache:'no-store'});
-    if(!r.ok) return;
-    paint(await r.json());
-  }catch(e){/* 静态快照模式：无后端，忽略 */}
-}
-function paint(d){
-  document.querySelector('.meta').textContent =
-    '模式 '+d.mode+' · 起跑 '+(d.started_at||'-')+' · 更新 '+new Date().toLocaleString();
-  const s=d.stats;
-  document.getElementById('bar').style.width=(s.total?100*s.valid/s.total:0)+'%';
-  document.getElementById('warns').innerHTML=(d.warnings||[])
-    .map(function(w){return '<div class="warn">⚠ '+esc(w)+'</div>'}).join('');
-  document.getElementById('rows').innerHTML=(d.fields||[]).map(function(f){
-    const cls=f.status==='VALID'?'ok':f.status==='RUNNING'?'run':
-      (f.status==='SKIP'||f.status==='DEADLINE-SKIP')?'skip':
-      f.status==='PENDING'?'pend':'bad';
-    const note=(f.conflicts&&f.conflicts.length)?('⚠ 矛盾判定: '+f.conflicts.join('/')):'';
-    return '<tr class="'+(f.status==='RUNNING'?'now':'')+'"><td>'+f.seq+'</td><td>'+esc(f.fid)+'</td>'+
-      '<td class="'+cls+'">'+f.status+'</td><td>'+esc(f.duration||'-')+'</td>'+
-      '<td>'+esc(f.recall||'-')+'</td><td>'+esc(note||f.detail||'')+'</td></tr>';
-  }).join('');
-}
-function esc(s){var A=String.fromCharCode(38);return String(s==null?'':s).replace(/[&<>]/g,function(c){return A+(c==='&'?'amp;':c==='<'?'lt;':'gt;')})}
-tick(); setInterval(tick,5000);
-</script></body></html>
-"""
-
-
-def _esc(s):
-    """HTML 转义。实体用字符码拼出来，避免源码里出现裸实体被编辑器改写。"""
-    a = chr(38)
-    return (str(s).replace(a, a + 'amp;').replace(chr(60), a + 'lt;').replace(chr(62), a + 'gt;'))
-
-
-def render_html(c):
-    stats = {'total': c.total, 'valid': c.valid, 'failed': c.failed,
-             'skipped': c.skipped, 'pending': c.pending}
-    pct = 100 * stats['valid'] / stats['total'] if stats['total'] else 0
-    cards = ''.join(
-        '<div class="card"><b>%d</b><span>%s</span></div>' % (v, k)
-        for k, v in (('总场次', stats['total']), ('有效', stats['valid']),
-                     ('失败', stats['failed']), ('跳过', stats['skipped']),
-                     ('待跑', stats['pending']), ('连续失败', c.consecutive_fail)))
-    warns = ''.join('<div class="warn">⚠ %s</div>' % _esc(w) for w in c.warnings)
-    rows = []
-    for f in c.fields:
-        note = ''
-        if f.conflicts:
-            note = '⚠ 矛盾判定: ' + '；'.join(sorted(set(f.conflicts)))
-        if f.detail:
-            note = (note + '  ' if note else '') + f.detail
-        rows.append('<tr class="%s"><td>%d</td><td>%s</td><td class="%s">%s</td>'
-                    '<td>%s</td><td>%s</td><td>%s</td></tr>'
-                    % ('now' if f.status == STATUS_RUNNING else '',
-                       f.seq, _esc(f.fid), style(f.status), f.status,
-                       _esc(f.duration or '-'), _esc(f.recall or '-'), _esc(note)))
-    return (HTML_TMPL.replace('__CID__', _esc(c.cid))
-            .replace('__MODE__', _esc(c.mode))
-            .replace('__START__', _esc(c.started_at or '-'))
-            .replace('__UPDATED__', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-            .replace('__PCT__', '%.1f' % pct)
-            .replace('__CARDS__', cards)
-            .replace('__WARNS__', warns)
-            .replace('__ROWS__', ''.join(rows)))
-
-
 # ------------------------------------------------------------------ 命令
 def cmd_list(args, src):
     names = [d for d in src.list_campaigns()
@@ -1169,59 +1057,9 @@ def cmd_plan(args, src):
     return 0
 
 
-def cmd_html(args, src):
-    c = build_campaign(src, args.campaign, args.schedule)
-    html = render_html(c)
-    if args.out:
-        with open(args.out, 'w', encoding='utf-8') as fh:
-            fh.write(html)
-        print('已写出 %s（%d 场，有效 %d）' % (args.out, c.total, c.valid))
-    else:
-        sys.stdout.write(html)
-    return 0
-
-
-def cmd_serve(args, src):
-    camp = args.campaign
-
-    def snapshot():
-        return campaign_json(build_campaign(src, camp, args.schedule))
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
-
-        def _send(self, body, ctype):
-            raw = body.encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', ctype)
-            self.send_header('Content-Length', str(len(raw)))
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def do_GET(self):
-            if self.path.startswith('/api/queue'):
-                self._send(json.dumps(snapshot(), ensure_ascii=False),
-                           'application/json; charset=utf-8')
-            else:
-                self._send(render_html(build_campaign(src, camp, args.schedule)),
-                           'text/html; charset=utf-8')
-
-    srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    print('队列实时页: http://127.0.0.1:%d/  （campaign=%s，Ctrl-C 退出）' % (args.port, camp))
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print()
-    finally:
-        srv.server_close()
-    return 0
-
-
 def main():
     ap = argparse.ArgumentParser(description='raceway campaign 队列观测台（只读）')
-    ap.add_argument('cmd', choices=['list', 'status', 'plan', 'html', 'serve'])
+    ap.add_argument('cmd', choices=['list', 'status', 'plan'])
     ap.add_argument('campaign', nargs='?', default=None)
     ap.add_argument('--root', default=None, help='campaigns 目录（默认 ./campaigns）')
     ap.add_argument('--ssh', default=None, help='远端主机，如 root@203.0.113.10')
@@ -1231,8 +1069,6 @@ def main():
     ap.add_argument('--watch', action='store_true')
     ap.add_argument('--interval', type=int, default=5)
     ap.add_argument('--limit', type=int, default=20)
-    ap.add_argument('-o', '--out', default=None)
-    ap.add_argument('--port', type=int, default=8801)
     args = ap.parse_args()
 
     root = args.root or os.path.join(os.getcwd(), 'campaigns')
@@ -1246,10 +1082,6 @@ def main():
         return cmd_status(args, src)
     if args.cmd == 'plan':
         return cmd_plan(args, src)
-    if args.cmd == 'html':
-        return cmd_html(args, src)
-    if args.cmd == 'serve':
-        return cmd_serve(args, src)
     return 1
 
 

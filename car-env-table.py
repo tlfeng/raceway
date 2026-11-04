@@ -17,7 +17,7 @@ import statistics
 import sys
 
 DOCS = {"track": 11396503, "hnsw2m-2m-s3": 2000000, "nested-s3": 11203029,
-        "hv1024-s3": 1000000, "hv512-s3": 1000000}
+        "hv1024-s3": 1000000}
 NAME = {"track": "geo", "hnsw2m-2m-s3": "hnsw", "nested-s3": "nested", "hv1024-s3": "hv1024"}
 WARMUP = {"track": 20, "hnsw2m-2m-s3": 40, "nested-s3": 25, "hv1024-s3": 25}
 
