@@ -18,12 +18,14 @@ import subprocess
 import sys
 import time
 
-ES = sys.argv[1] if len(sys.argv) > 1 else "https://10.10.10.224:9200"
-AUTH = sys.argv[2].split(":", 1) if len(sys.argv) > 2 and ":" in sys.argv[2] else None
-NDOCS = int(sys.argv[3]) if len(sys.argv) > 3 else 50000
 CORPUS = "/opt/raceway/tracks/hv1024x/documents-1024.json"
 QUERIES = "/opt/raceway/tracks/hv1024x/queries.json"
-INDEX = "smoke-vectors"
+# 本脚本会建/删这三个索引（smoke- 前缀，与真实索引不撞名）
+TMP_INDEXES = ("smoke-cfgcheck", "smoke-zstdsr", "smoke-base")
+
+ES = None
+AUTH = None
+NDOCS = 50000
 
 
 def curl(method, path, body=None, raw_body=None, ctype="application/json"):
@@ -75,11 +77,19 @@ def settings_base():
     return {"index": {"number_of_shards": 3, "number_of_replicas": 0}}
 
 
+def err_text(err):
+    """ES 的 error 可能是对象，也可能是字符串"""
+    if isinstance(err, dict):
+        return (err.get("reason") or err.get("type")
+                or json.dumps(err, ensure_ascii=False)[:200])
+    return str(err)[:200]
+
+
 def create(name, settings):
     curl("DELETE", "/" + name)
     r = curl("PUT", "/" + name, {"settings": settings, "mappings": MAPPING_BASE})
     if "error" in r:
-        return None, r["error"].get("reason") or r["error"]["type"]
+        return None, err_text(r["error"])
     if not r.get("acknowledged"):
         return None, "响应不是建索引应答: %s" % json.dumps(r, ensure_ascii=False)[:120]
     return name, None
@@ -92,14 +102,12 @@ def bulk_load(name, ndocs, chunk=1000):
     整批被拒、索引里一条都没进去）。这里用 1000 条（≈21 MB）一块。"""
     total_err = 0
     buf = []
-    sent = 0
     with open(CORPUS, encoding="utf-8") as f:
         for i, line in enumerate(f):
             if i >= ndocs:
                 break
             buf.append(json.dumps({"index": {"_index": name}}))
             buf.append(line.strip())
-            sent += 1
             if len(buf) >= chunk * 2:
                 r = curl("POST", "/_bulk", raw_body="\n".join(buf) + "\n",
                          ctype="application/x-ndjson")
@@ -137,23 +145,29 @@ def store_gb(name):
     return None
 
 
-def KNN_BODY(k=10, ef=100):
+def query_vector():
+    """queries.json 首行是向量数组；也兼容 {"emb": [...]} / {"vector": [...]} 形态"""
     with open(QUERIES, encoding="utf-8") as f:
         q = json.loads(f.readline())
+    if isinstance(q, list):
+        return q
+    return q.get("emb") or q.get("vector")
+
+
+def KNN_BODY(k=10, ef=100):
     return {"size": k, "_source": False, "docvalue_fields": ["docid"],
-            "knn": {"field": "emb", "k": k, "num_candidates": ef, "query_vector": q}}
+            "knn": {"field": "emb", "k": k, "num_candidates": ef,
+                    "query_vector": query_vector()}}
 
 
 def knn_search(name, k=10, ef=100):
     """用真查询跑一次 knn 检索"""
-    with open(QUERIES, encoding="utf-8") as f:
-        q = json.loads(f.readline())      # JSONL：每行一个向量数组
     body = {
         "size": k,
         "_source": False,
         "docvalue_fields": ["docid"],
         "knn": {"field": "emb", "k": k, "num_candidates": ef,
-                "query_vector": q if isinstance(q, list) else q.get("emb") or q.get("vector")},
+                "query_vector": query_vector()},
     }
     r = curl("POST", "/%s/_search" % name, body)
     hits = r.get("hits", {}).get("hits", [])
@@ -161,56 +175,69 @@ def knn_search(name, k=10, ef=100):
     return len(hits), err, hits[0].get("fields", {}).get("docid") if hits else None
 
 
-print("=" * 72)
-print("smoke test：hv1024x-codec-zstd-sr 配置")
-print("目标 %s ｜ 文档数 %d" % (ES, NDOCS))
-print("=" * 72)
+def main():
+    global ES, AUTH, NDOCS
+    ES = sys.argv[1] if len(sys.argv) > 1 else "https://10.10.10.224:9200"
+    AUTH = sys.argv[2].split(":", 1) if len(sys.argv) > 2 and ":" in sys.argv[2] else None
+    NDOCS = int(sys.argv[3]) if len(sys.argv) > 3 else 50000
 
-print("\n【①】settings 形态 —— 旧写法应该被拒，新写法应该通过")
-for label, st in [("旧（嵌套，昨晚那批用的）", settings_broken()),
-                  ("新（平铺，修好的）", settings_fixed()),
-                  ("基座（无 codec/sr）", settings_base())]:
-    name, err = create("smoke-cfgcheck", st)
-    if err:
-        print("  [拒] %-28s %s" % (label, err[:90]))
+    print("=" * 72)
+    print("smoke test：hv1024x-codec-zstd-sr 配置")
+    print("目标 %s ｜ 文档数 %d" % (ES, NDOCS))
+    print("会建/删这些索引：%s（smoke- 前缀，与真实索引不撞名）" % "、".join(TMP_INDEXES))
+    print("=" * 72)
+
+    print("\n【①】settings 形态 —— 旧写法应该被拒，新写法应该通过")
+    for label, st in [("旧（嵌套，昨晚那批用的）", settings_broken()),
+                      ("新（平铺，修好的）", settings_fixed()),
+                      ("基座（无 codec/sr）", settings_base())]:
+        name, err = create("smoke-cfgcheck", st)
+        if err:
+            print("  [拒] %-28s %s" % (label, err[:90]))
+        else:
+            print("  [过] %-28s 建索引成功" % label)
+            curl("DELETE", "/smoke-cfgcheck")
+
+    results = {}
+    for label, st, name in [("zstd+source_reuse（修好的）", settings_fixed(), "smoke-zstdsr"),
+                            ("基座（对照）", settings_base(), "smoke-base")]:
+        print("\n【②】%s：建索引 + 灌 %d 条" % (label, NDOCS))
+        n, err = create(name, st)
+        if err:
+            print("  建索引失败: %s" % err[:150])
+            continue
+        t0 = time.time()
+        nerr = bulk_load(name, NDOCS)
+        print("  灌入完成 %d 条（bulk 错误 %d），耗时 %.0f 秒" % (NDOCS, nerr, time.time() - t0))
+        curl("POST", "/%s/_refresh" % name)
+        curl("POST", "/%s/_forcemerge?max_num_segments=1" % name)
+        time.sleep(3)
+        cnt = curl("GET", "/%s/_count" % name)
+        cat = curl("GET", "/_cat/indices/%s?h=docs.count,store.size" % name)
+        print("  索引文档数 %s ｜ %s" % (cnt.get("count"), json.dumps(cat, ensure_ascii=False)[:120]))
+        gb = store_gb(name)
+        results[label] = gb
+        print("  存储体积: %s" % ("%.3f GB" % gb if gb else "取不到"))
+        raw = curl("POST", "/%s/_search" % name, KNN_BODY())
+        print("  检索原始响应: %s" % json.dumps(raw, ensure_ascii=False)[:300])
+        hits, err, docid = knn_search(name)
+        print("  knn 检索: 命中 %d 条%s" % (hits, ("（首条 docid=%s）" % docid) if docid else ""))
+        if err:
+            print("  检索报错: %s" % err_text(err)[:200])
+
+    a = results.get("zstd+source_reuse（修好的）")
+    b = results.get("基座（对照）")
+    if a and b:
+        print("\n【③】体积对比：zstd+sr %.3f GB vs 基座 %.3f GB → 比值 %.2fx" % (a, b, a / b))
+        print("     昨晚那批是 9 倍（42.7 GB vs 4.7 GB）；修好后应该接近 1 倍")
     else:
-        print("  [过] %-28s 建索引成功" % label)
-        curl("DELETE", "/smoke-cfgcheck")
+        print("\n【③】体积对比：跳过（取不到存储体积：zstd+sr=%s 基座=%s）" % (a, b))
 
-results = {}
-for label, st, name in [("zstd+source_reuse（修好的）", settings_fixed(), "smoke-zstdsr"),
-                        ("基座（对照）", settings_base(), "smoke-base")]:
-    print("\n【②】%s：建索引 + 灌 %d 条" % (label, NDOCS))
-    n, err = create(name, st)
-    if err:
-        print("  建索引失败: %s" % err[:150])
-        continue
-    t0 = time.time()
-    nerr = bulk_load(name, NDOCS)
-    print("  灌入完成 %d 条（bulk 错误 %d），耗时 %.0f 秒" % (NDOCS, nerr, time.time() - t0))
-    curl("POST", "/%s/_refresh" % name)
-    curl("POST", "/%s/_forcemerge?max_num_segments=1" % name)
-    time.sleep(3)
-    cnt = curl("GET", "/%s/_count" % name)
-    cat = curl("GET", "/_cat/indices/%s?h=docs.count,store.size" % name)
-    print("  索引文档数 %s ｜ %s" % (cnt.get("count"), json.dumps(cat, ensure_ascii=False)[:120]))
-    gb = store_gb(name)
-    results[label] = gb
-    print("  存储体积: %s" % ("%.3f GB" % gb if gb else "取不到"))
-    raw = curl("POST", "/%s/_search" % name, KNN_BODY())
-    print("  检索原始响应: %s" % json.dumps(raw, ensure_ascii=False)[:300])
-    hits, err, docid = knn_search(name)
-    print("  knn 检索: 命中 %d 条%s" % (hits, ("（首条 docid=%s）" % docid) if docid else ""))
-    if err:
-        print("  检索报错: %s" % str(err)[:200])
+    for name in TMP_INDEXES:
+        curl("DELETE", "/" + name)
+    print("\n【④】测试索引已清理")
+    return 0
 
-if len(results) == 2:
-    a = results["zstd+source_reuse（修好的）"]
-    b = results["基座（对照）"]
-    print("\n【③】体积对比：zstd+sr %.3f GB vs 基座 %.3f GB → 比值 %.2fx"
-          % (a, b, a / b if b else 0))
-    print("     昨晚那批是 9 倍（42.7 GB vs 4.7 GB）；修好后应该接近 1 倍")
 
-for name in ("smoke-zstdsr", "smoke-base", "smoke-cfgcheck"):
-    curl("DELETE", "/" + name)
-print("\n【④】测试索引已清理")
+if __name__ == "__main__":
+    sys.exit(main())

@@ -60,9 +60,14 @@ def audit(path):
 
 
 def fix_json(path):
-    d = json.load(open(path, encoding="utf-8"))
-    st = d.get("settings") or {}
-    inner = st.get("index") or {}
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    st = d.get("settings")
+    if not isinstance(st, dict):
+        return []
+    inner = st.get("index")
+    if not isinstance(inner, dict):
+        return []
     moved = []
     for k in CODEC_KEYS:
         if k in inner:
@@ -70,7 +75,8 @@ def fix_json(path):
             moved.append(k)
     if moved:
         d["settings"] = st
-        open(path, "w", encoding="utf-8").write(json.dumps(d, ensure_ascii=False, indent=2))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(d, ensure_ascii=False, indent=2))
     return moved
 
 
@@ -80,6 +86,7 @@ def main():
     if args and args[0] in ("--check", "--fix"):
         mode = args.pop(0)[2:]
     dirs = args or ["."]
+    n_fixed = 0
     n_bad = 0
     for root in dirs:
         for dirpath, _dn, fn in os.walk(root):
@@ -88,16 +95,30 @@ def main():
             p = os.path.join(dirpath, "index.json")
             status, msg = audit(p)
             if status in ("nested", "jinja-nested"):
-                n_bad += 1
                 if mode == "fix" and status == "nested":
                     moved = fix_json(p)
-                    print("  [已修] %-58s 移动 %s" % (p, moved))
+                    if moved:
+                        print("  [已修] %-58s 移动 %s" % (p, moved))
+                        n_fixed += 1
+                        # 修完复检：只有复检仍不通过才计入"仍需处理"
+                        st2, msg2 = audit(p)
+                        if st2 != "ok":
+                            n_bad += 1
+                            print("  [未解决] %-53s %s" % (p, msg2))
+                        continue
+                    # moved 为空：状态判定与实际不符，当作未解决
+                    n_bad += 1
+                    print("  [未解决] %-53s %s" % (p, msg))
                     continue
+                n_bad += 1
                 print("  [%s] %-58s %s" % ("修" if status == "nested" else "人工",
                                           p, msg))
             elif status == "unreadable":
                 print("  [跳过] %s" % p)
-    print("\n%s：%d 个赛道 index.json 的 settings 结构有问题"
+    if mode == "fix" and n_fixed:
+        print("\n已修 %d 处" % n_fixed)
+    # n_bad 只数**修完仍未解决**的：全修好就是 0，退出码 0（CI 语义）
+    print("%s：%d 个赛道 index.json 的 settings 结构有问题"
           % ("仍需处理" if n_bad else "全部通过", n_bad))
     return 1 if n_bad else 0
 
