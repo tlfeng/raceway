@@ -33,6 +33,7 @@
 | `geonames/` | ✅ 定义齐；**write-only/query-only 待从压测机回灌**（`$ROOT/tracks/geo/challenges/`） | 官方基座 + raceway 口径；`create-only` 探针已就位 |
 | `nested/` | ✅ 完整（挑战自 prepare-nested-track.sh heredoc 静态化） | 官方基座，shards 走 params |
 | `hv1024/` | ✅ 定义齐；`queries.json` 部署时生成：`bzcat $HV_QUERIES_BZ2 \| head -2000 > queries.json`，语料 `ln -sfn $HV_CORPUS documents-1024.json`（1M×1024 维，22 739 096 214 字节，断言在 track.json） | 原 hv1024-s3 收缩；m=32/efC=100 |
+| `hv1024x{,-int8,-bbq,-codec-zstd-sr}/` | ✅ 完整（2026-11-04 自压测机定版入库，生成器 `setup-hv1024bbq.sh` 退役） | 1024 维量化/压缩四变体（2026-11-03 hvbbq campaign 15/15 VALID 用此版）：四目录仅 `index.json` 不同——基座 `hnsw`、`int8_hnsw`、`bbq_hnsw`、`hnsw+ZSTD+source_reuse`；其余定义（track.json/track.py/operations/challenges）逐字节同基座。`create-only` 探针仅 codec-zstd-sr 有（复现该臂故障用）。索引名 `vectors`，语料同 hv1024（VARIANT.txt 记台账）；`queries-recall.jsonl`/`truth.jsonl` 为 recall 探针数据，不进 git。结论：`REPORT-hvbbq-1024维量化压缩对比-20261104.md` |
 | `ds-j{512,768,1024,1536,2048}`、`ds-g{960,1920}` | ⏳ **待从压测机回灌**（`$ROOT/tracks/ds-*` 定义文件，不含语料；生成器 dimsweep-*.py 已不在树内，静态定版是唯一留存机会） | 语料在 `$ROOT/corpora-ds/` |
 | `hnsw2m-2m`（→ 建议落 `hnsw/`，分片 params 化） | ⏳ 待从压测机回灌（手工搭的基座） | 96 维 200 万向量 |
 | `hvtp200k-2s/3s` | 🗑 一次性，不回灌（oneoff 批次已定案；需要时分片走 params） | |

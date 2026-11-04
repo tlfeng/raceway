@@ -38,5 +38,4 @@ tracks/**/*.offset
 tracks/**/queries.json
 tracks/**/queries*.jsonl
 tracks/**/truth.jsonl
-tracks/**/VARIANT.txt
 tracks/**/challenges/full.json

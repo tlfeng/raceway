@@ -1,0 +1,8 @@
+变体 id:    hv1024x-codec-zstd-sr
+基础赛道:   hv1024x（/opt/raceway/tracks/hv1024x）
+基座 md5:   88ad062cf210
+烘入设置:   index.codec=ZSTD + index.source_reuse=true
+索引名:     vectors
+引擎兼容:   easysearch
+说明:       压缩=ZSTD · source_reuse 开
+挑战:       write-only / query-only / create-only(建索引探针)
