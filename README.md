@@ -119,6 +119,8 @@ prepare-*-track.sh           赛道变体生成（幂等）
 car-compare.py / car-env-table.py / codec-compare.py  结果对比
 bench-compose.py / bench-queue.py / bench-history.py  控制台与只读观测
 build-race-store.py → bench-export.py → bench-apply.py  入库链路
+flatten_settings.py          赛道 settings 结构审计/修复（回归闸门见 tests/）
+kibana/                      Kibana 7.17 建板工具链（安装器 + 起停 + 建板 + 验收）
 ```
 
 ## 安全

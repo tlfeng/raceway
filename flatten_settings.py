@@ -21,7 +21,8 @@ CODEC_KEYS = ("index.codec", "index.source_reuse")
 def audit(path):
     """→ (状态, 说明)。状态 ∈ ok / nested / jinja-nested / unreadable"""
     try:
-        s = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as f:
+            s = f.read()
     except OSError:
         return "unreadable", "读不了"
     try:

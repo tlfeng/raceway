@@ -17,9 +17,11 @@
 | `panel-manifest.py` | 从实际导入的 saved objects 反解出《面板清单》（地面真相） |
 | `shim-7.17-es250.js` | 协议适配层：Kibana 7.17 → EasySearch 2.5.0（产品校验 + API 差异兜底） |
 | `deploy-kibana.sh` | 压测机上起停 Kibana 7.17 + shim，并生成对接指标库的 `kibana.yml` |
+| `pull-kibana-image.sh` | Kibana 7.17.29 的**安装**器：不装 Docker，直接走 registry API 取镜像层解开用 |
 
-Kibana 7.17.29 的**安装**脚本在仓库根目录 `pull-kibana-image.sh`（不在本目录）：
-`artifacts.elastic.co` 的下载路径在压测机网络里被封，只能走 registry API 取镜像层解开用。
+> `artifacts.elastic.co` 的下载路径在压测机网络里被封，只能走 registry API 取镜像层解开用。
+> 本目录是自成一体的工具链 —— 装 Kibana（`pull-kibana-image.sh`）和起 Kibana
+> （`deploy-kibana.sh`）的脚本都在这里，压测机上整个 `kibana/` 目录一起拷过去即可。
 
 ## 环境
 
@@ -34,7 +36,7 @@ EasySearch 2.5.0 指标库   https://127.0.0.1:9237
 
 ```bash
 # 1) 装 Kibana 7.17.29（产物 /testing/kibana-rootfs/usr/share/kibana）
-bash ../pull-kibana-image.sh                      # tag=7.17.29 dest=/testing/kibana-rootfs
+bash ./pull-kibana-image.sh                      # tag=7.17.29 dest=/testing/kibana-rootfs
 
 # 2) 起 Kibana + shim（ES_PORT/ES_USER/ES_PASS 指向指标库）
 ES_PORT=9237 ES_USER=admin ES_PASS='***' \
@@ -226,8 +228,9 @@ tail -f /tmp/es_shim.log
 ## 历史
 
 2026-11-02 上游 `ebd5c86` 以「移除 Kibana 看板链路与 HTML 报告工具」为名删掉了本目录与
-`bench-report.py`。2026-11-03 恢复**仅建板链路**（本目录 5 个文件 + 根目录
-`pull-kibana-image.sh`），并按 v2 契约改了面板口径；未恢复的是与建板无关的部分：
+`bench-report.py`。2026-11-03 恢复**仅建板链路**（本目录 5 个文件 +
+`pull-kibana-image.sh`，安装器后来也从仓库根目录归位到本目录），
+并按 v2 契约改了面板口径；未恢复的是与建板无关的部分：
 HTML 报告工具链（`bench-report.py` + `echarts.min.js`）、
 7.10.2 的 `docker-compose.yml`（不是 7.17，且与工作区 `es-kibana.sh` 冲突）、
 `es-proxy.py`（shim 已落请求体，功能被覆盖）。

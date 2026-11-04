@@ -304,6 +304,7 @@ systemctl stop easysearch-metric-store.service
 | `reset-env.sh` | 环境还原 | `./reset-env.sh <easysearch\|elasticsearch\|all>`，可加 `--no-wipe` / `--purge` |
 | `stop-campaign.sh` / `close-campaign.sh` | 停掉某个跑分的进程 / 给中途停掉的跑分补「结束行」 | `./stop-campaign.sh <标签>`；`./close-campaign.sh [--dry-run]` |
 | `identity.py` | 被测配置身份口径的唯一来源 | 被 sidecar 和导出器 import |
+| `flatten_settings.py` | 赛道 index.json 的 settings 结构审计/修复（codec/source_reuse 必须是顶层键） | `python3 flatten_settings.py --check tracks/`；回归由 `tests/test_track_settings.py` 守着 |
 | `bench-sidecar.py` | 每场的元数据 sidecar：实测 JDK 版本、索引 settings、核数、堆 | 由 run-bench 每场调用 |
 | `car-compare.py` | 两个配置对比 + `--assert` 阈值断言（不达标退出码 1） | `python3 car-compare.py <跑分A> <跑分B> --a 标签A --b 标签B` |
 | `car-env-table.py` | 三配置 × 多赛道的「性能 × 环境」联合表 | `python3 car-env-table.py <跑分目录> [--detail]` |
@@ -311,7 +312,8 @@ systemctl stop easysearch-metric-store.service
 | `bench-queue.py` / `bench-history.py` / `bench-compose.py` | 队列观测台 / 已入库覆盖表 / 控制台，见 §14 | 见 §14 |
 | `build-race-store.py` → `bench-export.py` → `bench-apply.py` | 跑分产物 → rally race store → 入库载荷 → 导入 ES | `python3 bench-export.py --out exports/<tag>` |
 
-> 旧名 `arm-compare.py` 和 `arm-env-table.py` 是 2026-10-21 改名前留下的副本（工作区里没被 git 跟踪）。现在的版本是 `car-*`。
+> 旧名 `arm-compare.py` 和 `arm-env-table.py`（2026-10-21 改名前的副本）已删除，现在的版本是 `car-*`。
+> Kibana 建板工具链自成一套，在 `kibana/` 目录里（见 [kibana/README.md](../kibana/README.md)）。
 
 ## 10. 一场压测内部发生了什么
 
