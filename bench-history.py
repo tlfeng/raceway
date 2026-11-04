@@ -134,7 +134,9 @@ class HistoryUnavailable(Exception):
 # 为什么覆盖判定必须带变体：库里 track 字段是**基础赛道**（"geo"/"hnsw"/…），
 # 压缩与 source_reuse 是另外两个维度。若覆盖键只用 (车, 赛道, 轮次)，6 个变体的
 # 历史会混成一格 —— "ZSTD+sr 跑过"会被当成"default 也跑过"，把没跑的格误判成已覆盖。
-CODEC_TOKEN = {'default': 'def', 'ZSTD': 'zstd', 'best_compression': 'bc'}
+CODEC_TOKEN = {'default': 'def', 'ZSTD': 'zstd', 'zstd': 'zstd', 'best_compression': 'bc'}
+# ↑ 'zstd' 小写别名：入库 codec 列是归一小写（CANON_CODEC），variant_id_of 从列值
+#   派生变体 id 时要能命中；'ZSTD' 大写键保留给变体 id 反推路径（compression_of）。
 TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
 CANONICAL_ALIAS = {'gdef': 'geo-codec-def', 'gzstd': 'geo-codec-zstd-sr',
                    'gbc': 'geo-codec-bc'}
@@ -203,20 +205,29 @@ def variant_of(track, codec, sr):
 def variant_id_of(row):
     """一行 benchmark-result-race → 变体 id（覆盖判定的 key 维度）。
 
-    **按变体目录名判定，不用 codec 字段反推** —— 因为基座赛道与它的 default
-    变体实测出来的 index.codec 是一样的（引擎默认就是 LZ4），靠 codec 分不出
-    "geonames 基座"和"geo-codec-def"。
-
-    v3：变体身份是编排事实，存成顶层 track_variant（`geo-codec-def` 这样的
-    变体 id，基座赛道就是基础赛道名本身）。旧库的行从 track_raw 取。
+    v3.1（2026-11-03）：track_variant 列退役。**旧契约行**（带 track_variant /
+    track_raw）仍以它们为准——基座与 def 变体的实测 codec 相同（引擎默认 LZ4），
+    靠 codec 反推分不出，测试 test_base_and_default_variant_are_distinguishable
+    锁定这条；**新契约行**（两者皆无）才由 codec / source_reuse **派生**
+    （variant_of）——codec 列有三层兜底（sidecar 实测 → user_tags 声明 → 变体名
+    规则，见 bench-export.codec_dims），编排传了存储档的场次必有值；基座场次
+    codec 为空 → 派生回基座名。
     """
     v = row.get('track_variant') or ''
     if v:
         return v
-    raw = row.get('track_raw') or ''
-    if '-codec-' in raw:
-        return raw
-    return row.get('track') or raw
+    raw = row.get('track_raw')
+    if raw is not None:
+        # 旧契约行：track_raw 是变体目录名的权威载体
+        return raw if '-codec-' in raw else (row.get('track') or raw)
+    codec = row.get('codec')
+    if codec:
+        sr = row.get('source_reuse')
+        sr_s = {True: 'true', False: 'false'}.get(sr, sr if isinstance(sr, str) else None)
+        v = variant_of(row.get('track') or '', codec, sr_s)
+        if v:
+            return v
+    return row.get('track') or raw or ''
 
 
 def split_codec(codec, sr=None):
@@ -496,7 +507,7 @@ class Cell:
         for r in self.rows:
             if r.get('trusted') is False:
                 out.append("该测量有 trusted=false 的行（面板只取 trusted=true）")
-            v = r.get('track_variant')
+            v = variant_id_of(r)
             if v and v != r.get('track'):
                 out.append("赛道变体：%s（基座 %s）" % (v, r.get('track')))
         return out
