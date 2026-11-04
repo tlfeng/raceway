@@ -26,10 +26,8 @@ vm_all() {
 }
 
 # JDK 安装（幂等）：把 OpenJDK 装到虚机的 /opt/jdks/jdk-<ver>。
-# 只认这一个约定（版本号从目录名取，安装包在 $PKG_DIR/openjdk-<ver>_linux-x64_bin.tar.gz），
+# 只认这一个约定：版本号从目录名取，安装包在 $PKG_DIR/openjdk-<ver>_linux-x64_bin.tar.gz。
 # 不猜版本、不下网 —— 装不了就返回非 0，由调用方报错。
-# 用途：JDK 26/27 这类"用户自管变体"的复测前，campaign 收尾会清掉虚机上的 jdk 目录，
-#       框架只负责换装与身份断言，装什么版本由这里按 $JDK_DIR 决定。
 provision_jdk() { # <ip>
   local ip="$1" ver pkg
   case "${JDK_DIR:-}" in
@@ -50,7 +48,7 @@ provision_jdk() { # <ip>
     /opt/jdks/jdk-$ver/bin/java -version 2>&1 | head -1" || return 1
   return 0; }
 
-# 引擎名 -> 属性（正式名：easysearch | elasticsearch；systemd 服务名与引擎名相同）
+# 引擎名 -> 属性（引擎名 = systemd 服务名：easysearch | elasticsearch）
 eng_dir() {
   case "$1" in
     easysearch)    echo "$IBS_BASE/easysearch";;
@@ -63,34 +61,30 @@ node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsea
 # 服务运行用户（wipe 后 chown 用）
 eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; esac; }
 
-# ---- 赛道变体（压缩 × source_reuse）--------------------------------------------
-# 一个**变体** = 基础赛道 + 压缩档 + source_reuse 开关。
+# ---- 赛道变体（压缩 × source_reuse × 量化）--------------------------------------
+# 一个**变体** = 基础赛道 + 压缩档 + source_reuse 开关（量化档是另一维度，见 track_quant）。
 #
-#   规范 id = <基础赛道id>-codec-<压缩token>[-sr]   （与变体目录名一致）
-#     geo-codec-def      geo-codec-def-sr
-#     geo-codec-zstd     geo-codec-zstd-sr
-#     geo-codec-bc       geo-codec-bc-sr
-#     hnsw-codec-zstd    ds-j1024-codec-def-sr  …（任意基础赛道都适用）
+# 规范 id = <基础赛道id>-codec-<压缩token>[-sr]（与变体目录名一致）：
+#   geo-codec-def[-sr] / geo-codec-zstd[-sr] / geo-codec-bc[-sr]
+#   hnsw-codec-zstd / ds-j1024-codec-def-sr …（任意基础赛道都适用）
 #
-# 历史短 id（只作**兼容输入**，历史排程文件里就是这么写的）：
-#   gdef  → geo-codec-def
-#   gzstd → geo-codec-zstd-sr   ← 历史名"gzstd"实为 ZSTD + source_reuse，
-#                                  不改名是为了让旧 campaign 的场次名语义不漂移
-#   gbc  → geo-codec-bc
+# 兼容输入：历史短 id 仍然认（只作别名）：
+#   gdef → geo-codec-def
+#   gzstd → geo-codec-zstd-sr（是 ZSTD + source_reuse，不是纯 ZSTD）
+#   gbc → geo-codec-bc
 #
 # 压缩 token ↔ index.codec：def=default(LZ4) / zstd=ZSTD / bc=best_compression
 # -sr 后缀 = index.source_reuse 开（Easysearch 专有设置）
 #
-# 为什么用**规则**而不是查表：压缩与 source_reuse 是索引级设置，对**任何**基础
-# 赛道都成立 —— 规则化才能推广到全部赛道，新增赛道不用再改表。
+# 压缩与 source_reuse 是索引级设置，对任何基础赛道都成立 → 规则化，不查表。
 #
-# 引擎兼容（据 Easysearch 源码 EngineConfig.INDEX_CODEC_SETTING + index.source_reuse
-# 的专有性）：
+# 引擎兼容（index.codec 取值依据 Easysearch 源码 EngineConfig.INDEX_CODEC_SETTING）：
 #   index.codec 合法值 = default / best_compression / lucene_default / ZSTD 系列
 #     （ZSTD 系列 Easysearch 专有；ES 的 index.codec 只有 default/best_compression）
 #   index.source_reuse = Easysearch 专有（ES 不认这个设置）
-#   → 两侧通用：default/best_compression 且 sr 关
-#   → 仅 Easysearch：ZSTD（任意 sr）、或任意压缩 + sr 开
+#
+# → 两侧通用：default/best_compression 且 sr 关
+# → 仅 Easysearch：ZSTD（任意 sr）、或任意压缩 + sr 开
 
 track_canonical() { # <短 id> → 规范 id
   case "$1" in
@@ -108,15 +102,13 @@ track_dir() { # <赛道/变体 id> → 目录
   local c; c=$(track_canonical "$1")
   case "$c" in
     *-codec-*)
-      # 压缩变体**不再另建目录**：赛道定义定版在 tracks/，压缩档与 source_reuse
-      # 走 --track-params（index_codec / source_reuse），由 index.json 的条件块写入。
-      # 少一份运行时生成的副本 = 少一处"脚本产物与 git 定义不一致"的坑。
+      # 压缩变体不另建目录：定版在 tracks/，压缩档与 source_reuse 走
+      # --track-params（index_codec / source_reuse），由 index.json 的条件块写入。
       local b="${c%%-codec-*}"
       case "$b" in hv1024x*) echo "$ROOT/tracks/hv1024x";; *) track_dir "$b";; esac;;
     hv1024x-int8|hv1024x-bbq)
-      # 向量量化族：四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
-      # 量化档走 --track-params（vector_index_type）—— 只差一行却存四份目录，
-      # 改一处忘另一处的漂移风险就是这么来的。
+      # 向量量化族四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
+      # 量化档走 --track-params（vector_index_type）。
       echo "$ROOT/tracks/hv1024x";;
     geo) echo "$ROOT/tracks/geonames";;
     hnsw) echo "$TRACK_HNSW_S3";;
@@ -141,13 +133,44 @@ track_source_reuse() { # <id> → true / false（空 = 非压缩变体）
     *) echo "";; esac; }
 track_quant() { # <id> → index_options.type（空 = 不量化）
   # 向量量化档是**向量索引类型**（index_options.type），不是压缩档：
-  # int8_hnsw = 标量量化，bbq_hnsw = 二值量化。两侧通用（ES 8.19.23 与
-  # Easysearch 2.5.1 都能建，2026-11-03 hvbbq campaign 15 场已实跑）。
+  # int8_hnsw = 标量量化，bbq_hnsw = 二值量化；ES 8.19.23 与 Easysearch 2.5.1 两侧都能建。
   # 与压缩档是**两个独立维度**，别混：量化走 vector_index_type，压缩走 index_codec。
   case "$(track_canonical "$1")" in
     *-int8) echo "int8_hnsw";;
     *-bbq) echo "bbq_hnsw";;
     *) echo "";; esac; }
+# hnsw 3 分片变体只在**真要跑 hnsw 族**时才生成：无条件生成时，机器上缺 hnsw 基座
+# 定义会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
+tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要生成 hnsw 3 分片变体
+  local tk
+  for tk in "$@"; do
+    case "$tk" in *hnsw*) return 0;; esac
+  done
+  return 1
+}
+# 赛道可用性总表：✔=定义在位 / ⚠=不在位。
+# run-bench.sh list 与 doctor.sh 共用这一份 —— 两处各写一份映射表 = 迟早漂移。
+track_availability_table() {
+  local _t _d
+  for _t in geo hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr; do
+    case "$_t" in
+      hnsw) _d="${TRACK_HNSW_BASE:-}";;                    # 3 分片变体起跑时生成，判基座在不在
+      *)    _d=$(track_dir "$_t" 2>/dev/null || echo "");;   # 变体与基座同目录（压缩/量化走 params）
+    esac
+    if [ -n "$_d" ] && [ -f "$_d/track.json" ]; then
+      printf '  %s %-24s %s\n' "✔" "$_t" "$_d"
+    else
+      [ -n "$_d" ] || { case "$_t" in
+        hnsw) _d="（vm-bench.env 里没设 TRACK_HNSW_BASE）";;
+        *)    _d="（路径解析失败）";;
+      esac; }
+      printf '  %s %-24s %s\n' "⚠" "$_t" "$_d"
+      echo "      ↳ 定义不在位：仓库没同步全（同步得带 tracks/），或这条还没回灌进 git（见 tracks/README.md）"
+    fi
+  done
+  echo "  ⚠ ds-<档名>              $ROOT/tracks/ds-<档名>"
+  echo "      ↳ 7 档维度扫描的定义待回灌（语料在机器上）；要跑先按 tracks/README.md「还没切完的部分」回灌"
+}
 track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
   local b; b=$(track_base "$1"); case "$b" in geo) echo "geonames";; nested) echo "sonested";; *) echo "vectors";; esac; }
 track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
@@ -159,22 +182,23 @@ track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
 
 track_params() { # <id> → esrally --track-params（空 = 不传）
   # 分片口径：只有"模板类基座"需要传 —— geonames / nested / hv1024 的 index.json
-  # 是 Jinja 模板，写的是 "index.number_of_shards": {{number_of_shards | default(N)}}，
+  # 是 Jinja 模板（"index.number_of_shards": {{number_of_shards | default(N)}}），
   # 不传就落到模板默认值（geonames 5、nested 1、hv1024 3），与其余赛道的 3 分片口径
-  # 不一致，跨赛道/跨变体的数字就不可比了（实测 legacy 别名 gdef/gzstd/gbc 落档都是 3 分片）。
+  # 不一致，跨赛道/跨变体的数字就不可比了。
+  #
   # 其余赛道（hnsw/ds-*）分片已烘进 index.json，不传。
-  # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名（geo-codec-*）
-  #    与 legacy 别名走的是同一条规则，只是名字不同。
+  # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名与 legacy 别名
+  #    走的是同一条规则，只是名字不同。
   local b; b=$(track_base "$1")
   local p=""
   case "$b" in
     geo|nested|hv1024) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
   esac
   # 压缩档与 source_reuse：索引级设置，走 --track-params（标量，无逗号，rally 2.12 解析可靠），
-  # 由 index.json 的条件块写入 settings —— {% if index_codec is defined %} /
-  # {% if source_reuse is defined and source_reuse %}。
-  # source_reuse 只在开的时候传：写 false 会被 Jinja 当成非空字符串（真值）→ 反而把
-  # Easysearch 专有设置打开了，必须不传。
+  # 由 index.json 的条件块写入 settings（{% if index_codec is defined %} /
+  # {% if source_reuse is defined and source_reuse %}）。
+  # ⚠️ source_reuse 只在开的时候传：写 false 会被 Jinja 当成非空字符串（真值）→ 反而打开
+  #    Easysearch 专有设置，必须不传。
   local comp sr
   comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
   [ -n "$comp" ] && p="${p:+$p,}index_codec:$comp"
@@ -208,7 +232,7 @@ track_assert_storage_params() { # <赛道id>
 
 # ---- 拓扑（单事实源 = ibs ip.txt）---------------------------------------------
 # 集群节点 = ip.txt 中主机名不以 esrally 开头的行（esrally 行是驱动器，不进集群）。
-# 产出：VM_IPS/VM_NODES（角色节点数组）、NNODES、NODE_RANGE（ops.deploy -n 的 1-based 行号区间）、
+# 产出：VM_IPS/VM_NODES、NNODES、NODE_RANGE（ops.deploy -n 的 1-based 行号区间）、
 #       VM_NAMES（env 显式配置的 KVM 客户机名优先且数量须匹配，否则回退集群节点名）。
 # 与引擎无关（行集固定）；引擎切换时由 ibs_sync_ip 改写主机名前缀，行集不变。
 load_topology() { # [engine_name]（仅日志用途）
@@ -271,9 +295,8 @@ nonseg_shards() { # <index>
     | awk '$1=="p"{c[$2]++} END{n=0; for(s in c) if(c[s]>1) n++; print n+0}'
 }
 
-# 异步 forcemerge 并轮询到每分片 1 段
-# （单挑战协议下编排侧不再调用 —— merge 移入赛道 full challenge，段数卡点退役；
-#   函数保留供手工对某个索引做"合并+验证"。）
+# 异步 forcemerge 并轮询到每分片 1 段（编排侧不调用，merge 由赛道 full challenge 负责；
+# 函数保留供手工对某个索引做"合并+验证"）。
 force_merge_to_one() { # <index> <max_wait_sec>
   local idx="$1" maxw="${2:-1200}"
   local ip="${VM_IPS[0]}" n deadline=$((SECONDS + maxw))
@@ -293,18 +316,15 @@ force_merge_to_one() { # <index> <max_wait_sec>
 # 单挑战（full）：写段（建索引/refresh，nested 系写段自带 forcemerge+等合并）
 # → forcemerge(1) → 查段，一次 rally 调用跑完（phase=wq）。
 # merge 的"完成等待"由赛道自带（force-merge 同步 API / wait-until-merges-finish
-# 条件操作，rally 保证完成后才跑后续 op）；编排侧段数卡点（SEG-ASSERT）随拆分
-# 协议退役 —— merge 结果无验证是接受的取舍。
+# 条件操作，rally 保证完成后才跑后续 op）；编排侧无段数卡点，merge 结果无验证是接受的取舍。
 derive_full_challenge() { # <track_dir> —— 从 write-only + query-only 拼出 challenges/full.json（幂等）
-  # 2026-10-29 补丁（上游 0ed6911 缺陷，三处）：
-  #  (1) 原实现只认 challenges/write-only.json 与 challenges/query-only.json 两个独立文件；
-  #      geonames(codec-bench) 与 hnsw2m 把这两个挑战写在同一个 challenges/default.json（数组）里 → 派生失败 → 整场 RACE-FAIL。
-  #      本版：独立文件优先；否则遍历 challenges/*.json 按挑战名定位其 schedule 数组。
-  #  (2) 原自检把 {{占位}} 一律替换成 "X"，当占位符在引号内（"{{x}}"）会变成 ""X"" → 非法 JSON → 误判失败；
-  #      且 geo 赛道带 {%- if %} jinja 语句块。改进：先剥离语句标签 → 引号内占位→"X" → 裸占位→"X"；自检降级为告警（真错由 rally 拦）。
-  #  (3) 写段与查段合并后出现**重名任务** → rally 报 "contains multiple tasks with the name 'X'" → 整场 RACE-FAIL。
-  #      rally 的任务名规则：显式 "name" 优先，否则用 operation-type（再否则用 operation 字符串）。
-  #      本版：逐操作算有效任务名，冲突者显式补名（-2/-3…），保证挑战内唯一。
+  # 派生的三条规则（照做，否则整场 RACE-FAIL）：
+  #  (1) 挑战文件优先用 challenges/<name>.json；没有就遍历 challenges/*.json 按挑战名
+  #      定位其 schedule 数组（geonames / hnsw2m 把两个挑战写在同一个 default.json 数组里）。
+  #  (2) 自检替换占位前先剥 jinja 语句标签，再把引号内占位→"X"、裸占位→"X"；
+  #      自检只告警不阻断（真错由 rally 拦）。
+  #  (3) rally 要求挑战内任务名唯一：显式 "name" 优先，否则 operation-type；
+  #      重名者显式补名（-2/-3…）。
   local dir="$1" out="$1/challenges/full.json"
   [ -s "$out" ] && return 0
   python3 - "$dir" "$out" <<'PY' || return 1
@@ -499,9 +519,8 @@ PY
 
 # ============================================================================
 # CPU 绑核（模拟 8 核招标环境）
-#   原理：三节点 systemd drop-in 写 CPUAffinity，引擎进程及全部线程（含 GC）
-#   限定在指定 vCPU；JDK 10+ 按亲和掩码把 availableProcessors 收缩为 N，
-#   线程池/GC 自动按 N 核配置 —— 等效一台 N 核机器，不动虚机、不动安装。
+#   三节点 systemd drop-in 写 CPUAffinity，引擎进程及全部线程（含 GC）限定在指定 vCPU；
+#   JDK 10+ 按亲和掩码把 availableProcessors 收缩为 N，线程池/GC 自动按 N 核配置。
 #   apply 后对服务"下次启动"生效（ibs wipe 重启即生效）；clear 还原。
 #   编排侧：run-bench*.sh 设 EXPECT_CPU_CORES=N 时每场断言（CPU-GATE-FAIL）。
 # ============================================================================
@@ -545,10 +564,10 @@ cpu_affinity_clear() { # 移除 drop-in（服务下次启动恢复全部核）
   log "CPUAffinity drop-in 已移除（服务下次启动恢复全部核）"
 }
 
-# 实际堆断言（2026-10-16 新增）：归位重装/工件推送会把 bundle 原版 1g 堆带回来，
-# user-tags 声明的 heap 与实际 -Xmx 可能不一致（10/15 ds3 事故：声明 16g 实际 1g，ez 全部场 -13%）。
-# 必须在引擎冷启动后调用（集群卡点之后）。全车硬断言——堆由 ibs 部署时 configure_jvm_heap
-# 统一设定（easysearch 走 jvm.options 堆行、ES 走 jvm.options.d/heap.options，均为内存/2=16g）。
+# 实际堆断言：归位重装/工件推送会把 bundle 原版 1g 堆带回来，user-tags 声明的 heap
+# 与实际 -Xmx 可能不一致（声明 16g 实际 1g → 全场数据偏低）→ 必须硬断言。
+# 必须在引擎冷启动后调用（集群卡点之后）。堆由 ibs 部署时 configure_jvm_heap 统一设定
+# （easysearch 走 jvm.options 堆行、ES 走 jvm.options.d/heap.options，均为内存/2=16g）。
 heap_assert() { # <car> <expected:16g> [dir] [svc] → 任一节点实际 -Xmx ≠ 声明则 rc=1
   local car="$1" want="${2:-16g}" dir="${3:-$IBS_BASE/easysearch}" svc="${4:-easysearch}"
   local wg num unit gb ip pid xmx bad=0

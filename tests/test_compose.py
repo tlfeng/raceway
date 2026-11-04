@@ -8,7 +8,7 @@
 覆盖的最要紧的不变式：
     **compose 生成的排程行序 == runner 非排程主循环的实际执行序**
     （赛道外层 → 轮次 → 车右旋，交错直接复刻 bench-queue.order_for_round）
-排程模式下 runner 不再自行交错，交错是排程文件的义务——这里钉住它。
+排程模式下 runner 不自行交错，交错是排程文件的义务——这里钉住它。
 """
 import importlib
 import os
@@ -214,7 +214,7 @@ class TestControlConsole(unittest.TestCase):
 
     def test_api_render_returns_est_total_and_what(self):
         """GUI 的 render 响应要带 est_total_min / what —— 起跑前"要跑多久"和
-        runner 分支参数（历史 bug：serve 模式 what=None 让 dry-run 必失败）。"""
+        runner 分支参数（serve 模式 what=None 会让 dry-run 必失败）。"""
         import tempfile
         cars_path = tempfile.mktemp(suffix='.conf')
         with open(cars_path, 'w', encoding='utf-8') as f:

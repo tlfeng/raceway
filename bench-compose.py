@@ -174,15 +174,15 @@ def render_cars(cars, tag):
 
 
 # ---- 赛道清单（两层：基础赛道 → 压缩 × source_reuse 变体网格）-----------------
-# 压缩与 source_reuse 是**索引级设置**，对任何基础赛道都成立 → 不再只给 geonames
-# 做变体，而是让**每个**基础赛道都能派生 6 个变体（3 压缩 × 2 sr）。
+# 压缩与 source_reuse 是**索引级设置**，对任何基础赛道都成立 → 每个基础赛道派生
+# 6 个变体（3 压缩 × 2 sr）。
 #
 # 变体 id = <基础赛道id>-codec-<def|zstd|bc>[-sr]  （与变体目录名一致）
 # 引擎兼容不是查表而是**规则推导**（与压测机 vm-bench-lib.sh 同一套）→
 # 不存在两处表格漂移的可能。
 #
-# 能不能起跑看 run-bench.sh:109-118 的赛道分支；库里的 hvtp200k-2s/3s 是旧版
-# runner 跑的，当前 runner 的 track_dir 没有这两个分支 → 只能看历史，排不了。
+# 能不能起跑看 run-bench.sh:109-118 的赛道分支；hvtp200k-2s/3s 当前 runner 的
+# track_dir 没有这两个分支 → 只能看历史，排不了。
 #
 # est 取各 campaign 的 RACES.md 实测耗时上界 + 余量（窗底守卫靠它算"这场塞不塞
 # 得进剩余窗口"，估小了会把排得下的场次误判成 DEADLINE-SKIP）。
@@ -217,7 +217,7 @@ TOKEN_LABEL = {'def': 'default(LZ4)', 'zstd': 'ZSTD', 'bc': 'best_compression'}
 TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
 # 变体 est 系数（相对基础赛道）：
 #   （default,关）1.0 —— 基线
-#   （ZSTD,开）  1.25 —— 来自 geo 实测（ZSTD+sr 中位 30min / 基座 24min）
+#   （ZSTD,开）  1.25 —— 来自 geo 实测
 #   其余取中间值 —— 压缩对总耗时的影响**没有实测**，这里是保守估计，
 #   跑完一轮后按实测值用 --est 覆盖。
 VARIANT_EST_FACTOR = {
@@ -1289,7 +1289,7 @@ def api_render(st, body):
                             int(body.get('est_default') or DEFAULT_EST),
                             recall=(body.get('recall') != 'norecall'))
     # runner 的赛道分支参数：serve 模式没有 CLI 的 compose_all 推导，这里补上
-    # （此前 GUI 的 preview/start 把 what=None 传给 runner，dry-run 必失败）
+    # （GUI 的 preview/start 不能把 what=None 传给 runner，否则 dry-run 必失败）
     what = body.get('what') or what_for(tracks)
     est_total = est_total_min(rows, est_map, int(body.get('est_default') or DEFAULT_EST))
     st.last = {'cars': cars, 'schedule': sched, 'tag': tag, 'plan': plan, 'what': what,

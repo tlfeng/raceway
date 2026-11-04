@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
 # cpu-affinity.sh —— 三节点引擎 CPU 绑核工具（模拟 8 核招标环境）
-#   ./cpu-affinity.sh apply <N>  三节点 easysearch+elasticsearch 写 systemd
-#                                CPUAffinity drop-in（服务下次启动生效；JDK 按亲
-#                                和掩码把可用核数收缩为 N，线程池/GC 自动按 N 核）
+#   ./cpu-affinity.sh apply <N>  三节点 easysearch+elasticsearch 写 CPUAffinity drop-in
+#                                （下次启动生效；JDK 按亲和掩码把可用核数收缩为 N，线程池/GC 按 N 核）
 #   ./cpu-affinity.sh status [N] 查看引擎进程当前实际亲和核数（给 N 则校验，不符 rc=1）
 #   ./cpu-affinity.sh clear      移除 drop-in（服务下次启动恢复全部 32 vCPU）
+#
 # 编排侧配套：run-bench*.sh 设 EXPECT_CPU_CORES=N 时每场断言（CPU-GATE-FAIL）。
 # ⚠️ drop-in 持久生效：跑完绑核 campaign 后，跑全核矩阵前必须 clear。
 # ============================================================================

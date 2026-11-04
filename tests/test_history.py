@@ -11,7 +11,7 @@
    只有写赛 VALID 是**半场**，仍需重跑（不能当成已覆盖）。
 2. **build 隔离**：jdk25@3009 跑过 ≠ jdk25@3015 跑过。同一格在两个 build 上
    各有一次跑动时，必须**按 build 分别**判定 —— 取"最坏"会把后来成功的
-   重跑也一起抹掉（ds2 之前就在 3009 上 SKIP、后来 3015 上 VALID）。
+   重跑也一起抹掉（3009 上 SKIP、3015 上 VALID）。
 3. **指标库不可用 ≠ 什么都没跑过**：查不到库时覆盖表必须标 unavailable，
    编排照常但**不剔除**任何格；把空表当"没跑过"会让编排台重排已做过的测试。
 """
@@ -28,9 +28,9 @@ H = importlib.import_module('bench-history')  # noqa: E402
 def row(campaign='c1', fid='jdk25-ds-j1024-r1', car='jdk25', car_build='jdk25@3015',
         track='ds-j1024', rnd=1, status='VALID', quality='ok', phase='w',
         challenge=None, ts='2026-10-21T02:30:00Z', warnings=None):
-    """一行 benchmark-result-race 文档（2026-10-21 字段终态）。
+    """一行 benchmark-result-race 文档。
 
-    身份不再有顶层 car / car_build 字段 —— 车代号在 user_tags.car，
+    身份字段：顶层没有 car / car_build —— 车代号在 user_tags.car，
     构建号在 engine_build，bench-history 用 row_build_key 合成 `车@build`。
     """
     build = car_build.rsplit('@', 1)[-1] if '@' in car_build else ''
@@ -92,7 +92,7 @@ class TestBuildIsolation(unittest.TestCase):
     """同一格在不同 build 上各跑一次 → 必须按 build 分别判定。"""
 
     def setUp(self):
-        # 3009 上 SKIP（ds3 当时被窗底砍掉），3015 上后来跑成 VALID（ds2）
+        # 同一格：3009 上 SKIP、3015 上 VALID → 必须按 build 分别判定
         rows = [
             row(campaign='ds3', car_build='jdk25@3009', status='SKIP', phase='w'),
             row(campaign='ds3', car_build='jdk25@3009', status='SKIP', phase='q'),

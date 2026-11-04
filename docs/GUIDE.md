@@ -2,9 +2,10 @@
 
 > 分两层写：
 > - **上篇「怎么跑」** —— 想测什么、敲什么命令、怎么看进度、跑完怎么收结果。
-> - **下篇「跑起来之后」** —— 框架怎么分层、脚本各管什么、一场压测内部发生什么、踩过哪些坑。
+> - **下篇「跑起来之后」** —— 框架怎么分层、脚本各管什么、一场压测内部发生什么、哪些规则不能破。
 >
-> 方法学与统计口径见 [METHODOLOGY](METHODOLOGY.md)，hv1024 赛道的数据来源见 [hv1024-track](hv1024-track.md)。
+> 方法学与统计口径见 [METHODOLOGY](METHODOLOGY.md)，hv1024 赛道的数据来源见 [hv1024-track](hv1024-track.md)，
+> 赛道定义目录的规矩与待办见 [tracks/README.md](../tracks/README.md)。
 > 门面前言与最短上手路径见仓库根 [README](../README.md)。
 > 所有环境配置都放在 `vm-bench.env`（模板 `vm-bench.env.example`，真身不入库）。
 
@@ -50,15 +51,32 @@ ssh <压测机>
 cd /opt/raceway
 
 # ② 改过本地 raceway 仓库后，先同步到压测机（在本地仓库目录执行；只覆盖不删除）
-scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/
+scp -r *.sh *.py *.conf vm-bench.env tracks kibana <压测机>:/opt/raceway/
 
 # ③ 长任务一律 setsid nohup 后台跑，人只轮询 PROGRESS.txt（防 SSH 断连）
 # ④ 跑完把 campaign 下载回本地归档（见 §6）
 ```
 
-被测引擎的包路径、堆大小、卡点阈值都在 `vm-bench.env`。JDK 不走包配置，`JDK_DIR` 直接写被测节点上的目录。
+⚠️ **`scp` 必须带 `tracks/`（和 `kibana/`）**：赛道定义在 git 里，压测机上没有它就跑不起来。
 
 ⚠️ scp 只覆盖不删除：压测机上删过的文件，本地删了还要 `ssh <压测机> rm` 一次。
+
+被测引擎的包路径、堆大小、卡点阈值都在 `vm-bench.env`。JDK 不走包配置，`JDK_DIR` 直接写被测节点上的目录。
+
+### 2.1 阈值键与路径键（`vm-bench.env`）
+
+| 键 | 作用 |
+|---|---|
+| `VERDICT_STEAL_MAX` | 赛后 ENV 判定：任一采样 steal_max 超过 → 该场 CONTAMINATED；赛前 steal_max ≥ 此值 → 卡点 FAIL |
+| `VERDICT_FOREIGN_MAX` | 外来进程 CPU 峰值超过 → 赛后 WARN；赛前 ≥ 此值 → 卡点 FAIL |
+| `QUIET_STEAL` / `QUIET_FOREIGN_CPU` | 赛前静默卡点的同口径项，缺省**继承** `VERDICT_*`；只有赛前要单独收紧才显式写 |
+| `QUIET_LOAD1` / `QUIET_BENCH_CPU` / `QUIET_FREE_GB` | 赛前卡点专属：1 分钟负载 / 被测引擎 CPU %（赛前应为 0）/ 磁盘可用 GB |
+| `HOST_QUIET_PORTS` / `HOST_QUIET_AUTOSTART` | 逃生阀：置空可关掉宿主旁路检查（见 `precheck.sh`） |
+| `CLUSTER_WAIT_SEC` | 集群卡点轮询超时 |
+| `TIMEOUT_<赛道>_W` / `_Q` | 写段 / 查段超时（秒） |
+| `HV_CORPUS` / `HV_QUERIES_BZ2` | hv1024 系语料与官方查询集路径；起跑前用来软链语料、生成 `queries.json` |
+| `TRACK_HNSW_BASE` / `TRACK_HNSW_S3` | 机器本地的 96 维 HNSW 赛道（定义不在库内，runner 现生成） |
+| `ENGINE_MARK` | 监控归因标记：cmdline 含此串的进程视为被测引擎。**换部署根必须同步改**（见 §15 第 10 条） |
 
 ## 3. 三种编排方式
 
@@ -87,7 +105,7 @@ scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/
 | `CAR_LABEL` | 这台车的标签，进场次名和元数据。多配置时必须互不相同；不填就取 JDK 目录名或引擎身份 |
 | `JDK_WANT` | 可选，形如 `"25\|OpenJDK"`，是期望的 JDK 身份，进元数据并参与校验 |
 
-> 旧名 `ARM_LABEL` 仍然认，改名前写的配置行照抄能用。
+> 兼容：旧名 `ARM_LABEL` 仍然认。
 
 ```
 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=ez3015
@@ -125,7 +143,7 @@ jdk26 ds-j1024 2 norecall 42
 
 四条规则：
 
-1. 赛道名写规范 id（`geo` `hnsw` `hv1024` `nested` `ds-*` `geo-codec-*`），不要写历史短别名。
+1. 赛道名写规范 id（`geo` `hnsw` `hv1024` `nested` `ds-*` `geo-codec-*`），不要写短别名。
 2. 最后那个数字是该场预计耗时。时间窗保护靠它判断「这场还塞不塞得下」。
 3. 设了 `DS_HOURS=12`，放不下的场次标 `DEADLINE-SKIP` 就跳过，继续跑后面更便宜的场 —— 保证高价值的数据先落袋。时间窗末尾还留 20 分钟余量。
 4. 排程方式不做轮内换位，文件里的行序就是执行顺序。断点续跑认 `STATE.txt`（用 `CAMP_ID` 复用同一个跑分目录）。
@@ -159,7 +177,7 @@ setsid nohup ./run-bench.sh both 3 ez-es.conf > run-3eng-$(date +%m%d).log 2>&1 
 ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ./run-bench.sh gbc 3 ...  # ES 只认 default 与 best_compression
 ```
 
-压缩变体**不再生成目录**：压缩档与 source_reuse 走 `--track-params`（`index_codec:` / `source_reuse:true`），由定版 `tracks/geonames/index.json` 的条件块写进 settings。机制见 §13.1。
+压缩变体不生成目录：压缩档与 source_reuse 走 `--track-params`（`index_codec:` / `source_reuse:true`），由定版 `tracks/geonames/index.json` 的条件块写进 settings。机制见 §13.1。
 
 ### 4.3 1024 维向量（8 核环境）
 
@@ -215,9 +233,6 @@ cat    /opt/raceway/campaigns/<campaign-id>/RACES.md        # 场次判定表
 | `JDK-SWAP-FAIL` / `JDK-FIX-FAIL` / `JDK-ASSERT-FAIL` | JDK 换装、回切、身份校验失败 | 查 `JDK_DIR` 在被测节点上是否可达 |
 | `HEAP-ASSERT-FAIL` | 实际 -Xmx 和声明的不一致 | 补跑这一场；复现就查配置漂移 |
 | `CPU-ASSERT-FAIL` | 实际亲和核数和 `EXPECT_CPU_CORES` 不一致 | 查绑核的 drop-in 有没有残留 |
-
-> `WRITE-FAIL` / `QUERY-FAIL` / `SEG-ASSERT-FAIL` 是旧协议时代的名字，现在不会再出现。
-> `bench-queue.py` 的 `STATUS_FAILS` 已补上 `RACE-FAIL`（2026-11-02 修复），那 3 个旧名字还留着，但不会再命中。
 
 ## 6. 跑后：收结果、对比、入库
 
@@ -301,7 +316,7 @@ systemctl stop easysearch-metric-store.service
 | `reset-env.sh` | 环境还原 | `./reset-env.sh <easysearch\|elasticsearch\|all>`，可加 `--no-wipe` / `--purge` |
 | `stop-campaign.sh` / `close-campaign.sh` | 停掉某个跑分的进程 / 给中途停掉的跑分补「结束行」 | `./stop-campaign.sh <标签>`；`./close-campaign.sh [--dry-run]` |
 | `identity.py` | 被测配置身份口径的唯一来源 | 被 sidecar 和导出器 import |
-| `flatten_settings.py` | 赛道 index.json 的 settings 结构审计/修复（codec/source_reuse 必须是顶层键） | `python3 flatten_settings.py --check tracks/`；回归由 `tests/test_track_settings.py` 守着 |
+| `audit_track_settings.py` | 赛道 index.json 的 settings 结构审计（codec/source_reuse 必须是顶层键；只报告不修复） | `python3 audit_track_settings.py --check tracks/`；回归由 `tests/test_track_settings.py` 守着 |
 | `bench-sidecar.py` | 每场的元数据 sidecar：实测 JDK 版本、索引 settings、核数、堆 | 由 run-bench 每场调用 |
 | `car-compare.py` | 两个配置对比 + `--assert` 阈值断言（不达标退出码 1） | `python3 car-compare.py <跑分A> <跑分B> --a 标签A --b 标签B` |
 | `car-env-table.py` | 三配置 × 多赛道的「性能 × 环境」联合表 | `python3 car-env-table.py <跑分目录> [--detail]` |
@@ -309,7 +324,6 @@ systemctl stop easysearch-metric-store.service
 | `bench-queue.py` / `bench-history.py` / `bench-compose.py` | 队列观测台 / 已入库覆盖表 / 控制台，见 §14 | 见 §14 |
 | `build-race-store.py` → `bench-export.py` → `bench-apply.py` | 跑分产物 → rally race store → 入库载荷 → 导入 ES | `python3 bench-export.py --out exports/<tag>` |
 
-> 旧名 `arm-compare.py` 和 `arm-env-table.py`（2026-10-21 改名前的副本）已删除，现在的版本是 `car-*`。
 > Kibana 建板工具链自成一套，在 `kibana/` 目录里（见 [kibana/README.md](../kibana/README.md)）。
 
 ## 10. 一场压测内部发生了什么
@@ -323,7 +337,7 @@ systemctl stop easysearch-metric-store.service
 
 几个关键取舍：
 
-- **单挑战协议**（2026-10-28 起）：编排侧不再分成 write 和 query 两次 race，也不再单独做段数检查。合并由赛道自带的 full challenge 完成（force-merge 同步接口 + 等合并结束）。代价是「合并结果没有再单独验证」，这是接受的简化。
+- **单挑战协议**：编排侧一次 rally 调用跑完（写 + 合并 + 查），不单独做段数检查。合并由赛道自带的 full challenge 完成（force-merge 同步接口 + 等合并结束）。代价是「合并结果没有再单独验证」，这是接受的简化。
 - **采样**：一整场共用一份采样，tag 是 `<场次名>-wq`，5 秒一条 CSV，ENV 判定写在 `monitors/` 里。
 - **堆**：由 ibs 在部署时统一设成物理内存的一半（16g）。easysearch 写进 `jvm.options`，ES 写进 `jvm.options.d/heap.options`。
 - **JDK**：按 `JDK_DIR` 幂等换装。第一次换装会把引擎自带的 JDK 归档成 `jdk.bundled`；没指定 `JDK_DIR` 的配置会自动切回自带的。
@@ -351,6 +365,8 @@ monitors/           三台被测节点的采样 CSV + summary + ENV-SUMMARY.csv
 
 ## 13. 赛道说明
 
+赛道定义的目录结构、规矩与待办见 [tracks/README.md](../tracks/README.md)；这里只讲编排层怎么用。
+
 ### 13.1 codec 赛道（geonames 存储压缩）
 
 `./run-bench.sh codec 3` 一次跑六个变体，也可以单独跑：`./run-bench.sh geo-codec-def 3`。
@@ -364,7 +380,7 @@ geo-codec-bc       geo-codec-bc-sr
 hnsw-codec-zstd    ds-j1024-codec-bc-sr   …（任意基础赛道都能这么派生）
 ```
 
-**为什么要拆成两个维度**：早先三个变体把压缩和 source_reuse 混在一个名字里（`geo-codec-zstd-sr` 既是 ZSTD 又是 source_reuse），这样「ZSTD 比 default 快还是慢」就没法归因了。拆开之后，任意两档之间的差异只来自一个变量：
+**压缩与 source_reuse 是两个独立维度**：任意两档之间的差异只来自一个变量：
 
 | 对比 | 差异来自 |
 |---|---|
@@ -382,9 +398,9 @@ hnsw-codec-zstd    ds-j1024-codec-bc-sr   …（任意基础赛道都能这么�
 
 几个实现细节：
 
-- 赛道定义定版在 `tracks/geonames/`（git 里就是跑的那份）。压缩档与 source_reuse 不再烘进副本目录，而是走 `--track-params`（`index_codec:` / `source_reuse:true`），由 `index.json` 的条件块写入 settings —— 没有第二份运行时生成的赛道定义，也就没有"脚本产物与 git 定义不一致"这种坑。
-- **分片数不烘在变体里，靠 track-params 传**。geonames 的 `index.json` 是 Jinja 模板，分片位置写的是 `{{number_of_shards | default(5)}}` —— 不传就会落到模板默认的 **5 分片**。runner 按**基座赛道**统一传 `SHARDS`/`REPLICAS`（默认 3/0），所以 canonical 变体名（`geo-codec-*`）和 legacy 别名（`gdef`/`gzstd`/`gbc`）拿到的是同一份口径。变体目录里看不到分片设置，不代表分片数就是模板默认值。
-- 历史短名 `gdef` / `gzstd` / `gbc` 保留为别名（`gzstd` 实际是 `geo-codec-zstd-sr`）。不改名是为了让旧跑分的场次名（`…-gzstd-r1`）语义不漂移。
+- 赛道定义定版在 `tracks/geonames/`（git 里就是跑的那份）。压缩档与 source_reuse 走 `--track-params`（`index_codec:` / `source_reuse:true`），由 `index.json` 的条件块写入 settings —— 没有第二份运行时生成的赛道定义。
+- **分片数不烘在变体里，靠 track-params 传**。geonames 的 `index.json` 是 Jinja 模板，分片位置是 `{{number_of_shards | default(5)}}` —— 不传就落到模板默认的 **5 分片**。runner 按**基座赛道**统一传 `SHARDS`/`REPLICAS`（默认 3/0），canonical 变体名（`geo-codec-*`）与别名（`gdef`/`gzstd`/`gbc`）拿到同一份口径。变体目录里看不到分片设置，不代表分片数就是模板默认值。
+- **兼容别名**：`gdef` / `gzstd` / `gbc` 仍可用（`gzstd` = `geo-codec-zstd-sr`）。不改名是为了让旧跑分的场次名（`…-gzstd-r1`）语义不漂移。
 - 可证明性：sidecar 每场抓一次 `GET /<索引>/_settings?flat_settings=true` 的实测值 —— 烘进赛道不等于集群里真是这个值。
 - 汇总用 `codec-compare.py <跑分目录> [--detail]`，出写入两口径、赛末体积、逐操作查询三张表。
 
@@ -440,7 +456,7 @@ python3 bench-compose.py serve   --port 8802                       # Web 控制�
 几个使用前提：
 
 - 指标库没起（压测窗口里是常态）时编排照常，只是没法自动剔除已跑过的格子。
-- 控制台里的赛道清单是**全部能起跑的赛道**：`ds-*` 维度扫描 7 档、`geo` 加 `gdef/gzstd/gbc` 三个 codec 变体、`hnsw`、`hv1024`、`nested`。每档带一个实测的预计分钟数（来自各次跑分的 `RACES.md`）。`hvtp200k-2s/3s` 只有历史数据，当前 runner 没有对应分支，**能看不能排**。
+- 控制台里的赛道清单是**全部能起跑的赛道**：`ds-*` 维度扫描 7 档、`geo` 加 `gdef/gzstd/gbc` 三个 codec 变体、`hnsw`、`hv1024`、`nested`。每档带一个实测的预计分钟数（来自各次跑分的 `RACES.md`）。`hvtp200k-2s/3s` 没有对应 runner 分支，**能看不能排**。
 - 覆盖判定守三条口径（见 `bench-history.py` 顶部注释）：相位判定（拆分协议一场次两行 phase=w/q，两个相位都 VALID 才算跑过；单挑战协议一行 phase=wq）、build 隔离（`jdk25@3009` 跑过不等于 `jdk25@3015` 跑过）、指标库不可用不等于什么都没跑过。
 
 ### 14.1 中途停掉的跑分怎么收尾
@@ -457,23 +473,25 @@ runner 被 TERM/INT/HUP 打断，或者自己 `die` 掉时，会补上这一行�
 
 补的只是一行文本，`RACES.md` 和 `STATE.txt` 都不动，`CAMP_ID=<id>` 的断点续跑照常。
 
-## 15. 踩过的坑
+## 15. 规则与后果（不能破的规矩）
 
-1. **报告文件名必须全场唯一**。rally 的 markdown 报告是追加不覆盖的，重试的场次用 `-tryN` 后缀，免得串写。
-2. **ES 冷重启的口径由 ibs wipe 承担**。ES 的 admin 用户存在 data 目录的 `.security` 索引里。`ops.clean wipe` 先停服务再清空 data 和 logs，重启后 `_restore_admin` 用 keystore 的 bootstrap.password 重放一遍 admin 创建（幂等）。这样冷态干净，三台车口径一致。
-3. **easysearch 的 wipe 不用特殊处理**。admin 由 `config/security/user.yml` 承载，data 可以整个删，和 ES 走同一条 ibs wipe 命令。
-4. **pkill 会匹配到自己**。停进程时用 `[x]` 这种字符类打断字面匹配，避免 pkill 杀掉自己的命令行。
-5. **hnsw 的 3 分片变体必须幂等生成，而且绝不能带 `.offset` 断点文件** —— rally 会续传，写入计量就失真了。
-6. **段数要用带后缀的接口采**（`_cat/segments` 按 prirep 过滤）。rally 报告里的段数是 `_all` 口径，会把 `.security` 也算进去。
-7. **长任务要防 SSH 断连**。整个跑分 `setsid nohup` 后台跑，人只轮询 PROGRESS.txt 文件。
-8. **0 副本的时候单节点也是 green**。集群检查必须显式断言 `number_of_nodes=3` 和节点名，不能只看 green。
-9. **残留进程会串台**。每场之前要停干净、断言 9200 端口空闲、再用 `GET /` 断言版本，防旧引擎占着端口静默串台。静默卡点还会查 `bench_cpu_avg`：残留引擎的命令行里有 ENGINE_MARK，会被算成 bench 而不是外来进程，只有这一条能抓到它。
-10. **监控的归因标记要跟着部署根走**。load-monitor 判断 bench 还是外来进程，靠的是命令行里的 ENGINE_MARK（默认 `/infini`，也就是 ibs 的安装根，run-bench 每场都会精确指到被测引擎目录）。标记错位时 bench 那列恒为 0，引擎的 CPU 被算成外来进程，「外来进程」这个判定就瞎了。**换部署根必须同步改 ENGINE_MARK**。
-11. **绑核的 drop-in 是持久生效的**。`cpu-affinity.sh apply 8` 写进 `/etc/systemd/system/{easysearch,elasticsearch}.service.d/zz-cpu-affinity.conf`，跨 ibs 部署、wipe、重启一直都在。**后面要跑全核（32 vCPU）矩阵，必须先 `./cpu-affinity.sh clear`**，否则引擎被静默限制在 8 核，数字全废。`EXPECT_CPU_CORES` 每场都会兜底断言。
-12. **写赛道的暖机时间必须按本集群实测的写入时长重新标，不能沿用赛道的原值**。rally 的规矩是：`warmup-time-period` 里的样本全标 `sample-type=warmup`，不进结果。而 bulk 写入按官方文档**不要设 `time-period`** —— rally 会灌完整个语料，暖机之后的每个样本都是测量样本；报告里的 `duration` 是**含暖机**的墙钟时长。官方示例给 bulk 写死 120s 预跑，隐含前提是语料要灌好几分钟。本集群整段写入只有 geo 71~98s、nested 110~135s、hnsw 422~449s，120s 或 70s 这种常量会变成 72%~109%，测量窗口被吃光，`throughput=null` 而返回码还是 0，照样判 VALID（nested 变体曾因此丢了 2/6 场）。**取值规则：按上游比例带取暖机，约等于任务时长的 20%，而且窗口必须 ≥ 50%** —— geo `write-only` 20s、nested-s3 25s（并删掉 time-period:3600）、hnsw 40s。
-13. **口径A 和口径B 不一样，两个都要留**。口径A 是 rally 的 `Median Throughput`（区间中位速率），口径B 是语料条数 ÷ `duration`（全程平均）。差别来自写入有没有慢尾，不是窗口长短：nested 窗口只有 1.7~14.4s 时两者差 ±0.8%，hnsw 窗口 382~404s 时口径A 反而系统性高 3.5%（建图慢尾）。`car-compare.py` 两个口径都会输出，还会给出每场的任务秒数。race.json 里的 `segment_count` 和 `store_size` 是 `_all` 全集群统计，而段数检查查的是具体索引，别拿它当 forcemerge 失败的证据。
-14. **ES 8.19 出厂的 `config/jvm.options` 里没有 `-Xms/-Xmx`**，堆走 JVM 默认值，也就是物理内存的 1/4，32G 的被测节点上只有 8g，和 ez 那边显式设的 16g 不是一个基线。现在由 ibs 统一治本：`configure_jvm_heap` 遇到没有堆行的配置，就写一份 `config/jvm.options.d/heap.options`（内存的一半 = 16g，幂等覆写）。ES 和 easysearch 两边部署完就是同一个基线，编排侧的 `heap_assert` 也会硬断言每一台车。
-15. **比 codec 的落盘体积别用 race.json 的 `store_size`**。race.json 里的 `store_size` 和 `segment_count` 是 rally 落档的 `_all` 全集群口径（把 `.security` 这些非测试索引也算进去了），和「赛末三台节点的 `indices.store` 之和」不是一回事，codec 之间的差异显现不出来。真实体积取赛末 sidecar 的原始探针 `logs/fp/<场次名>-q/nodes-stats.txt`（拆分协议）或 `<场次名>-wq/nodes-stats.txt`（单挑战协议），把三台节点的 `indices.store.size_in_bytes` 加起来。`codec-compare.py` 默认用后者，只有探针缺失时才回退到 race.json。
-16. **重试的场次会让「按 车-赛道-圈数 拼出来的场次名」在下游串档**。RACES.md 里同一场可能出现 `x-r1`、`x-r1-try2`、`x-r1-try3` 三行，而 race.json 里**没有 attempt 号**。只有 sidecar 同时握着 `race_id` 和带 `-tryN` 的真实场次名，所以 `bench-export.py` 用 `sidecar_by_race` 做连接键（实测 JDK、堆、状态都对得上）；`codec-compare.py` 则先按 RACES.md 过滤掉 VALID 再统计，否则作废场次的写入数据会混进样本。同类的坑：`env_summary_csv` 早期用 `partition("-")` 切场次名，把 `es819-gbc-r1` 截成了 `es819`，后来改成按 `-<节点名>$` 重建。
-17. **对比必须先把赛道钉死，车只在同赛道内可比**。以前那种一个 track 只取到第一辆车的对比图，等于拿 A 车的尾部去和另一个赛道的数比。正确的做法是按 (车, 赛道) 分车画线，每个赛道一张图。跨赛道只能看趋势，不能看绝对值 —— bulk 尺寸、文档大小、建图成本都不一样。
-18. **排程输入必须挂在独立的文件描述符上**。排程循环体里的子命令（ssh、ibs、rally、tar）都会继承 stdin，而 `while read … done < <(schedule_lines)` 的 stdin 就是排程管道。任何一个子命令读一下 stdin，后面还没跑的排程行就被吃干净了 —— 实测 24 场只跑了第 1 场。修法是排程从 **FD 3** 读（`exec 3< <(schedule_lines)` 配 `read -u 3`），子命令的 stdin 和排程彻底隔开。
+| # | 规则 | 后果 |
+|---|---|---|
+| 1 | 报告文件名必须全场唯一（重试场次用 `-tryN` 后缀） | rally 的 markdown 报告是追加不覆盖的，不加后缀会串写 |
+| 2 | ES 冷重启的口径由 ibs wipe 承担：`ops.clean wipe` 先停服务再清空 data 和 logs，重启后 `_restore_admin` 用 keystore 的 bootstrap.password 重放一遍 admin 创建（幂等） | 不做就带着上一场的状态进场，三台车冷态口径不一致 |
+| 3 | easysearch 的 wipe 不用特殊处理：admin 由 `config/security/user.yml` 承载，data 可整个删 | 和 ES 走同一条 ibs wipe 命令，不必分支 |
+| 4 | 停进程时用字符类打断字面匹配（`[x]`） | `pkill` 会匹配到自己的命令行，把自己杀掉 |
+| 5 | 语料目录必须幂等生成，且绝不能带 `.offset` 断点文件 | rally 会续传，写入计量失真 |
+| 6 | 段数要用带后缀的接口采（`_cat/segments` 按 prirep 过滤） | rally 报告里的段数是 `_all` 口径，会把 `.security` 也算进去 |
+| 7 | 整个跑分用 `setsid nohup` 后台跑，人只轮询 PROGRESS.txt | SSH 断连会带走整个跑分 |
+| 8 | 集群检查必须显式断言 `number_of_nodes=3` 和节点名，不能只看 green | 0 副本的时候单节点也是 green |
+| 9 | 每场之前停干净、断言 9200 端口空闲、再用 `GET /` 断言版本 | 旧引擎占着端口会静默串台。静默卡点的 `bench_cpu_avg` 是唯一能抓到残留引擎的检查（残留引擎命令行里有 ENGINE_MARK，会被算成 bench 而不是外来进程） |
+| 10 | 监控归因标记 ENGINE_MARK 要跟着部署根走（默认 `/infini` 即 ibs 安装根，run-bench 每场精确指到被测引擎目录）；**换部署根必须同步改** | 标记错位时 bench 那列恒为 0，引擎 CPU 被算成外来进程，「外来进程」这个判定就瞎了 |
+| 11 | `cpu-affinity.sh apply 8` 写的 drop-in 是持久生效的（跨 ibs 部署、wipe、重启）；跑全核（32 vCPU）矩阵前必须先 `./cpu-affinity.sh clear` | 引擎被静默限制在 8 核，数字全废。`EXPECT_CPU_CORES` 每场都会兜底断言 |
+| 12 | 写赛道的暖机时间按本集群实测的写入时长重新标，**不沿用赛道的原值**：按上游比例带取暖机，约等于任务时长的 20%，且窗口必须 ≥ 50%（geo `write-only` 20s、nested-s3 25s 并删掉 `time-period:3600`、hnsw 40s）。bulk 写入按官方文档不设 `time-period`（rally 会灌完整个语料，报告里的 `duration` 是含暖机的墙钟时长） | 写死常量会让暖机占 72%~109%，测量窗口被吃光，`throughput=null` 而返回码还是 0，照样判 VALID |
+| 13 | 口径A（rally `Median Throughput`）与口径B（语料条数 ÷ `duration`）都要留；`car-compare.py` 两个口径都会输出 | 差别来自写入慢尾不是窗口长短：nested 窗口 1.7~14.4s 时两者差 ±0.8%，hnsw 窗口 382~404s 时口径A 反而系统性高 3.5% |
+| 14 | 堆由 ibs 在部署时统一设成物理内存的一半（16g）；ES 配置里没有堆行时写一份 `config/jvm.options.d/heap.options`（幂等覆写）。编排侧 `heap_assert` 硬断言每一台车 | ES 8.19 出厂 `config/jvm.options` 里没有 `-Xms/-Xmx`，堆走 JVM 默认值（物理内存 1/4，32G 节点上只有 8g），和 ez 显式设的 16g 不是同一个基线 |
+| 15 | 比落盘体积取赛末 sidecar 的原始探针（三台节点 `indices.store.size_in_bytes` 之和）：拆分协议 `logs/fp/<场次名>-q/nodes-stats.txt`，单挑战协议 `<场次名>-wq/nodes-stats.txt`。`codec-compare.py` 默认用后者，探针缺失才回退 race.json | race.json 的 `store_size` / `segment_count` 是 `_all` 全集群口径（把 `.security` 也算进去了），codec 之间的差异显现不出来 |
+| 16 | 下游连接键用 sidecar 的 `race_id` + 带 `-tryN` 的真实场次名（`bench-export.py` 用 `sidecar_by_race`）；场次名从右往左按 `-<节点名>$` 重建，不要用 `partition("-")`。`codec-compare.py` 先按 RACES.md 过滤掉 VALID 再统计 | 同一场会有 `x-r1` / `x-r1-try2` / `x-r1-try3` 多行而 race.json 没有 attempt 号，按「车-赛道-圈数」拼名字会串档；`partition("-")` 会把 `es819-gbc-r1` 截成 `es819` |
+| 17 | 对比按 (车, 赛道) 分车画线，每个赛道一张图 | 只按 track 取第一辆车的对比图，等于拿 A 车的尾部去和另一个赛道的数比。跨赛道只能看趋势不能看绝对值（bulk 尺寸、文档大小、建图成本都不同） |
+| 18 | 排程从 **FD 3** 读（`exec 3< <(schedule_lines)` 配 `read -u 3`），子命令的 stdin 与排程隔开 | 排程循环体里的子命令（ssh、ibs、rally、tar）都会继承 stdin，任何一个读一下 stdin，后面还没跑的排程行就被吃干净了 |

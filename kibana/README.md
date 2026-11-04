@@ -6,7 +6,7 @@
 > **口径基准是 v2 契约**（见压测工作区 `DESIGN-三索引数据存储方案.md`）：
 > 库里没有 `valid` / `status` / `quality`，只有行级布尔 `trusted`；
 > 看板级默认闸门是 `trusted: true AND NOT codec:(zstd or best_compression)`。
-> 改面板口径前先对一遍那份文档，别照着旧 `valid`/`quality` 写。
+> 改面板口径前先对一遍那份文档。
 
 ## 目录里有什么
 
@@ -21,7 +21,8 @@
 
 > `artifacts.elastic.co` 的下载路径在压测机网络里被封，只能走 registry API 取镜像层解开用。
 > 本目录是自成一体的工具链 —— 装 Kibana（`pull-kibana-image.sh`）和起 Kibana
-> （`deploy-kibana.sh`）的脚本都在这里，压测机上整个 `kibana/` 目录一起拷过去即可。
+> （`deploy-kibana.sh`）的脚本都在这里，压测机上整个 `kibana/` 目录一起拷过去即可
+> （和 `tracks/` 一起同步，见 [GUIDE §2](../docs/GUIDE.md)）。
 
 ## 环境
 
@@ -68,7 +69,7 @@ bash deploy-kibana.sh status
 
 | 点 | Kibana 7.17 | Kibana 8.1 |
 |---|---|---|
-| `visualization.attributes.version` | 映射是 **integer**，写字符串整批导入失败 → **不写**（Kibana 自带样例里也没这字段，不是必填） | 同样不写（历史上写过非 semver 值让 8.x 迁移函数抛 `Invalid Version: 1`） |
+| `visualization.attributes.version` | 映射是 **integer**，写字符串整批导入失败 → **不写**（Kibana 自带样例里也没这字段，不是必填） | 同样不写 |
 | `kibanaSavedObjectMeta.searchSourceJSON` | 按 7.17 自带样例写 `{"query":{"query":"","language":"kuery"},"filter":[]}` | `{"filter":[]}` |
 | `index-pattern.attributes.timeFieldName` | 必填字符串，取不到就兜底第一个 date 字段 | 同 |
 
@@ -103,8 +104,7 @@ python3 make_dashboard.py --import \
   + 维度扫描合并板 `bench-dimsweep`（维度轴）/ `bench-dimsweep-car`（车轴）
 - **visualization**：TSVB 时序图 + markdown 文本面板（段标题、维度对照表、图例说明）
 
-面板数量随赛道与 workload 集变化，**以实际导入为准**，不要在文档里写死数字
-（历史口径散落在多处，已经漂过好几轮）。
+面板数量随赛道与 workload 集变化，**以实际导入为准**，不要在文档里写死数字。
 
 TSVB 时序图按「赛道 × workload」动态生成，分四段：
 **① 写入**（吞吐、索引总耗时、Merge/Refresh/Flush 耗时、限流、活动次数）、
@@ -121,7 +121,7 @@ TSVB 时序图按「赛道 × workload」动态生成，分四段：
 | 维度扫描档 `ds-*` | `DS_TRACK_RE` 匹配即跳过 | 已合并进 `bench-dimsweep` / `bench-dimsweep-car`，不再一页一档 |
 | 一次性对照场次 | `ONE_OFF_TRACKS` 显式列出 | 不是可复跑的赛道，是一次决策实验（详见 `make_dashboard.py` 里的注释） |
 
-`ONE_OFF_TRACKS` 当前是 `('hvtp200k-2s', 'hvtp200k-3s')` —— 2026-10-15「分片布局复测」的
+`ONE_OFF_TRACKS` 当前是 `('hvtp200k-2s', 'hvtp200k-3s')` —— 「分片布局复测」的
 对照组（20 万条 × 1024 维，只测"2 主分片 vs 3 主分片"一个变量），结论已定稿进
 《向量场景控标技术指标-20261015.md》§五，**结论走文档不走看板**。
 不放的理由写在 `make_dashboard.py` 的 `ONE_OFF_TRACKS` 注释里（无 RACES.md 记账 → 导出期
@@ -208,7 +208,7 @@ python3 verify-dashboard.py --kibana http://127.0.0.1:5601 --dash bench-geo
 它直接调 Kibana 自己的 TSVB 渲染接口 `POST /api/metrics/vis/data`（7.x / 8.x 同路径），
 把看板级 KQL 并进面板 filter、用看板存的时间窗发真实请求，要求返回的 series 里 bucket 非空。
 
-> 踩坑：Kibana 7.11+ 的 dashboard 迁移会把 `panelsJSON` 里面板的 `id` 抹掉，改成
+> 迁移兼容：Kibana 7.11+ 的 dashboard 迁移会把 `panelsJSON` 里面板的 `id` 抹掉，改成
 > `panelRefName` + `references`（`references` 的 `name` 是 panelIndex，面板侧是
 > `panelRefName`，两边名字对不上）—— 校验脚本按 panelIndex 关联才对得上。
 
@@ -224,13 +224,3 @@ tail -f /tmp/es_shim.log
 排查完不必还原任何配置 —— shim 是常驻代理，不像改 `kibana.yml` 那种要改回来。
 
 更细的踩坑记录见压测工作区的 `FLOW-benchmark结果入库ES与Kibana看板.md` 第六节。
-
-## 历史
-
-2026-11-02 上游 `ebd5c86` 以「移除 Kibana 看板链路与 HTML 报告工具」为名删掉了本目录与
-`bench-report.py`。2026-11-03 恢复**仅建板链路**（本目录 5 个文件 +
-`pull-kibana-image.sh`，安装器后来也从仓库根目录归位到本目录），
-并按 v2 契约改了面板口径；未恢复的是与建板无关的部分：
-HTML 报告工具链（`bench-report.py` + `echarts.min.js`）、
-7.10.2 的 `docker-compose.yml`（不是 7.17，且与工作区 `es-kibana.sh` 冲突）、
-`es-proxy.py`（shim 已落请求体，功能被覆盖）。

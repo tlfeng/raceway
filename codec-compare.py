@@ -6,8 +6,8 @@
 
 三件事分开看，别混成一个数：
   ① 写入吞吐：口径A=rally Median Throughput（warmup 后样本中位），口径B=语料条数÷duration（全程平均）
-  ② 落盘体积：race.json 的 store_size 是 `_all` 全集群统计；本轮每场只有一个 geonames 索引，
-     所以它就等于该 codec 的实测体积（同语料、同 3 分片、赛后都 forcemerge）——这是压缩对比的主指标
+  ② 落盘体积：主指标取赛末 sidecar 探针（logs/fp/<fid>-*/nodes-stats.txt）的三节点 store 之和；
+     race.json 的 store_size 只是写赛结束时的快照，压缩差异没充分显现（见 post_merge_store）
   ③ 查询延迟：q-race.json 的 op_metrics[].latency 分位（codec 改变了 stored fields 的解码成本）
 
 codec 一列读的是 sidecar 里 `GET /geonames/_settings` 的**实测**值，不是赛道文件名烘的期望值
@@ -86,7 +86,7 @@ def post_merge_store(camp, fid):
 
 def valid_fids(camp):
     """RACES.md 里状态 VALID 的场次名集合。
-    重试场的**写赛**常常是成功的（10-18 的 es819-gbc-r1 两次 QUERY-FAIL 前写赛都落了档），
+    重试场的**写赛**常常也是成功的（QUERY-FAIL 之前写赛已落档），
     只看 results/*.json 会把它们当成独立样本 → n 虚高、且把作废场混进中位数。"""
     p = os.path.join(camp, "RACES.md")
     ok = set()

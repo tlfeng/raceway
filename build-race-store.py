@@ -8,7 +8,7 @@ bench-export.py 的 --races 期望的是 rally 原生布局 `<dir>/<race-id>/rac
 
     <out>/<race-id>/race.json  ->  campaigns-local/<campaign>/results/<fid>-race.json
 
-只建软链不复制数据（231 场约 3 MB，复制会双份且易与源脱节）。
+只建软链不复制数据（复制会双份且易与源脱节）。
 幂等：已存在的链接会按需重建；--rebuild 先清空再生成。
 
   python3 build-race-store.py --campaigns campaigns-local --out race-store

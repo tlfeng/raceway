@@ -3,7 +3,8 @@
 # doctor.sh —— 新环境体检：一条命令回答"这台机器离能起跑还差什么"
 #   ./doctor.sh        # 在驱动宿主机上运行
 # 纯只读：不碰集群、不改状态、不依赖 vm-bench.env（它正是体检对象之一）。
-# 六组检查：基础工具 / env 配置 / ibs 拓扑 / 虚机连通 / 语料与安装包 / 指标库，
+#
+# 六组检查：基础工具 / env 配置 / ibs 拓扑 / 虚机连通 / 语料与安装包 / 指标库；
 # 末尾给出阈值生效值。FAIL>0 时退出码 1 —— 修完 FAIL 再起跑。
 # ============================================================================
 set -uo pipefail
@@ -21,6 +22,12 @@ ENV_LOADED=0
 if [ -f vm-bench.env ]; then
   # shellcheck disable=SC1091
   source ./vm-bench.env 2>/dev/null && ENV_LOADED=1
+fi
+# env 在位时把公共函数库也拉进来 —— 「赛道可用性」表要和 runner 用**同一个** track_dir
+# （两处各写一份映射表 = 迟早漂移）。env 不在位时体检照跑，只是这张表出不来。
+if [ "$ENV_LOADED" = 1 ] && [ -f vm-bench-lib.sh ]; then
+  # shellcheck disable=SC1091
+  source ./vm-bench-lib.sh 2>/dev/null || true
 fi
 
 # ---- 1/6 驱动宿主机基础工具 ---------------------------------------------------
@@ -119,14 +126,48 @@ else
     esac
   done < <(grep -oE '^[[:space:]]*TRACK_[A-Z0-9_]+' vm-bench.env)
   # 定版赛道定义（git 里那份）：缺一份 = 起跑必炸（而不是跑出一个错的赛道）
-  for _td in geonames hv1024 nested; do
+  for _td in geonames hv1024 nested hv1024x; do
     _p="$ROOT/tracks/$_td"
     if [ -f "$_p/track.json" ]; then ok "tracks/$_td → $_p（定版定义在位）"
-    else bad "tracks/$_td 定义缺失: $_p（仓库里应有 tracks/$_td/；先同步仓库）"; fi
+    else bad "tracks/$_td 定义缺失: $_p（仓库里应有 tracks/$_td/；同步仓库时记得带 tracks/）"; fi
+  done
+  # 赛道可用性总表 —— 和 `run-bench.sh list` 同一份实现（vm-bench-lib.sh 的
+  # track_availability_table），两处各写一份映射表 = 迟早漂移。
+  # "起不来"最常见的原因是定义没同步全 / 还没回灌进 git —— 这里一次说清。
+  if declare -F track_availability_table >/dev/null 2>&1; then
+    echo "  赛道可用性（✔ 定义在位 / ⚠ 不在位 → 同步仓库时带上 tracks/，或先按 tracks/README.md 回灌）："
+    track_availability_table
+  fi
+  # hv1024 系语料与查询集：**本地语料**（track.json 里没有 base-url，rally 不会自动下载）
+  for _td in hv1024 hv1024x; do
+    _p="$ROOT/tracks/$_td"
+    [ -f "$_p/track.json" ] || continue
+    if [ -e "$_p/documents-1024.json" ]; then
+      ok "$_td 语料已就位（documents-1024.json）"
+    elif [ -n "${HV_CORPUS:-}" ] && [ -f "${HV_CORPUS}" ]; then
+      ok "$_td 语料待软链（起跑时自动链上）: $HV_CORPUS"
+    else
+      bad "$_td 缺语料：vm-bench.env 里设 HV_CORPUS=1M×1024 维语料 JSON 路径（起跑时自动软链）"
+    fi
+    if [ -s "$_p/queries.json" ]; then
+      ok "$_td 查询集已就位"
+    elif [ -n "${HV_QUERIES_BZ2:-}" ] && [ -f "${HV_QUERIES_BZ2}" ]; then
+      ok "$_td 查询集待生成（起跑时自动生成）: $HV_QUERIES_BZ2"
+    else
+      bad "$_td 缺查询集：vm-bench.env 里设 HV_QUERIES_BZ2=官方 queries.json.bz2 路径（起跑时自动生成）"
+    fi
   done
   # 安装包：任一 bundle 即可部署（版本由配置推导）
   if [ -n "${PKG_DIR:-}" ] && ls "$PKG_DIR"/*.tar.gz >/dev/null 2>&1; then
-    ok "安装包就位: $(ls "$PKG_DIR"/*.tar.gz 2>/dev/null | wc -l) 个（$PKG_DIR）"
+    _npkg=$(ls "$PKG_DIR"/*.tar.gz 2>/dev/null | wc -l)
+    _nempty=0
+    for _p in "$PKG_DIR"/*.tar.gz; do [ -s "$_p" ] || _nempty=$((_nempty+1)); done
+    if [ "$_nempty" -eq 0 ]; then
+      ok "安装包就位: $_npkg 个（$PKG_DIR）"
+    else
+      # 空包会被 runner 当成"缺安装包"（它查的是 -s 非空）→ 体检得说清，别让体检过了起跑才炸
+      bad "有 $_nempty 个安装包是空文件（runner 按非空判定 → 会报缺安装包）：$(for _p in "$PKG_DIR"/*.tar.gz; do [ -s "$_p" ] || basename "$_p"; done | tr '\n' ' ')"
+    fi
   else
     bad "PKG_DIR=${PKG_DIR:-?} 里没有 *.tar.gz（easysearch/elasticsearch bundle，部署必需）"
   fi

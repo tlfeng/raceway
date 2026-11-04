@@ -491,7 +491,7 @@ def track_panel_specs(track, groups, interval):
             specs.append(('qthr-' + gid, '%s · 吞吐 (ops/s)' % label,
                           '%s AND family:throughput AND unit:"ops/s" AND stat:p50 AND %s' % (t, tt),
                           '0.0a', split, 'avg', interval))
-        # ---- 时延三兄弟（2026-10-20 复审重做）----
+        # ---- 时延三兄弟 ----
         # rally 的 latency 有两种口径，取决于该 operation 有没有 target-throughput：
         #   闭环（无 target-throughput）: latency ≡ service_time，量单次请求耗时
         #   开环（有 target-throughput）: latency = 端到端（含发压机积压），
@@ -967,7 +967,7 @@ DS_TABLE_SPECS = [
     ('r100', 'Recall@100', 'family:recall AND stat:mean AND task:knn-search-100-1000 AND trusted:true', '', 1),
 ]
 
-# 一次性对照赛道：**不进看板**（2026-10-22 定）
+# 一次性对照赛道：**不进看板**
 #   hvtp200k-2s / hvtp200k-3s —— 「分片布局复测」的对照组，20 万条 × 1024 维，
 #   只跑 1 组（ez 2.5.0-3009 / 8 核绑核），只测「2 主分片 vs 3 主分片」一个变量。
 #   结论已写进《向量场景控标技术指标-20261015.md》§五：条款定稿为 3 主分片、

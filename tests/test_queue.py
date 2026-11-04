@@ -176,7 +176,7 @@ class TestLegacyCampaign(unittest.TestCase):
 
     def test_retry_does_not_break_legacy_plan(self):
         """重跑会把同一 fid 再插回时间线中间；legacy 推导的自校验必须按首次出现去重，
-        否则会把本来正确的排程误判成"推导不可信"（实测 ds2 campaign 被这么误判过）。"""
+        否则会把本来正确的排程误判成"推导不可信"。"""
         cars = ['jdk26', 'jdk27']
         tracks = ['ds-j1024']
         rounds = 2

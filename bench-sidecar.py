@@ -209,8 +209,8 @@ def parse_knn_params(spec_blob, op_files, py_blob=""):
 def node_extras(full_stats_text):
     """从完整 _nodes/stats 探针里取"引擎压力与健康"指标。
 
-    只取拿得到就落、拿不到就不落 —— 旧探针（_nodes/stats/jvm,os,process,indices）
-    不含这些字段。缺它们的后果：压测中"是不是把线程池打爆了""缓存命中多少"
+    只取拿得到就落、拿不到就不落 —— 旧探针不含这些字段。
+    缺它们的后果：压测中"是不是把线程池打爆了""缓存命中多少"
     "引擎侧累计查询耗时"全部无法回答，饱和与限流在数据上不可区分。
     """
     nodes = load_nodes(full_stats_text)
@@ -314,9 +314,10 @@ def nodes_measured(info_text, stats_text):
         jvm_i, os_i = n.get("jvm") or {}, n.get("os") or {}
         jvm_s, os_s = s.get("jvm") or {}, s.get("os") or {}
         idx = (s.get("indices") or {}).get("docs") or {}
-        # 段内存只记仍在真实计数的 on-heap 三项：rally 经 index stats 采的 terms/norms/
-        # doc_values/points 等六项在新 Lucene（ES 8.19、ez240/250 实测）已衰减为恒 0
-        # （reader 挪到 mmap 堆外），index_writer/version_map/fixed_bit_set 仍是实值
+        # 段内存只记仍在真实计数的 on-heap 三项：rally 经 index stats 采的
+        # terms/norms/doc_values/points 等六项在新 Lucene（ES 8.19、ez240/250 实测）
+        # 已衰减为恒 0（reader 挪到 mmap 堆外），
+        # index_writer/version_map/fixed_bit_set 仍是实值
         seg = (s.get("indices") or {}).get("segments") or {}
         rec = {
             "name": n.get("name") or s.get("name"),
@@ -435,7 +436,8 @@ def main():
             "challenge": args.challenge, "round": args.round, "attempt": args.attempt,
         },
         "engine": {
-            # 从包名推导，不能写死 easysearch：es819 车的 sidecar 曾经 name=easysearch 而 pkg/version=8.19.23 自相矛盾
+            # 从包名推导，不能写死 easysearch：写死会让 es819 车出现
+            # name=easysearch 而 pkg/version=8.19.23 的自相矛盾
             "name": engine_name(args.pkg),
             "pkg": os.path.basename(args.pkg) if args.pkg else None,
             "pkg_sha256": sha,

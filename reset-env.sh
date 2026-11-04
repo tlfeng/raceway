@@ -4,7 +4,8 @@
 #   ./reset-env.sh <easysearch|elasticsearch|all>        # 停集群 + wipe data/logs（保留安装）
 #   ./reset-env.sh ... --no-wipe                         # 只停不清
 #   ./reset-env.sh ... --purge                           # 连安装目录一起删除 + 系统参数回滚
-#                                                        #   （ibs 模式委托 ops.clean uninstall）
+#
+# --purge 在 ibs 模式委托 ops.clean uninstall。
 # 说明：不会触碰虚机上原有的 /opt/easysearch/node-4/5/6 目录。
 # ============================================================================
 set -uo pipefail

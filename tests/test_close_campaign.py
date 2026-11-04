@@ -149,8 +149,8 @@ class CloseCampaignTest(unittest.TestCase):
     def test_live_runner_is_protected(self):
         pid = self.start_fake_runner()
         self.camp('live', HEADER % 'live', pid=pid)                       # pid 文件指向活 runner
-        self.camp('fresh', HEADER % 'fresh')                              # 旧式无 pid 文件、刚更新
-        self.camp('stale', HEADER % 'stale', mtime=time.time() - 3600)    # 旧式无 pid 文件、早停了
+        self.camp('fresh', HEADER % 'fresh')                              # 无 pid 文件、刚更新
+        self.camp('stale', HEADER % 'stale', mtime=time.time() - 3600)    # 无 pid 文件、早停了
         out = self.run_close()
         self.assertIn('LIVE  live：RUNNER.pid', out)
         self.assertIn('LIVE  fresh：宿主机有 run-bench.sh', out)
@@ -171,7 +171,7 @@ class CloseCampaignTest(unittest.TestCase):
         self.assertFalse(Q.parse_progress(self.progress('ds2-20261021-1'))['ended'])
 
     def test_decoy_with_filename_in_cmdline_is_not_a_runner(self):
-        """vim/tail/ssh 的命令行里带 run-bench.sh 不算 runner：刚更新的旧式 campaign 照常收尾。"""
+        """vim/tail/ssh 的命令行里带 run-bench.sh 不算 runner：刚更新的无 pid campaign 照常收尾。"""
         self.start_decoy()
         self.camp('fresh', HEADER % 'fresh')
         self.assertIn('CLOSE fresh', self.run_close())

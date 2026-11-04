@@ -1,6 +1,6 @@
 # hv1024 赛道：1024 维向量数据集与制作记录
 
-> 记录 hv1024 赛道（`$ROOT/tracks/hv1024-s3`，`ROOT=/opt/raceway`）的数据集来源与制作方法。数据集血统为 **esrally 官方赛道 `msmarco-jina-10m-vector`**（MS MARCO passage 语料 × jina-embeddings-v3，1024 维 float32）的 100 万条子集；赛道本身为自定义测试程序。赛道参数与口径速览见 [GUIDE §13.2](GUIDE.md)。
+> 记录 hv1024 赛道（定义定版在 `tracks/hv1024/`）的数据集来源与制作方法。数据集血统为 **esrally 官方赛道 `msmarco-jina-10m-vector`**（MS MARCO passage 语料 × jina-embeddings-v3，1024 维 float32）的 100 万条子集；赛道本身为自定义测试程序。赛道参数与口径速览见 [GUIDE §13.2](GUIDE.md)。
 
 ## 一、数据集来源
 
@@ -20,7 +20,7 @@
 
 ## 三、赛道构造（`tracks/hv1024/`，本仓库定版）
 
-赛道定义定版在 `tracks/hv1024/`（index.json / track.json / operations / challenges / track.py 全在 git 里）。起跑前由 run-bench 补两样 git 收不了的东西：语料软链 `documents-1024.json`、查询集 `queries.json`（官方 bz2 前 2000 条），并自检语料字节数与语料/查询向量维度：
+赛道定义定版在 `tracks/hv1024/`（index.json / track.json / operations / challenges / track.py 全在 git 里）。起跑前由 run-bench 补两样 git 收不了的东西：语料软链 `documents-1024.json`、查询集 `queries.json`（官方 bz2 前 2000 条），并自检语料字节数与语料/查询向量维度。语料与查询集的来源路径由 `vm-bench.env` 的 `HV_CORPUS` / `HV_QUERIES_BZ2` 指定：
 
 | 组件 | 内容 | 与官方差异 |
 |---|---|---|
@@ -33,10 +33,10 @@
 ## 四、20 万条派生赛道
 
 - 语料：`corpora/documents-hvfloat-sub200000.json`（200,000 行，4,548,045,134 字节，同链切取的前 20 万条）。
-- 赛道：`tracks/hvtp200k-2s`（2 分片）与 `hvtp200k-3s`（3 分片，最终采用），query-only 含单客户端与 32 客户端稳态（time-period 90s）两任务，用于 32 并发吞吐与分片布局对比（结论：2 分片使 3 节点 1/3 算力闲置，最终采用 3 主分片）。
+- 派生赛道 `tracks/hvtp200k-2s`（2 分片）与 `hvtp200k-3s`（3 分片，最终采用），query-only 含单客户端与 32 客户端稳态（time-period 90s）两任务，用于 32 并发吞吐与分片布局对比。结论：2 分片使 3 节点 1/3 算力闲置，最终采用 3 主分片。
 
 ## 五、复现要点
 
 1. 下载/转码脚本在 `<语料制作目录>/hv-bench/`；赛道定义在本仓库 `tracks/hv1024/`（语料软链与 queries.json 由 run-bench 起跑前生成）。
 2. 语料文件**勿删勿改**：`documents-jina-float.json` 与 `documents-hvfloat-sub200000.json` 被正式赛道以符号链接引用；重新生成只需重跑上表 1→2（需外网可达官方 CDN）。
-3. 本数据集与官方赛道的关系口径："官方 esrally 赛道 msmarco-jina-10m-vector 公开语料的 100 万条子集，测试程序由本规范定义"。
+3. 本数据集与官方赛道的关系口径：「官方 esrally 赛道 msmarco-jina-10m-vector 公开语料的 100 万条子集，测试程序由本规范定义」。
