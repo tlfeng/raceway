@@ -1,5 +1,5 @@
 {
-  "settings": { "index": { "number_of_shards": {{number_of_shards | default(3)}}, "number_of_replicas": {{number_of_replicas | default(0)}}{% if index_codec is defined %}, "index.codec": "{{index_codec}}"{% endif %}{% if source_reuse is defined and source_reuse %}, "index.source_reuse": true{% endif %} } },
+  "settings": { "index": { "number_of_shards": {{number_of_shards | default(3)}}, "number_of_replicas": {{number_of_replicas | default(0)}} }{% if index_codec is defined %}, "index.codec": "{{index_codec}}"{% endif %}{% if source_reuse is defined and source_reuse %}, "index.source_reuse": true{% endif %} },
   "mappings": {
     "dynamic": "false",
     "_source": { "enabled": false },
