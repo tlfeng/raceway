@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """bench-sidecar.py —— 每场 race 的 sidecar 组装器（方案 §4）
 
-用法（由 run-bench-jdk.sh 每场调用一次）:
+用法（由 run-bench.sh 每场调用一次）:
   bench-sidecar.py --raw DIR --out FILE --campaign C --fid F --phase w|q --race-id ID \
       --car A --track TK --challenge CH --round N --attempt K --track-dir D --track-params "..." \
       --heap 16g --cores 32 --pkg PATH --jdk-want "25|TencentKonaJDK" --env-id bench-3node-32c32g

@@ -11,7 +11,7 @@
 #     ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819
 #   允许的键：ENGINE_NAME ENGINE_VERSION ENGINE_BUILD JDK_DIR CAR_LABEL JDK_WANT（见下）；
 #   不写配置文件 = 单配置模式，沿用下面的顶层环境旋钮。
-#   模板见 scripts/campaign-configs.example.conf；DRY=1 或首参 --dry-run 只打印排程不执行
+#   模板见同目录的 campaign-configs.example.conf；DRY=1 或首参 --dry-run 只打印排程不执行
 #   断点续跑：RACES.md 里已 VALID 的场自动跳过（FRESH=1 强制全重跑）
 #   收尾可选 NOTIFY_URL=https://webhook… ：POST 一条 JSON 结果摘要
 #
@@ -107,7 +107,7 @@ fi
 
 if [ "$WHAT" = list ]; then
   echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested codec both all ds"
-  echo "配置模板: $(ls "$LIB_DIR"/campaign-configs.example.conf 2>/dev/null || echo scripts/campaign-configs.example.conf)"
+  echo "配置模板: $(ls "$LIB_DIR"/campaign-configs.example.conf 2>/dev/null || echo campaign-configs.example.conf)"
   echo "近期 campaign（RACES.md 的 VALID/总场）:"
   # 不限 jdk3-* 前缀：campaign 前缀已随车族分化（jdk3/vm3/esrm/ds3/ds2/es819…），
   # 只列 jdk3-* 会把 es819 车批次、维度扫描批次整批漏掉。

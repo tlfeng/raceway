@@ -435,7 +435,7 @@ python3 bench-compose.py serve   --port 8802                       # Web 控制�
 
 另外两个只读工具：
 
-- `bench-queue.py` —— 看队列。list / status / plan / html / serve 几个子命令，把跑分目录里的 `PROGRESS.txt`、`RACES.md`、`STATE.txt`、排程文件推成一张队列视图，并报四类问题：判定矛盾、STATE 行号错位、排程在运行期间被改、窗底漂移。
+- `bench-queue.py` —— 看队列。list / status / plan 三个子命令，把跑分目录里的 `PROGRESS.txt`、`RACES.md`、`STATE.txt`、排程文件推成一张队列视图，并报四类问题：判定矛盾、STATE 行号错位、排程在运行期间被改、窗底漂移。（网页版在上面的 `bench-compose.py serve` 里，不另开一个服务）
 - `bench-history.py` —— 看已入库的历史。把指标库 `benchmark-result-race` 读成「车 × 赛道 × 圈数」的覆盖表，回答「哪些格子跑过了、判定是什么、用的哪个 build」。
 
 进度页的推导就是来自 `bench-queue.build_campaign`。
