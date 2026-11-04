@@ -1,0 +1,15 @@
+    {
+      "name": "create-only",
+      "description": "Preflight probe: create the sonested index with the resolved settings and stop.",
+      "schedule": [
+        { "operation": "delete-index" },
+        { "operation": "create-index" },
+        { "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "sonested",
+            "request-params": { "wait_for_status": "green", "wait_for_no_relocating_shards": "true" },
+            "retry-until-success": true
+          } }
+      ]
+    }
