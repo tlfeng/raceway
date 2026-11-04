@@ -114,10 +114,16 @@ else
       else warn "$k → $v 目录在但没有 track.json（不是 rally 赛道目录？路径填错或语料没铺全）"
       fi; continue; fi
     case "$v" in
-      *codec*) warn "$k → $v 不存在（prepare-codec-track.sh 按需生成，用到哪条跑哪条）"; miss_var=$((miss_var+1));;
+      *codec*) warn "$k → $v 不存在（压缩变体不再建目录：压缩档走 --track-params，这条变量已作废，可从 env 删掉）"; miss_var=$((miss_var+1));;
       *) bad "$k → $v 不存在（基座赛道缺语料，起跑必炸）";;
     esac
   done < <(grep -oE '^[[:space:]]*TRACK_[A-Z0-9_]+' vm-bench.env)
+  # 定版赛道定义（git 里那份）：缺一份 = 起跑必炸（而不是跑出一个错的赛道）
+  for _td in geonames hv1024 nested; do
+    _p="$ROOT/tracks/$_td"
+    if [ -f "$_p/track.json" ]; then ok "tracks/$_td → $_p（定版定义在位）"
+    else bad "tracks/$_td 定义缺失: $_p（仓库里应有 tracks/$_td/；先同步仓库）"; fi
+  done
   # 安装包：任一 bundle 即可部署（版本由配置推导）
   if [ -n "${PKG_DIR:-}" ] && ls "$PKG_DIR"/*.tar.gz >/dev/null 2>&1; then
     ok "安装包就位: $(ls "$PKG_DIR"/*.tar.gz 2>/dev/null | wc -l) 个（$PKG_DIR）"

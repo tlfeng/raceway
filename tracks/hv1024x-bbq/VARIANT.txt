@@ -1,7 +1,0 @@
-变体 id:    hv1024x-bbq
-基础赛道:   hv1024（/opt/raceway/tracks/hv1024-s3）
-烘入设置:   index_options.type=bbq_hnsw
-索引名:     vectors
-语料:       /testing/aijiami-perf-test/hv-bench/corpora/documents-jina-float.json（1,000,000 docs × 1024 维 float，22739096214 字节）
-_source:    excludes ["emb"]（docid 保留，向量不进 _source）
-生成:       setup-hv1024bbq.sh 20261103

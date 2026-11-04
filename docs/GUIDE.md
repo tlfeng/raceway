@@ -159,7 +159,7 @@ setsid nohup ./run-bench.sh both 3 ez-es.conf > run-3eng-$(date +%m%d).log 2>&1 
 ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ./run-bench.sh gbc 3 ...  # ES 只认 default 与 best_compression
 ```
 
-赛道变体由 `prepare-codec-track.sh` 自动生成，幂等。机制见 §13.1。
+压缩变体**不再生成目录**：压缩档与 source_reuse 走 `--track-params`（`index_codec:` / `source_reuse:true`），由定版 `tracks/geonames/index.json` 的条件块写进 settings。机制见 §13.1。
 
 ### 4.3 1024 维向量（8 核环境）
 
@@ -297,10 +297,7 @@ systemctl stop easysearch-metric-store.service
 | `load-monitor.sh` | 被测节点侧采样器，只读 `/proc`，5 秒一采 | run-bench 自动启停；手动可 `start` / `stop` / `probe` / `summary` |
 | `cpu-affinity.sh` | 给三台节点的引擎绑核（systemd CPUAffinity drop-in），模拟 8 核的小规格环境 | `./cpu-affinity.sh apply 8` / `status` / `clear` |
 | `doctor.sh` | 新环境体检：六组只读检查（工具、env、拓扑、连通、语料、指标库） | `./doctor.sh` |
-| `prepare-codec-track.sh` | 生成存储压缩变体（幂等，带 `esrally info` 自检） | 选 codec 时 run-bench 会自动调 |
-| `prepare-hv1024-track.sh` | 生成 1024 维赛道变体（幂等），见 §13.2 | 选 hv1024 时自动调 |
-| `prepare-nested-track.sh` | 生成 nested 赛道 3 分片变体（幂等） | 选 nested 时自动调 |
-| `prepare-dimsweep-track.sh` / `prepare-dimsweep-jdk.sh` | ds-* 赛道修复与自检 / 把 OpenJDK 26、27 装到三台被测节点（幂等） | 选 ds-* 时自动调 |
+| `tracks/` | 赛道定义定版目录（index.json / challenges / operations / track.json 全在 git 里） | runner 直接消费；语料软链、queries.json 等 git 收不了的产物由 run-bench 起跑前补 |
 | `reset-env.sh` | 环境还原 | `./reset-env.sh <easysearch\|elasticsearch\|all>`，可加 `--no-wipe` / `--purge` |
 | `stop-campaign.sh` / `close-campaign.sh` | 停掉某个跑分的进程 / 给中途停掉的跑分补「结束行」 | `./stop-campaign.sh <标签>`；`./close-campaign.sh [--dry-run]` |
 | `identity.py` | 被测配置身份口径的唯一来源 | 被 sidecar 和导出器 import |
@@ -385,7 +382,7 @@ hnsw-codec-zstd    ds-j1024-codec-bc-sr   …（任意基础赛道都能这么�
 
 几个实现细节：
 
-- 基础赛道 `$TRACK_GEO` 一点没改。`prepare-codec-track.sh` 只复制一份副本，在副本的 settings 里加一行，幂等。
+- 赛道定义定版在 `tracks/geonames/`（git 里就是跑的那份）。压缩档与 source_reuse 不再烘进副本目录，而是走 `--track-params`（`index_codec:` / `source_reuse:true`），由 `index.json` 的条件块写入 settings —— 没有第二份运行时生成的赛道定义，也就没有"脚本产物与 git 定义不一致"这种坑。
 - **分片数不烘在变体里，靠 track-params 传**。geonames 的 `index.json` 是 Jinja 模板，分片位置写的是 `{{number_of_shards | default(5)}}` —— 不传就会落到模板默认的 **5 分片**。runner 按**基座赛道**统一传 `SHARDS`/`REPLICAS`（默认 3/0），所以 canonical 变体名（`geo-codec-*`）和 legacy 别名（`gdef`/`gzstd`/`gbc`）拿到的是同一份口径。变体目录里看不到分片设置，不代表分片数就是模板默认值。
 - 历史短名 `gdef` / `gzstd` / `gbc` 保留为别名（`gzstd` 实际是 `geo-codec-zstd-sr`）。不改名是为了让旧跑分的场次名（`…-gzstd-r1`）语义不漂移。
 - 可证明性：sidecar 每场抓一次 `GET /<索引>/_settings?flat_settings=true` 的实测值 —— 烘进赛道不等于集群里真是这个值。
@@ -401,7 +398,7 @@ hnsw-codec-zstd    ds-j1024-codec-bc-sr   …（任意基础赛道都能这么�
 | 索引 | `vectors`，3 分片 0 副本，写完 forcemerge 到每分片 1 段 |
 | 查询 | `knn-search-10-100`（k10/ef100）与 `knn-search-100-1000`（k100/ef1000），warmup 100，测 1000 次迭代 |
 | 写入口径 | bulk-size 500 × 8 客户端。1024 维单条约 22KB，和 96 维 hnsw 的 5000×1 不能直接比 |
-| 赛道生成 | `prepare-hv1024-track.sh` 幂等生成到 `$ROOT/tracks/hv1024-s3` |
+| 赛道定义 | 定版在 `tracks/hv1024/`（git）；起跑前只补语料软链与 queries.json |
 
 和 96 维 `hnsw` 的定位差别：hnsw 测「2M×96 的建图吞吐」，hv1024 测「高维的建图与遍历成本」。跨赛道只看趋势，不看绝对值。8 核环境的做法见 §4.3。
 

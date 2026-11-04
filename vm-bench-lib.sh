@@ -25,6 +25,31 @@ vm_all() {
   done
 }
 
+# JDK 安装（幂等）：把 OpenJDK 装到虚机的 /opt/jdks/jdk-<ver>。
+# 只认这一个约定（版本号从目录名取，安装包在 $PKG_DIR/openjdk-<ver>_linux-x64_bin.tar.gz），
+# 不猜版本、不下网 —— 装不了就返回非 0，由调用方报错。
+# 用途：JDK 26/27 这类"用户自管变体"的复测前，campaign 收尾会清掉虚机上的 jdk 目录，
+#       框架只负责换装与身份断言，装什么版本由这里按 $JDK_DIR 决定。
+provision_jdk() { # <ip>
+  local ip="$1" ver pkg
+  case "${JDK_DIR:-}" in
+    /opt/jdks/jdk-*) ver="${JDK_DIR##*/jdk-}";;
+    *) return 1;;                      # 非约定路径 → 不擅自装
+  esac
+  pkg="$PKG_DIR/openjdk-${ver}_linux-x64_bin.tar.gz"
+  [ -s "$pkg" ] || return 1           # 本地没包 → 不擅自下
+  log "  $ip: 虚机缺 $JDK_DIR，用本地安装包推送安装（jdk-$ver，约 $(($(stat -c%s "$pkg")/1048576)) MB）"
+  vmPut "$ip" "$pkg" "/tmp/openjdk-$ver.tar.gz" >/dev/null || return 1
+  vm "$ip" "set -e
+    rm -rf /opt/jdks/jdk-$ver.tmp
+    mkdir -p /opt/jdks/jdk-$ver.tmp
+    tar xzf /tmp/openjdk-$ver.tar.gz -C /opt/jdks/jdk-$ver.tmp --strip-components=1
+    rm -rf /opt/jdks/jdk-$ver
+    mv /opt/jdks/jdk-$ver.tmp /opt/jdks/jdk-$ver
+    rm -f /tmp/openjdk-$ver.tar.gz
+    /opt/jdks/jdk-$ver/bin/java -version 2>&1 | head -1" || return 1
+  return 0; }
+
 # 引擎名 -> 属性（正式名：easysearch | elasticsearch；systemd 服务名与引擎名相同）
 eng_dir() {
   case "$1" in
@@ -82,11 +107,21 @@ track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀）
 track_dir() { # <赛道/变体 id> → 目录
   local c; c=$(track_canonical "$1")
   case "$c" in
-    *-codec-*) echo "$ROOT/tracks/$c";;
-    geo) echo "$TRACK_GEO";;
+    *-codec-*)
+      # 压缩变体**不再另建目录**：赛道定义定版在 tracks/，压缩档与 source_reuse
+      # 走 --track-params（index_codec / source_reuse），由 index.json 的条件块写入。
+      # 少一份运行时生成的副本 = 少一处"脚本产物与 git 定义不一致"的坑。
+      local b="${c%%-codec-*}"
+      case "$b" in hv1024x*) echo "$ROOT/tracks/hv1024x";; *) track_dir "$b";; esac;;
+    hv1024x-int8|hv1024x-bbq)
+      # 向量量化族：四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
+      # 量化档走 --track-params（vector_index_type）—— 只差一行却存四份目录，
+      # 改一处忘另一处的漂移风险就是这么来的。
+      echo "$ROOT/tracks/hv1024x";;
+    geo) echo "$ROOT/tracks/geonames";;
     hnsw) echo "$TRACK_HNSW_S3";;
-    hv1024) echo "$TRACK_HV1024";;
-    nested) echo "$TRACK_NESTED_S3";;
+    hv1024) echo "$ROOT/tracks/hv1024";;
+    nested) echo "$ROOT/tracks/nested";;
     *) echo "$ROOT/tracks/$1";;
   esac; }
 track_compression() { # <id> → index.codec 取值（空 = 非压缩变体）
@@ -104,6 +139,15 @@ track_source_reuse() { # <id> → true / false（空 = 非压缩变体）
     *-codec-*-sr) echo "true";;
     *-codec-*) echo "false";;
     *) echo "";; esac; }
+track_quant() { # <id> → index_options.type（空 = 不量化）
+  # 向量量化档是**向量索引类型**（index_options.type），不是压缩档：
+  # int8_hnsw = 标量量化，bbq_hnsw = 二值量化。两侧通用（ES 8.19.23 与
+  # Easysearch 2.5.1 都能建，2026-11-03 hvbbq campaign 15 场已实跑）。
+  # 与压缩档是**两个独立维度**，别混：量化走 vector_index_type，压缩走 index_codec。
+  case "$(track_canonical "$1")" in
+    *-int8) echo "int8_hnsw";;
+    *-bbq) echo "bbq_hnsw";;
+    *) echo "";; esac; }
 track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
   local b; b=$(track_base "$1"); case "$b" in geo) echo "geonames";; nested) echo "sonested";; *) echo "vectors";; esac; }
 track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
@@ -114,19 +158,53 @@ track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
 }
 
 track_params() { # <id> → esrally --track-params（空 = 不传）
-  # 只有"模板类基座"需要传分片口径：geonames 的 index.json 是 Jinja 模板，
-  # 写的是 "index.number_of_shards": {{number_of_shards | default(5)}} —— 不传就
-  # 落到模板默认的 **5 分片**，与本项目其余赛道的 3 分片口径不一致，跨赛道/跨变体
-  # 的数字就不可比了（实测 legacy 别名 gdef/gzstd/gbc 落档都是 3 分片）。
-  # 其余赛道（hnsw/hv1024/ds-*）分片已烘进 index.json，不传。
+  # 分片口径：只有"模板类基座"需要传 —— geonames / nested / hv1024 的 index.json
+  # 是 Jinja 模板，写的是 "index.number_of_shards": {{number_of_shards | default(N)}}，
+  # 不传就落到模板默认值（geonames 5、nested 1、hv1024 3），与其余赛道的 3 分片口径
+  # 不一致，跨赛道/跨变体的数字就不可比了（实测 legacy 别名 gdef/gzstd/gbc 落档都是 3 分片）。
+  # 其余赛道（hnsw/ds-*）分片已烘进 index.json，不传。
   # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名（geo-codec-*）
   #    与 legacy 别名走的是同一条规则，只是名字不同。
   local b; b=$(track_base "$1")
+  local p=""
   case "$b" in
-    geo|nested) echo "number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
-    *) echo "";;
+    geo|nested|hv1024) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
   esac
-}
+  # 压缩档与 source_reuse：索引级设置，走 --track-params（标量，无逗号，rally 2.12 解析可靠），
+  # 由 index.json 的条件块写入 settings —— {% if index_codec is defined %} /
+  # {% if source_reuse is defined and source_reuse %}。
+  # source_reuse 只在开的时候传：写 false 会被 Jinja 当成非空字符串（真值）→ 反而把
+  # Easysearch 专有设置打开了，必须不传。
+  local comp sr
+  comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
+  [ -n "$comp" ] && p="${p:+$p,}index_codec:$comp"
+  [ "$sr" = "true" ] && p="${p:+$p,}source_reuse:true"
+  # 向量量化档：index_options.type（int8_hnsw / bbq_hnsw）。
+  # ⚠️ 它在 **mappings** 里，不在 settings —— 条件块缺失时 rally 不报错，
+  # 但该臂会静默跑成 hnsw 基座（"int8 跑过"其实跑的是 fp32）。
+  local q; q=$(track_quant "$1")
+  [ -n "$q" ] && p="${p:+$p,}vector_index_type:$q"
+  echo "$p"; }
+
+# 压缩/存储参数的**静默失效**守卫：定版 index.json 里必须有对应条件块。
+# 少一个条件块 → rally 不报错，但压缩档根本没写进 settings → 几个臂跑成同一个，
+# 数据看着正常、结论全废（比直接报错难查得多）。所以起跑前就挡住。
+track_assert_storage_params() { # <赛道id>
+  local id="$1" dir idx comp sr q
+  dir=$(track_dir "$id"); idx="$dir/index.json"
+  comp=$(track_compression "$id"); sr=$(track_source_reuse "$id"); q=$(track_quant "$id")
+  if [ -z "$comp" ] && [ "$sr" != "true" ] && [ -z "$q" ]; then return 0; fi
+  [ -f "$idx" ] || die "赛道缺 index.json: $idx（$id）"
+  if [ -n "$comp" ] && ! grep -q 'index_codec' "$idx"; then
+    die "$id: $idx 没有 index_codec 条件块 —— 压缩档会静默失效（各臂跑成同一个压缩档）"
+  fi
+  if [ "$sr" = "true" ] && ! grep -q 'source_reuse' "$idx"; then
+    die "$id: $idx 没有 source_reuse 条件块 —— source_reuse 会静默失效"
+  fi
+  if [ -n "$q" ] && ! grep -q 'vector_index_type' "$idx"; then
+    die "$id: $idx 没有 vector_index_type 条件块 —— 量化档会静默失效（该臂跑成 hnsw 基座）"
+  fi
+  return 0; }
 
 # ---- 拓扑（单事实源 = ibs ip.txt）---------------------------------------------
 # 集群节点 = ip.txt 中主机名不以 esrally 开头的行（esrally 行是驱动器，不进集群）。

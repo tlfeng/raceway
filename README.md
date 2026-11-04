@@ -115,7 +115,7 @@ vm-bench-lib.sh              公共函数库（被 source）
 vm-bench.env.example         共享配置模板（复制成 vm-bench.env 填写；真身不入库）
 doctor.sh                    新环境体检（六组只读检查）
 precheck.sh / load-monitor.sh / cpu-affinity.sh      环境卡点 / 负载采样 / 引擎绑核
-prepare-*-track.sh           赛道变体生成（幂等）
+tracks/                       赛道定义定版目录（index.json / challenges / operations 全在 git 里）
 car-compare.py / car-env-table.py / codec-compare.py  结果对比
 bench-compose.py / bench-queue.py / bench-history.py  控制台与只读观测
 build-race-store.py → bench-export.py → bench-apply.py  入库链路

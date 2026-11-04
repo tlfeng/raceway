@@ -18,9 +18,9 @@
 
 产物：`corpora/documents-jina-float.json`（1,000,000 行，每行 `{"docid","emb":[1024 floats]}`，~22.7KB/行）。
 
-## 三、赛道构造（`prepare-hv1024-track.sh`，本仓库）
+## 三、赛道构造（`tracks/hv1024/`，本仓库定版）
 
-幂等生成 `$ROOT/tracks/hv1024-s3`（选 hv1024 时 run-bench 自动调用），构造时自动自检（语料字节数、语料/查询向量维度），生成后以 `esrally info` 验证：
+赛道定义定版在 `tracks/hv1024/`（index.json / track.json / operations / challenges / track.py 全在 git 里）。起跑前由 run-bench 补两样 git 收不了的东西：语料软链 `documents-1024.json`、查询集 `queries.json`（官方 bz2 前 2000 条），并自检语料字节数与语料/查询向量维度：
 
 | 组件 | 内容 | 与官方差异 |
 |---|---|---|
@@ -37,6 +37,6 @@
 
 ## 五、复现要点
 
-1. 下载/转码脚本在 `<语料制作目录>/hv-bench/`；赛道生成本仓库 `prepare-hv1024-track.sh`。
+1. 下载/转码脚本在 `<语料制作目录>/hv-bench/`；赛道定义在本仓库 `tracks/hv1024/`（语料软链与 queries.json 由 run-bench 起跑前生成）。
 2. 语料文件**勿删勿改**：`documents-jina-float.json` 与 `documents-hvfloat-sub200000.json` 被正式赛道以符号链接引用；重新生成只需重跑上表 1→2（需外网可达官方 CDN）。
 3. 本数据集与官方赛道的关系口径："官方 esrally 赛道 msmarco-jina-10m-vector 公开语料的 100 万条子集，测试程序由本规范定义"。

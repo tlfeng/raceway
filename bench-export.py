@@ -38,7 +38,7 @@ DOCS = {"track": 11396503, "hnsw2m-2m-s3": 2000000, "nested-s3": 11203029,
         "hv1024-s3": 1000000, "dsj512-s3": 1000000, "dsj768-s3": 1000000,
         "dsj1024-s3": 1000000, "dsj1536-s3": 1000000, "dsj2048-s3": 1000000,
         "dsg960-s3": 1000000, "dsg1920-s3": 1000000,
-        # geonames 存储压缩 × source_reuse 正交六变体（prepare-codec-track.sh 生成，
+        # geonames 存储压缩 × source_reuse 正交六变体（走 --track-params，不另建目录；
         # 语料与基座同一份 → doc 数相同）
         "geo-codec-def": 11396503, "geo-codec-def-sr": 11396503,
         "geo-codec-zstd": 11396503, "geo-codec-zstd-sr": 11396503,
