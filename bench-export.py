@@ -119,7 +119,7 @@ CANON_CODEC = ("default", "zstd", "best_compression")
 # knn_index_type / codec / source_reuse 三列承载，不另起赛道名（§2.6 同一套处理变量
 # 口径）。变体目录名 hv1024x-int8 / hv1024x-bbq 由 bench-history.base_of 剥掉量化
 # 后缀归到本基座。
-CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024", "hv1024x",
+CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024", "hv1024x", "hv1024x-bbqdisk",
                "hvtp200k-2s", "hvtp200k-3s",
                "ds-j512", "ds-j768", "ds-j1024", "ds-j1536", "ds-j2048",
                "ds-g960", "ds-g1920")
