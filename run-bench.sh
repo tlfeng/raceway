@@ -1050,14 +1050,34 @@ jdk_fix_apply() { # <目标 JDK 主版本号>
   #   JDK 27 里压根没有 JVMCI 这个概念，行为上与「JVMCI 关」等价，
   #   所以三个车（GraalVM25 / OpenJDK26 / OpenJDK27）的向量加速路径保持一致。
   local jci_hi=26
-  # 2.5.1+ 新式 bundle 自带不带版本号的 agent（lib/easysearch-security-agent.jar），
-  # 原版 agent 已适配新 JDK，整段修补不适用 —— 保持原版直接跳过。
-  # ⚠️ 否则旧过滤只匹配 -2.5.0.jar 文件名，滤不掉新式 javaagent 行 → 双 agent
-  # 叠加 → JVM 报 "jar hell!" 拒绝启动 → CLUSTER-NOT-READY。
-  if [ "$(vm "${VM_IPS[0]}" "[ -f $EZ_DIR/lib/easysearch-security-agent.jar ] && echo Y || echo N")" = Y ]; then
-    log "  检测到新式自带 agent（easysearch-security-agent.jar），保持 bundle 原版，跳过修补组合"
-    return 0
-  fi
+  # 判定依据 = **bundle 实际是否自带 security agent**，而不是版本号：
+  #   (a) 新式 bundle（2.5.1+）：lib/easysearch-security-agent.jar —— 自带且已适配新 JDK，
+  #       保持原版，跳过整段修补。
+  #   (b) 老式 bundle（2.5.0 线）：lib/easysearch-security-agent-<ver>.jar + -bootstrap- + -policy-，
+  #       原版 agent 不支持 Java 25+，需要换 patched agent —— 走下面的修补分支。
+  #   (c) **无 agent 的 bundle（2.4.0 线）**：bundle 里根本没有 security agent jar，
+  #       官方 jvm.options 也没有 javaagent 行。此时套用 2.5.0 时代的 patched agent 是错的：
+  #       patched 1.18.15 只含 org/easysearch.security.agent.*，缺 bootstrap.AgentPolicy
+  #       （那部分在 2.5.x bundle 里是独立的 -bootstrap- jar），加载即 NoClassDefFoundError，
+  #       服务起不来 → COLD-START-FAIL。正确做法 = 保持官方原版，一行都不改。
+  local agent_style
+  agent_style=$(vm "${VM_IPS[0]}" "
+    if [ -f $EZ_DIR/lib/easysearch-security-agent.jar ]; then echo new;
+    elif ls $EZ_DIR/lib/easysearch-security-agent-*.jar >/dev/null 2>&1; then echo old;
+    else echo none; fi")
+  case "$agent_style" in
+    new)
+      log "  检测到新式自带 agent（easysearch-security-agent.jar），保持 bundle 原版，跳过修补组合"
+      return 0;;
+    none)
+      # 官方 bundle 自带 JDK 与官方 jvm.options（无 javaagent、无 JVMCI 行）——一律不碰。
+      # 唯一动作：确保框架此前推来的 patched agent 被清掉（否则旧补丁残留会让服务起不来）。
+      for ip in "${VM_IPS[@]}"; do
+        vm "$ip" "rm -f $EZ_DIR/lib/easysearch-security-agent-2.5.0.jar" || true
+      done
+      log "  bundle 无 security agent（官方原版形态，JVM 修补不适用），保持官方 jvm.options 不变"
+      return 0;;
+  esac
   local ip
   for ip in "${VM_IPS[@]}"; do
     vm "$ip" "set -e
