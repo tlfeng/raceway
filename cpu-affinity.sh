@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 source ./vm-bench-lib.sh
 
 cmd="${1:?用法: $0 <apply N|status [N]|clear>}"
-declare -A DIR_OF=( [easysearch]="$IBS_BASE/easysearch" [elasticsearch]="$IBS_BASE/elasticsearch" )
+declare -A DIR_OF=( [easysearch]="$IBS_BASE/easysearch" [elasticsearch]="$IBS_BASE/elasticsearch" [opensearch]="$IBS_BASE/opensearch" )
 
 case "$cmd" in
   apply)
@@ -27,7 +27,7 @@ case "$cmd" in
   status)
     want="${2:-}" rc=0
     for ip in "${VM_IPS[@]}"; do
-      for svc in easysearch elasticsearch; do
+      for svc in easysearch elasticsearch opensearch; do
         l=$(cpu_allowed_of "$ip" "$svc" "${DIR_OF[$svc]}")
         if [ -z "$l" ]; then echo "$ip $svc: 进程未运行"; continue; fi
         n=$(cpu_list_count "$l")

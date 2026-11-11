@@ -80,6 +80,9 @@ raceway · 压测编排入口（用法页）
   hv1024x                1024 维四臂 · hnsw 基座      tracks/hv1024x
   hv1024x-int8           1024 维四臂 · 标量量化       同上（vector_index_type=int8_hnsw）
   hv1024x-bbq            1024 维四臂 · 二值量化       同上（vector_index_type=bbq_hnsw）
+  hv1024x-os             1024 维 OpenSearch · lucene hnsw fp32   tracks/hv1024x-os（knn_vector+method）
+  hv1024x-os-bbq         1024 维 OpenSearch · Lucene BBQ(32x)    tracks/hv1024x-os-bbq
+  hv1024x-os-disk        1024 维 OpenSearch · on_disk(faiss ivf) tracks/hv1024x-os-disk
   hv1024x-codec-zstd-sr  1024 维四臂 · ZSTD+复用源    同上（index_codec=ZSTD + source_reuse）仅 Easysearch
   <赛道>-codec-<def|zstd|bc>[-sr]                    压缩变体（走 --track-params，不另存目录）
   gdef / gzstd / gbc      上面几个压缩变体的历史别名
@@ -201,11 +204,13 @@ case "$WHAT" in
   gdef|gzstd|gbc) TRACKS=("$WHAT");; # 仍认的短名别名（= geo-codec-*）
   hnsw) TRACKS=(hnsw);;
   hv1024) TRACKS=(hv1024);;
-  hv1024x|hv1024x-int8|hv1024x-bbq) TRACKS=("$WHAT");;
+  hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk) TRACKS=("$WHAT");;
            # 量化族：四臂 = hnsw 基座 / int8 / bbq / 压缩臂。
            # ⚠ 这里用**白名单**而不是 hv1024x* 前缀匹配：前缀匹配会把拼错的
            # "hv1024x-int88" 当成合法赛道，一路走到 rally 才炸（报错跟"名字打错"毫无关系）。
            # 压缩臂（hv1024x-codec-*）由上面的 *-codec-* 分支接住。
+  upsert|geonames-upsert) TRACKS=(geonames-upsert);;
+           # geonames upsert/update 对比赛道（raceway 定制，见 /testing/upsert-bench/）
   nested) TRACKS=(nested);;
   codec) TRACKS=(geo-codec-def geo-codec-def-sr geo-codec-zstd geo-codec-zstd-sr geo-codec-bc geo-codec-bc-sr);;
            # geonames 一族的压缩×source_reuse 全套 6 变体
@@ -242,11 +247,16 @@ resolve_engine() { # 依据 ENGINE_NAME/VERSION/BUILD/JDK_DIR/CAR_LABEL/JDK_WANT
       [ -z "$ENGINE_BUILD" ] || die "elasticsearch 没有 build 号，勿设 ENGINE_BUILD"
       ENGINE_PKG="$PKG_DIR/elasticsearch-${ENGINE_VERSION}-linux-x86_64.tar.gz"
       FULL_VER="$ENGINE_VERSION";;
-    *) die "未知 ENGINE_NAME: $ENGINE_NAME（可选: easysearch | elasticsearch）";;
+    opensearch)  # os-20261108: 包名 linux-x64（ibs find_local_pkg 按 <engine>-<ver>-*x64* 匹配本地包）
+      [ -z "$ENGINE_BUILD" ] || die "opensearch 没有 build 号，勿设 ENGINE_BUILD"
+      ENGINE_PKG="$PKG_DIR/opensearch-${ENGINE_VERSION}-linux-x64.tar.gz"
+      FULL_VER="$ENGINE_VERSION";;
+    *) die "未知 ENGINE_NAME: $ENGINE_NAME（可选: easysearch | elasticsearch | opensearch）";;
   esac
   IS_ES=0; [ "$ENGINE_NAME" = elasticsearch ] && IS_ES=1
   [ -s "$ENGINE_PKG" ] || die "缺安装包: $ENGINE_PKG（ENGINE_NAME=$ENGINE_NAME VERSION=$ENGINE_VERSION BUILD=$ENGINE_BUILD）"
   [ "$IS_ES" = 1 ] && [ -n "$JDK_DIR" ] && die "elasticsearch 用自带 JDK，不支持 JDK_DIR"
+  [ "$ENGINE_NAME" = opensearch ] && [ -n "$JDK_DIR" ] && die "opensearch 用自带 JDK，不支持 JDK_DIR"
   # 标签：默认 JDK_DIR basename / 引擎身份；非法字符折叠为 -（进场次名与文件名）
   if [ -z "$CAR_LABEL" ]; then
     if [ -n "$JDK_DIR" ]; then CAR_LABEL=$(basename "$JDK_DIR"); else CAR_LABEL="${ENGINE_NAME}-${FULL_VER}"; fi
@@ -463,10 +473,11 @@ trap 'ABORT_REASON=SIGHUP; exit 129' HUP
 # ---------- 引擎映射（ibs 承载部署；路径/服务按 ENGINE_NAME 取） -----------------
 EZ_DIR="$IBS_BASE/easysearch"
 ES_DIR="$IBS_BASE/elasticsearch"
+OS_DIR="$IBS_BASE/opensearch"
 
-eng_dir_of()   { case "$1" in elasticsearch) echo "$ES_DIR";; easysearch) echo "$EZ_DIR";; *) return 1;; esac; }
-svc2_of()      { case "$1" in elasticsearch) echo elasticsearch;; easysearch) echo easysearch;; *) return 1;; esac; }
-ip_node_names_of(){ case "$1" in elasticsearch) echo "${VM_NODES_ES[@]}";; *) echo "${VM_NODES_EZ[@]}";; esac; }
+eng_dir_of()   { case "$1" in elasticsearch) echo "$ES_DIR";; easysearch) echo "$EZ_DIR";; opensearch) echo "$OS_DIR";; *) return 1;; esac; }
+svc2_of()      { case "$1" in elasticsearch) echo elasticsearch;; easysearch) echo easysearch;; opensearch) echo opensearch;; *) return 1;; esac; }
+ip_node_names_of(){ case "$1" in elasticsearch) echo "${VM_NODES_ES[@]}";; opensearch) echo "${VM_NODES_OS[@]}";; *) echo "${VM_NODES_EZ[@]}";; esac; }
 
 # ---------- ibs 生命周期 ------------------------------------------------------
 # 依赖 ibs 副本含 gate version-core / wipe stop-first 修复（缺失即 die）
@@ -496,6 +507,7 @@ ibs_deploy_engine() { # <engine>
   case "$eng" in
     easysearch)    tflag="-t easysearch";    vflag="-e $FULL_VER";;
     elasticsearch) tflag="-t elasticsearch"; vflag="-s $FULL_VER";;
+    opensearch)    tflag="-t opensearch";    vflag="-o $FULL_VER";;
     *) return 1;;
   esac
   PROGSTEP "  ibs 部署 $eng ($FULL_VER) 开始（约 5-8 分钟，节点 $NODE_RANGE）..."
@@ -567,7 +579,7 @@ ensure_engine() { # <engine>
 # （results/<fid>-<ph>-sidecar.json）。
 ensure_jdk() {
   local ip dir="$EZ_DIR" arch want
-  [ "$IS_ES" = 1 ] && return 0                 # ES 用自带 JDK
+  [ "$ENGINE_NAME" != easysearch ] && return 0  # ES/OS 用自带 JDK
   want=${JDK_DIR:-BUNDLED}
   for ip in "${VM_IPS[@]}"; do
     local stamp; stamp=$(vm "$ip" "cat $dir/jdk.path.stamp 2>/dev/null || echo none")
@@ -809,6 +821,7 @@ prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道�
 # 变体 id ↔ 目录 ↔ 压缩/sr/引擎 的推导在 vm-bench-lib.sh（与编排台同一套规则）。
 track_dims() { local b; b=$(track_base "$1"); case "$b" in ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;; ds-g960) echo 960;; ds-j768) echo 768;; ds-j512) echo 512;; *) return 1;; esac; }
 track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
+  geonames-upsert) echo "${TIMEOUT_UPSERT_W:-$TIMEOUT_GEO_W}";;
   geo) echo "$TIMEOUT_GEO_W";;
   hnsw) echo "$TIMEOUT_HNSW_W";;
   hv1024) echo "$TIMEOUT_HV1024_W";;
@@ -817,7 +830,7 @@ track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
   ds-*) local dm; dm=$(track_dims "$1") || { echo "$TIMEOUT_DS_W"; return; }
         if [ "$dm" -ge 1536 ]; then echo "$TIMEOUT_DS_W_HI"; else echo "$TIMEOUT_DS_W"; fi;;
  esac; }
-track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024|hv1024x*) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
+track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geonames-upsert) echo "${TIMEOUT_UPSERT_Q:-$TIMEOUT_GEO_Q}";; geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024|hv1024x*) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
 
 monitor_start() { # <fid> <eng> —— 被动周期采样（5s，只记录，不做卡点、不触发重试）
   local fid="$1" eng="$2" ip dir

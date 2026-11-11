@@ -53,13 +53,14 @@ eng_dir() {
   case "$1" in
     easysearch)    echo "$IBS_BASE/easysearch";;
     elasticsearch) echo "$IBS_BASE/elasticsearch";;
+    opensearch)    echo "$IBS_BASE/opensearch";;
     *) return 1;;
   esac
 }
 # 节点命名模板（ibs_sync_ip 改写 ip.txt 时按序套用；来自 env）
-node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsearch) echo "${VM_NODES_ES[@]}";; *) return 1;; esac; }
+node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsearch) echo "${VM_NODES_ES[@]}";; opensearch) echo "${VM_NODES_OS[@]}";; *) return 1;; esac; }
 # 服务运行用户（wipe 后 chown 用）
-eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; esac; }
+eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; opensearch) echo "${OS_RUN_USER:-opensearch}";; esac; }
 
 # ---- 赛道变体（压缩 × source_reuse × 量化）--------------------------------------
 # 一个**变体** = 基础赛道 + 压缩档 + source_reuse 开关（量化档是另一维度，见 track_quant）。
@@ -136,6 +137,7 @@ track_quant() { # <id> → index_options.type（空 = 不量化）
   # int8_hnsw = 标量量化，bbq_hnsw = 二值量化；ES 8.19.23 与 Easysearch 2.5.1 两侧都能建。
   # 与压缩档是**两个独立维度**，别混：量化走 vector_index_type，压缩走 index_codec。
   case "$(track_canonical "$1")" in
+    hv1024x-os*) echo "";;
     *-int8) echo "int8_hnsw";;
     *-bbq) echo "bbq_hnsw";;
     *) echo "";; esac; }
@@ -192,7 +194,7 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   local b; b=$(track_base "$1")
   local p=""
   case "$b" in
-    geo|nested|hv1024) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
+    geo|nested|hv1024|geonames-upsert) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
   esac
   # 压缩档与 source_reuse：索引级设置，走 --track-params（标量，无逗号，rally 2.12 解析可靠），
   # 由 index.json 的条件块写入 settings（{% if index_codec is defined %} /
