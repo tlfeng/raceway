@@ -134,16 +134,38 @@ class TestDerivationParity(unittest.TestCase):
 class TestCatalog(unittest.TestCase):
     """编排台的两层清单。"""
 
-    def test_every_base_has_six_variants(self):
+    def _can_codec(self, base):
+        """BASE_TRACKS 值的第 4 位（可选，默认 True）= 支持压缩变体。"""
+        spec = C.BASE_TRACKS[base]
+        return spec[3] if len(spec) > 3 else True
+
+    def test_every_variant_capable_base_has_six_variants(self):
         for base in C.BASE_TRACKS:
             vs = [v for v in C.TRACK_CATALOG.values()
                   if v['base'] == base and v['variant']]
+            if not self._can_codec(base):
+                # 不支持变体的基座（index.json 无 index_codec 条件块）：
+                # 清单里不应出现任何变体 —— 排了也会被起跑前守卫拦下，不如不生成
+                self.assertEqual(vs, [],
+                                 '基座 %s 不支持压缩变体，却生成了 %d 个' % (base, len(vs)))
+                continue
             self.assertEqual(len(vs), 6, '基础赛道 %s 的变体数不对' % base)
             combos = set((v['compression'], v['source_reuse']) for v in vs)
             for c in ('default', 'ZSTD', 'best_compression'):
                 for sr in (False, True):
                     self.assertIn((c, sr), combos,
                                   '基础赛道 %s 缺少组合 压缩=%s sr=%s' % (base, c, sr))
+
+    def test_catalog_bases_are_canonical(self):
+        """编排台能排的赛道，入库词表必须认 —— 否则跑完在导出侧被静默丢弃
+        （bench-export.CANON_TRACK 的注释对这条契约有明文）。
+
+        经 canon_track 比对：编排 id 'geo' 在入库层改名 'geonames'
+        （_TRACK_RENAME 只作用于输出层），比对的应是入库后的名字。
+        """
+        for base in C.BASE_TRACKS:
+            self.assertIn(E.canon_track(base), E.CANON_TRACK,
+                          '编排台可排的赛道 %s 入库归一后不在规范词表里' % base)
 
     def test_variant_id_matches_dir_naming(self):
         """变体 id 必须与变体目录名一致（runner 按 id 找目录）。"""
@@ -518,6 +540,48 @@ class TestFrozenTrackDefinitions(unittest.TestCase):
         self.assertEqual(b['hv1024x-int8'], 'vector_index_type:int8_hnsw')
         self.assertEqual(b['hv1024x-bbq'], 'vector_index_type:bbq_hnsw')
         self.assertEqual(b['hv1024x-codec-zstd-sr'], 'index_codec:ZSTD,source_reuse:true')
+
+    def test_dir_family_tracks_own_their_directories(self):
+        """独立目录成员（os 族 / bbqdisk）指向各自目录；它们的压缩变体也回各自目录。
+
+        这些成员与基座 mappings 不同（差异表达不成 params），不能并进 hv1024x ——
+        track_dir 把整个 hv1024x* 一刀切向基座目录时，os 族的变体会跑到错误定义上。
+        """
+        ids = {
+            'hv1024x-os': 'tracks/hv1024x-os',
+            'hv1024x-os-bbq': 'tracks/hv1024x-os-bbq',
+            'hv1024x-os-disk': 'tracks/hv1024x-os-disk',
+            'hv1024x-bbqdisk': 'tracks/hv1024x-bbqdisk',
+            'hv1024x-os-codec-def': 'tracks/hv1024x-os',
+            'hv1024x-bbqdisk-codec-def': 'tracks/hv1024x-bbqdisk',
+        }
+        b = bash_derive('track_dir', list(ids))
+        for i, want in ids.items():
+            self.assertIn(i, b, 'bash function did not run: %s' % i)
+            self.assertEqual(b[i], '/opt/raceway/' + want,
+                             'track_dir 指认不对: %s → %s' % (i, b[i]))
+
+    def test_dir_family_ids_are_not_quant_stripped(self):
+        """os 族的 -bbq / -os / -disk 是名字的一部分，base_of 不得剥。
+
+        剥错 = canon_track 归一出不存在的名字，整场被 track_unknown 闸门挡掉
+        （2026-11-11 审计：oshv 系 6 个 campaign 的 VALID 场次全部进不了库）。
+        """
+        for tid in ('hv1024x-os', 'hv1024x-os-bbq', 'hv1024x-os-disk', 'hv1024x-bbqdisk'):
+            self.assertEqual(H.base_of(tid), tid, 'base_of 剥了独立目录成员的名字: %s' % tid)
+        # 它们的压缩变体剥到各自基座，而不是 hv1024x
+        self.assertEqual(H.base_of('hv1024x-os-codec-zstd'), 'hv1024x-os')
+        self.assertEqual(H.base_of('hv1024x-bbqdisk-codec-bc'), 'hv1024x-bbqdisk')
+
+    def test_upsert_track_gets_shard_params(self):
+        """geonames-upsert 的 index.json 是 Jinja 模板（default(5)）→ 必须传分片口径。
+
+        与 geo 族同一口径（3 分片 0 副本），否则落到模板默认 5 分片，
+        跨赛道数字不可比且不报错。
+        """
+        b = bash_derive('track_params', ['geonames-upsert'])
+        self.assertEqual(b['geonames-upsert'],
+                         'number_of_shards:3,number_of_replicas:0')
 
 
 class TestDatasetLabels(unittest.TestCase):

@@ -95,7 +95,7 @@ def valid_fids(camp):
     for line in open(p, encoding="utf-8", errors="replace"):
         parts = [x.strip() for x in line.strip().strip("|").split("|")]
         if len(parts) >= 2 and parts[0] not in ("场次", "---") and not set(parts[0]) <= set("-"):
-            if parts[1] in ("VALID", "ENV-WARN"):
+            if parts[1] == "VALID":   # runner 只写 VALID；ENV-WARN 从不入表（历史残留已清）
                 ok.add(parts[0])
     return ok or None
 

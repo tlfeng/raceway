@@ -149,6 +149,10 @@ CANONICAL_ALIAS = {'gdef': 'geo-codec-def', 'gzstd': 'geo-codec-zstd-sr',
 QUANT_BY_INDEX_TYPE = {'int8_hnsw': 'int8', 'bbq_hnsw': 'bbq'}
 # 变体 id 里的量化后缀 → base_of 剥掉它（hv1024x-int8 → hv1024x）
 QUANT_SUFFIXES = ('-int8', '-bbq')
+# 独立目录定义的家族成员：-os / -bbq / -disk 是**名字的一部分**（mappings 各不相同，
+# 差异表达不成 track-params），不是变体后缀 —— base_of 不得剥（否则 hv1024x-os-bbq
+# 被错剥成 hv1024x-os，canon_track 归一不出来，整场被 track_unknown 闸门挡掉）。
+DIR_FAMILY_BASES = ('hv1024x-os', 'hv1024x-bbqdisk')
 
 
 def canonical_id(tid):
@@ -166,10 +170,14 @@ def base_of(tid):
     剥两层后缀：压缩档（-codec-...）与向量量化档（-int8 / -bbq）。
     量化档不是压缩档的子集，所以要单独剥 —— 否则 hv1024x-int8 归一不出来，
     整场会被 track_unknown 闸门挡掉。
+    独立目录家族（os 族 / bbqdisk）的后缀是名字的一部分，先于量化剥离判断。
     """
     c = canonical_id(tid)
     if '-codec-' in c:
         c = c.split('-codec-', 1)[0]
+    for b in DIR_FAMILY_BASES:
+        if c == b or c.startswith(b + '-'):
+            return c
     for suf in QUANT_SUFFIXES:
         if c.endswith(suf):
             c = c[:-len(suf)]

@@ -90,9 +90,12 @@ class CliSelfDocTest(unittest.TestCase):
         self.assertIn('tracks/', out, '--help 没交代仓库同步要带 tracks/')
 
     def test_help_lists_the_hv1024x_family(self):
-        """量化/压缩四臂要能在帮助里被看见（否则用户不知道它们存在）。"""
+        """量化/压缩四臂与独立目录成员（bbqdisk / os 族）要能在帮助里被看见
+        （否则用户不知道它们存在）。"""
         out = self._run('--help')
-        for name in ('hv1024x', 'hv1024x-int8', 'hv1024x-bbq', 'hv1024x-codec-zstd-sr'):
+        for name in ('hv1024x', 'hv1024x-int8', 'hv1024x-bbq', 'hv1024x-codec-zstd-sr',
+                     'hv1024x-bbqdisk', 'hv1024x-os', 'hv1024x-os-bbq', 'hv1024x-os-disk',
+                     'upsert'):
             self.assertIn(name, out, '--help 里没有 %s' % name)
 
     # ---- list --------------------------------------------------------------

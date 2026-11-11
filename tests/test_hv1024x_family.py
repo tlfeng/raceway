@@ -118,13 +118,22 @@ class TestHv1024xFamily(unittest.TestCase):
                        'vector_index_type'):
             self.assertIn(needle, self.tmpl, '定版 index.json 缺条件块: %s' % needle)
 
+    # 允许存在的 hv1024x- 目录 = 家族的**独立目录定义**成员。
+    # 它们与基座的 mappings 不同（os 族的 knn_vector+method、bbq_disk 的
+    # index_options.type 是另一种结构），差异表达不成 track-params，只能各立目录；
+    # 这与量化档（int8/bbq，只差 index_options.type 一行，走 params）相反。
+    # 出现名单之外的 hv1024x-* 目录 = 又有人把 params 能表达的东西建成了目录 → 红。
+    FAMILY_DIRS = ('hv1024x-bbqdisk', 'hv1024x-os', 'hv1024x-os-bbq', 'hv1024x-os-disk')
+
     def test_no_duplicate_arm_directories(self):
-        """家族只剩一份基座目录（差异应由 track-params 表达）。"""
+        """量化族不许再出现第二份目录（差异应由 track-params 表达）；
+        独立目录成员以 FAMILY_DIRS 名单为准，名单之外的目录一律红。"""
         tracks = os.path.join(ROOT, 'tracks')
         leftovers = [d for d in os.listdir(tracks)
                      if d.startswith('hv1024x-') and os.path.isdir(os.path.join(tracks, d))]
-        self.assertEqual(leftovers, [],
-                         '量化族又出现多份目录（差异应由 track-params 表达）: %s' % leftovers)
+        self.assertEqual(sorted(leftovers), sorted(self.FAMILY_DIRS),
+                         'hv1024x 家族目录与名单不符（量化档应走 track-params；'
+                         '独立目录成员名单见 FAMILY_DIRS）: %s' % leftovers)
 
     def test_create_only_probe_still_available(self):
         """建索引探针必须随基座保留（用于复现建索引类故障）。"""

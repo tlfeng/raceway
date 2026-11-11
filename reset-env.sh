@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # reset-env.sh —— 环境还原（在压测机上运行）
-#   ./reset-env.sh <easysearch|elasticsearch|all>        # 停集群 + wipe data/logs（保留安装）
+#   ./reset-env.sh <easysearch|elasticsearch|opensearch|all>   # 停集群 + wipe data/logs（保留安装）
 #   ./reset-env.sh ... --no-wipe                         # 只停不清
 #   ./reset-env.sh ... --purge                           # 连安装目录一起删除 + 系统参数回滚
 #
@@ -15,14 +15,18 @@ source ./vm-bench-lib.sh
 TARGET="all"; WIPE=1; PURGE=0
 for a in "$@"; do
   case "$a" in
-    easysearch|elasticsearch|all) TARGET="$a";;
+    easysearch|elasticsearch|opensearch|all) TARGET="$a";;
     --no-wipe) WIPE=0;;
     --purge) PURGE=1;;
     *) die "未知参数: $a";;
   esac
 done
 
-ENGINES=(easysearch elasticsearch)
+# 必须覆盖全部三引擎：run_field 每场开跑先用它清场，precheck 紧随其后查
+# "残留引擎 CPU"。漏一个引擎 = 上一场那个引擎的 JVM 活着进 precheck → 每场
+# 第一个 attempt 必失败（2026-11-08 oshv 系 campaign 实测：23 行判定 14 行 SKIP）。
+# 未安装的引擎由循环里的 [ -d $dir ] 检查跳过，没有副作用。
+ENGINES=(easysearch elasticsearch opensearch)
 [ "$TARGET" = all ] || ENGINES=("$TARGET")
 
 # 拓扑单事实源 = ibs ip.txt：按引擎派生角色节点

@@ -46,7 +46,12 @@ DOCS = {"track": 11396503, "hnsw2m-2m-s3": 2000000, "nested-s3": 11203029,
         # ds-* 的 rally track 字段是同名形式（实测 track_raw）
         "ds-j512": 1000000, "ds-j768": 1000000, "ds-j1024": 1000000,
         "ds-j1536": 1000000, "ds-j2048": 1000000, "ds-g960": 1000000,
-        "ds-g1920": 1000000}
+        "ds-g1920": 1000000,
+        # hv1024x 家族（含 OpenSearch 三臂与 bbqdisk）与 upsert 赛道
+        "hv1024x": 1000000, "hv1024x-int8": 1000000, "hv1024x-bbq": 1000000,
+        "hv1024x-bbqdisk": 1000000,
+        "hv1024x-os": 1000000, "hv1024x-os-bbq": 1000000, "hv1024x-os-disk": 1000000,
+        "geonames-upsert": 11396503}
 # 语料名登记表（rally track 字段原值 → corpus_name），与 DOCS 并排用于 sidecar 缺席时兜底。
 # track ↔ corpus 严格 1:1（rally track 定义自带 corpora）；hvtp200k 一次性批次不登记不臆造。
 CORPUS_NAME = {"track": "geonames", "nested": "nested", "nested-s3": "nested",
@@ -61,7 +66,12 @@ CORPUS_NAME = {"track": "geonames", "nested": "nested", "nested-s3": "nested",
                "dsj512-s3": "dense-vector-512", "dsj768-s3": "dense-vector-768",
                "dsj1024-s3": "dense-vector-1024", "dsj1536-s3": "dense-vector-1536",
                "dsj2048-s3": "dense-vector-2048", "dsg960-s3": "dense-vector-960",
-               "dsg1920-s3": "dense-vector-1920"}
+               "dsg1920-s3": "dense-vector-1920",
+               "hv1024x": "dense-vector-1024", "hv1024x-int8": "dense-vector-1024",
+               "hv1024x-bbq": "dense-vector-1024", "hv1024x-bbqdisk": "dense-vector-1024",
+               "hv1024x-os": "dense-vector-1024", "hv1024x-os-bbq": "dense-vector-1024",
+               "hv1024x-os-disk": "dense-vector-1024",
+               "geonames-upsert": "geonames"}
 TRACK_NAME = {"track": "geo", "hnsw2m-2m-s3": "hnsw", "nested-s3": "nested", "hv1024-s3": "hv1024"}
 
 
@@ -107,19 +117,25 @@ CANON_QUALITY = ("ok", "degraded", "unknown")
 CANON_CHALLENGE = ("write-only", "query-only", "index-only", "full", "nested-search-challenge")
 # codec 归一后的封闭词表
 CANON_CODEC = ("default", "zstd", "best_compression")
-# 规范赛道名封闭词表（14 个）。归一后命中不了登记表的场次**不写库**：
+# 规范赛道名封闭词表（19 个）。归一后命中不了登记表的场次**不写库**：
 # 归一不出来说明这一场的赛道身份不可信（实测：fid 形态脏、user_tags.track 是解析器
 # 写坏的字面量），留着它只会把看板的分线带偏 —— 挡住比带偏强。
 #
 # 词表必须与编排台的 BASE_TRACKS（bench-compose）一致 —— 编排台能排的赛道，
 # 库里就得能查。两边对不上的后果是静默的：编排台排了、库里查不到。
+# （BASE_TRACKS 全集是本词表的子集：hvtp200k-2s/3s 只有历史数据，runner 跑不了，
+#   编排台不排 —— 见 bench-compose BASE_TRACKS 的注释。）
 #
 # hv1024x 家族的基座 —— 1M 文档 × 1024 维 float，dot_product，HNSW m=32 / efC=100，
 # 3 分片。家族内的量化档（int8 / bbq）与压缩档（zstd + source_reuse）由
 # knn_index_type / codec / source_reuse 三列承载，不另起赛道名（§2.6 同一套处理变量
 # 口径）。变体目录名 hv1024x-int8 / hv1024x-bbq 由 bench-history.base_of 剥掉量化
 # 后缀归到本基座。
+# hv1024x-os / hv1024x-os-bbq / hv1024x-os-disk（OpenSearch 三臂）与
+# hv1024x-bbqdisk（ES bbq_disk）是**独立目录定义**（mappings 不同）—— 各自是
+# 规范赛道名，后缀不剥（bench-history.base_of 的 DIR_FAMILY_BASES 守这条）。
 CANON_TRACK = ("geonames", "hnsw", "nested", "hv1024", "hv1024x", "hv1024x-bbqdisk",
+               "hv1024x-os", "hv1024x-os-bbq", "hv1024x-os-disk", "geonames-upsert",
                "hvtp200k-2s", "hvtp200k-3s",
                "ds-j512", "ds-j768", "ds-j1024", "ds-j1536", "ds-j2048",
                "ds-g960", "ds-g1920")
