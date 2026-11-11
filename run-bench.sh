@@ -138,6 +138,9 @@ ENGINE_VERSION=${ENGINE_VERSION:-2.5.0}
 ENGINE_BUILD=${ENGINE_BUILD:-}
 JDK_DIR=${JDK_DIR:-}
 JDK_WANT=${JDK_WANT:-}
+# CAR_LABEL 也算顶层旋钮（单配置模式下 resolve_engine 要判 -z）；
+# set -u 下不初始化，`./run-bench.sh geo 3` 一进 resolve_engine 就崩 unbound。
+CAR_LABEL=${CAR_LABEL:-}
 SHARDS=${SHARDS:-3}          # 性能口径（非拓扑事实）：默认 3 主分片，可按实验覆盖
 REPLICAS=${REPLICAS:-0}
 # 静默负载卡点口径：each=每场赛前一次；once=仅 campaign 起跑前一次
