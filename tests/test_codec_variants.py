@@ -452,6 +452,20 @@ class TestTrackNameHelpText(unittest.TestCase):
         bad = [n for n in geo_family if self.REJECT in res.get(n, '')]
         self.assertEqual(bad, [], 'canonical 变体名被拒: %s' % bad)
 
+    def test_dry_run_single_track_survives_unset_knobs(self):
+        """单赛道 dry-run 不得死于 set -u 的未初始化旋钮。
+
+        排程模式永远填得上 CAR_LABEL（车定义行逐条 apply_config），单配置模式
+        靠顶层旋钮 —— CAR_LABEL 没初始化时，`--dry-run <赛道>` 一进 resolve_engine
+        就 "CAR_LABEL: unbound variable" 崩掉（usage 页第一条承诺的用法）。
+        """
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            self._prepare(d)
+            out = self._run(d, '--dry-run', 'geo', '1')
+        self.assertNotIn('unbound variable', out,
+                         '单赛道 dry-run 死于未初始化旋钮: %s' % out[-300:])
+        self.assertNotIn(self.REJECT, out, 'dry-run 模式不该进赛道名校验: %s' % out[-300:])
+
     def test_removed_legacy_names_are_rejected(self):
         """gdefsr/gzstdns/gbcsr 从未实现过（只进过文案）—— 文案不许再承诺它们。"""
         dead = ['gdefsr', 'gzstdns', 'gbcsr']
