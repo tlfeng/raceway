@@ -1,0 +1,13 @@
+变体 id:    hv1024x-os-disk
+基础赛道:   hv1024x-os（本目录基座，OpenSearch 版）
+索引名:     vectors
+引擎:       OpenSearch 2.17+（k-NN 插件，on_disk 模式默认 faiss ivf）
+映射:       knn_vector 1024 维 · cosinesimil · mode=on_disk（默认 32x 二值量化 + rescore oversample 2.0）
+            不写 method：on_disk 自动参数，避免 ivf 显式 nlist 走训练模型路径
+settings:   3 分片 0 副本 · index.knn=true · _source excludes ["emb"]
+对应 ES:    dense_vector + bbq_disk（ES920DiskBBQVectorsFormat，IVF+BBQ 驻盘）
+            实现不同：ES 为 Lucene 侧 IVF+BBQ，OS 为 Faiss IVF-Binary
+语料:       documents-1024.json（软链 documents-jina-float.json，1M × 1024 维 float，22739096214 字节）
+待部署补:   queries.json / queries-recall.jsonl / truth.jsonl（从 tracks/hv1024x 拷贝或软链）
+查询体:     OpenSearch k-NN DSL（{"query":{"knn":{"emb":{...}}}}，见 track.py）
+设计文档:   PLAN-opensearch-hv1024-三向量对比测试.md

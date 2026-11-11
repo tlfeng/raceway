@@ -53,13 +53,14 @@ eng_dir() {
   case "$1" in
     easysearch)    echo "$IBS_BASE/easysearch";;
     elasticsearch) echo "$IBS_BASE/elasticsearch";;
+    opensearch)    echo "$IBS_BASE/opensearch";;
     *) return 1;;
   esac
 }
 # 节点命名模板（ibs_sync_ip 改写 ip.txt 时按序套用；来自 env）
-node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsearch) echo "${VM_NODES_ES[@]}";; *) return 1;; esac; }
+node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsearch) echo "${VM_NODES_ES[@]}";; opensearch) echo "${VM_NODES_OS[@]}";; *) return 1;; esac; }
 # 服务运行用户（wipe 后 chown 用）
-eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; esac; }
+eng_user()   { case "$1" in easysearch) echo "$EZ_RUN_USER";; elasticsearch) echo "$ES_RUN_USER";; opensearch) echo "${OS_RUN_USER:-opensearch}";; esac; }
 
 # ---- 赛道变体（压缩 × source_reuse × 量化）--------------------------------------
 # 一个**变体** = 基础赛道 + 压缩档 + source_reuse 开关（量化档是另一维度，见 track_quant）。
@@ -105,7 +106,12 @@ track_dir() { # <赛道/变体 id> → 目录
       # 压缩变体不另建目录：定版在 tracks/，压缩档与 source_reuse 走
       # --track-params（index_codec / source_reuse），由 index.json 的条件块写入。
       local b="${c%%-codec-*}"
-      case "$b" in hv1024x*) echo "$ROOT/tracks/hv1024x";; *) track_dir "$b";; esac;;
+      # 只有共享基座目录的量化族（int8/bbq 走 params）指向 hv1024x；
+      # 独立目录成员（bbqdisk / os 族，mappings 不同）指向各自目录。
+      case "$b" in
+        hv1024x|hv1024x-int8|hv1024x-bbq) echo "$ROOT/tracks/hv1024x";;
+        *) track_dir "$b";;
+      esac;;
     hv1024x-int8|hv1024x-bbq)
       # 向量量化族四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
       # 量化档走 --track-params（vector_index_type）。
@@ -136,6 +142,7 @@ track_quant() { # <id> → index_options.type（空 = 不量化）
   # int8_hnsw = 标量量化，bbq_hnsw = 二值量化；ES 8.19.23 与 Easysearch 2.5.1 两侧都能建。
   # 与压缩档是**两个独立维度**，别混：量化走 vector_index_type，压缩走 index_codec。
   case "$(track_canonical "$1")" in
+    hv1024x-os*) echo "";;
     *-int8) echo "int8_hnsw";;
     *-bbq) echo "bbq_hnsw";;
     *) echo "";; esac; }
@@ -152,7 +159,9 @@ tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要生成 hnsw 3 分片变�
 # run-bench.sh list 与 doctor.sh 共用这一份 —— 两处各写一份映射表 = 迟早漂移。
 track_availability_table() {
   local _t _d
-  for _t in geo hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr; do
+  for _t in geo geonames-upsert hnsw hv1024 nested \
+            hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr \
+            hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk; do
     case "$_t" in
       hnsw) _d="${TRACK_HNSW_BASE:-}";;                    # 3 分片变体起跑时生成，判基座在不在
       *)    _d=$(track_dir "$_t" 2>/dev/null || echo "");;   # 变体与基座同目录（压缩/量化走 params）
@@ -172,7 +181,13 @@ track_availability_table() {
   echo "      ↳ 7 档维度扫描的定义待回灌（语料在机器上）；要跑先按 tracks/README.md「还没切完的部分」回灌"
 }
 track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
-  local b; b=$(track_base "$1"); case "$b" in geo) echo "geonames";; nested) echo "sonested";; *) echo "vectors";; esac; }
+  local b; b=$(track_base "$1")
+  case "$b" in
+    geo) echo "geonames";;
+    geonames-upsert) echo "geonames-upsert";;
+    nested) echo "sonested";;
+    *) echo "vectors";;
+  esac; }
 track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
   local comp sr
   track_is_variant "$1" || { echo ""; return 0; }
@@ -192,7 +207,7 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   local b; b=$(track_base "$1")
   local p=""
   case "$b" in
-    geo|nested|hv1024) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
+    geo|nested|hv1024|geonames-upsert) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
   esac
   # 压缩档与 source_reuse：索引级设置，走 --track-params（标量，无逗号，rally 2.12 解析可靠），
   # 由 index.json 的条件块写入 settings（{% if index_codec is defined %} /
@@ -267,11 +282,28 @@ target_hosts() {
 # 停一个引擎（systemctl 双停 + forking 逃逸 JVM 兜底击杀：
 # ibs 单元 Type=forking，java 会脱离单元 cgroup，systemctl stop 杀不掉——
 # 按 exe 路径在安装根下的 java 进程补刀，与 ibs wipe 的 stop-first 同理）
+#
+# ⚠️ 必须等进程真正退出才返回：紧随其后的 precheck 静默卡点把 bench 标记进程的
+# CPU（含退出中的残留 JVM）当"残留引擎"——不等净，每场第一个 precheck 大概率失败，
+# 白烧 1~2 次重试（2026-11-08 oshv 系 campaign 实测：23 行判定 14 行 SKIP）。
 stop_engine_on_vm() { # <ip> <engine>
   local ip="$1" eng="$2" dir; dir=$(eng_dir "$eng") || return 0
   vm "$ip" "systemctl stop $eng 2>/dev/null; sleep 1; systemctl stop $eng 2>/dev/null
     for p in \$(pgrep -x java 2>/dev/null); do
       case \$(readlink /proc/\$p/exe 2>/dev/null) in $dir/*) kill \$p 2>/dev/null;; esac
+    done
+    # 等退出（最多 15s，轮询期间持续补 TERM；与 ibs wipe 的等待口径一致）
+    for i in \$(seq 1 15); do
+      left=0
+      for p in \$(pgrep -x java 2>/dev/null); do
+        case \$(readlink /proc/\$p/exe 2>/dev/null) in \$dir/*) left=1; kill \$p 2>/dev/null;; esac
+      done
+      [ \$left = 0 ] && break
+      sleep 1
+    done
+    # 还在 → SIGKILL（删数据前必须停净，绝不带着进程进下一场）
+    for p in \$(pgrep -x java 2>/dev/null); do
+      case \$(readlink /proc/\$p/exe 2>/dev/null) in $dir/*) kill -9 \$p 2>/dev/null;; esac
     done
     true"
 }
@@ -544,21 +576,21 @@ cpu_list_count() { # "0-7" 或 "0-3,8" → 核数
   echo "$n"
 }
 
-cpu_affinity_apply() { # <ncpu> —— 三节点 easysearch+elasticsearch 写 CPUAffinity drop-in
+cpu_affinity_apply() { # <ncpu> —— 三节点引擎写 CPUAffinity drop-in
   local n="$1" ip cpus
   [ "$n" -ge 1 ] 2>/dev/null || die "cpu_affinity_apply: 核数非法: $n"
   cpus=$(seq -s' ' 0 $(( n - 1 )))
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "for svc in easysearch elasticsearch; do mkdir -p /etc/systemd/system/\$svc.service.d && printf '[Service]\nCPUAffinity=${cpus}\n' > /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done && systemctl daemon-reload" \
+    vm "$ip" "for svc in easysearch elasticsearch opensearch; do mkdir -p /etc/systemd/system/\$svc.service.d && printf '[Service]\nCPUAffinity=${cpus}\n' > /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done && systemctl daemon-reload" \
       || die "在 $ip 写 CPUAffinity drop-in 失败"
   done
-  log "CPUAffinity=${cpus} 已写入三节点 drop-in（easysearch+elasticsearch；服务下次启动生效，cpu-affinity.sh clear 还原）"
+  log "CPUAffinity=${cpus} 已写入三节点 drop-in（easysearch+elasticsearch+opensearch；服务下次启动生效，cpu-affinity.sh clear 还原）"
 }
 
 cpu_affinity_clear() { # 移除 drop-in（服务下次启动恢复全部核）
   local ip
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "rm -f /etc/systemd/system/easysearch.service.d/${CPU_DROPIN} /etc/systemd/system/elasticsearch.service.d/${CPU_DROPIN} && systemctl daemon-reload" \
+    vm "$ip" "for svc in easysearch elasticsearch opensearch; do rm -f /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done && systemctl daemon-reload" \
       || die "在 $ip 移除 CPUAffinity drop-in 失败"
   done
   log "CPUAffinity drop-in 已移除（服务下次启动恢复全部核）"

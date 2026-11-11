@@ -1,0 +1,9 @@
+变体 id:    hv1024x-bbqdisk
+基础赛道:   hv1024x（/opt/raceway/tracks/hv1024x）
+烘入设置:   index_options.type=bbq_disk（默认参数：cluster_size=384 · visit_pct≈1%/1M向量/shard · bits=1）
+索引名:     vectors
+语料:       /testing/aijiami-perf-test/hv-bench/corpora/documents-jina-float.json（1,000,000 docs × 1024 维 float，22739096214 字节）
+_source:    excludes ["emb"]（docid 保留，向量不进 _source）
+引擎兼容:   elasticsearch ≥9.2 · **Enterprise license**（集群 elasticsearch.yml 已烘 xpack.license.self_generated.type: trial，
+            ibs wipe 后自动重新自签 30 天 trial，bbq_disk 全程可用 —— 2026-11-04 实测）
+生成:       20261104 从 hv1024x-bbq 复制，仅 index_options.type 不同（bbq_disk 不接受 m/ef_construction）

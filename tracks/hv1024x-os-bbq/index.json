@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 3,
+      "number_of_replicas": 0,
+      "knn": true
+    }
+  },
+  "mappings": {
+    "dynamic": "false",
+    "_source": { "excludes": ["emb"] },
+    "properties": {
+      "docid": { "type": "keyword" },
+      "emb": {
+        "type": "knn_vector", "dimension": 1024, "space_type": "cosinesimil",
+        "compression_level": "32x",
+        "method": { "name": "hnsw", "engine": "lucene",
+                    "parameters": { "m": 32, "ef_construction": 100 } }
+      }
+    }
+  }
+}

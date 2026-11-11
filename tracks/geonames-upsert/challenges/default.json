@@ -1,0 +1,261 @@
+    {
+      "name": "upsert-flow",
+      "default": true,
+      "description": "Full upsert lifecycle on a fresh index: pass 1 inserts all documents via doc_as_upsert (cold), pass 2 updates all documents via doc_as_upsert (hot), pass 3 runs a mixed workload with {{new_doc_ratio | default(25)}}% inserts (new ids) and the rest updates.",
+      "schedule": [
+        {
+          "operation": {
+            "name": "delete-index",
+            "operation-type": "delete-index",
+            "only-if-exists": true
+          }
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "settings": {{index_settings | default({}) | tojson}}
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames-upsert",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "name": "upsert-insert-cold",
+          "operation": "upsert-insert",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-insert",
+          "operation": "refresh"
+        },
+        {
+          "name": "upsert-update-hot",
+          "operation": "upsert-update",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-update",
+          "operation": "refresh"
+        },
+        {
+          "name": "upsert-mixed",
+          "operation": "upsert-mixed",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-mixed",
+          "operation": "refresh"
+        },
+        {% if include_force_merge | default(false) %}
+        {
+          "operation": "force-merge"
+        },
+        {
+          "name": "wait-until-merges-finish",
+          "operation": "wait-until-merges-finish"
+        },
+        {% endif %}
+        {
+          "operation": "index-stats",
+          "warmup-iterations": 100,
+          "iterations": 100
+        }
+      ]
+    },
+    {
+      "name": "upsert-cold-insert",
+      "description": "Creates a fresh index and inserts all documents via doc_as_upsert only (every upsert takes the insert path). Measures pure upsert-insert throughput.",
+      "schedule": [
+        {
+          "operation": {
+            "name": "delete-index",
+            "operation-type": "delete-index",
+            "only-if-exists": true
+          }
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "settings": {{index_settings | default({}) | tojson}}
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames-upsert",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "name": "upsert-insert-cold",
+          "operation": "upsert-insert",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-insert",
+          "operation": "refresh"
+        },
+        {
+          "operation": "index-stats",
+          "warmup-iterations": 100,
+          "iterations": 100
+        }
+      ]
+    },
+    {
+      "name": "upsert-hot-update",
+      "description": "Requires an index populated by a previous race (upsert-cold-insert or upsert-flow). Updates all documents via doc_as_upsert (every upsert takes the update path). Does NOT delete or recreate the index.",
+      "schedule": [
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames-upsert",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "name": "upsert-update-hot",
+          "operation": "upsert-update",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-update",
+          "operation": "refresh"
+        },
+        {
+          "operation": "index-stats",
+          "warmup-iterations": 100,
+          "iterations": 100
+        }
+      ]
+    },
+    {
+      "name": "upsert-mixed",
+      "description": "Requires an index populated by a previous race. Runs a mixed upsert workload with {{new_doc_ratio | default(25)}}% inserts against new ids and the rest updates against existing ids. Does NOT delete or recreate the index.",
+      "schedule": [
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames-upsert",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "name": "upsert-mixed",
+          "operation": "upsert-mixed",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-mixed",
+          "operation": "refresh"
+        },
+        {
+          "operation": "index-stats",
+          "warmup-iterations": 100,
+          "iterations": 100
+        }
+      ]
+    },
+    {
+      "name": "native-update",
+      "description": "Baseline using Rally's built-in update path for comparison: indexes all documents with Rally-generated sequential ids, then re-runs the bulk with on-conflict=update so every action becomes a plain partial-doc update (no doc_as_upsert involved).",
+      "schedule": [
+        {
+          "operation": {
+            "name": "delete-index",
+            "operation-type": "delete-index",
+            "only-if-exists": true
+          }
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "settings": {{index_settings | default({}) | tojson}}
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames-upsert",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "name": "index-append-with-ids",
+          "operation": "index-append-ids",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-append",
+          "operation": "refresh"
+        },
+        {
+          "name": "index-update-native",
+          "operation": "index-update-native",
+          "warmup-time-period": {{warmup_time_period | default(30)}},
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-native-update",
+          "operation": "refresh"
+        },
+        {% if include_force_merge | default(false) %}
+        {
+          "operation": "force-merge"
+        },
+        {
+          "name": "wait-until-merges-finish",
+          "operation": "wait-until-merges-finish"
+        },
+        {% endif %}
+        {
+          "operation": "index-stats",
+          "warmup-iterations": 100,
+          "iterations": 100
+        }
+      ]
+    }

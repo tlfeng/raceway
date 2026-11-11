@@ -38,7 +38,11 @@ tracks/**/*.offset
 tracks/**/queries.json
 tracks/**/queries*.jsonl
 tracks/**/truth.jsonl
+# full.json 默认是派生产物（write-only + query-only → derive_full_challenge 现生成），
+# 不入库。例外：geonames-upsert 没有 write-only/query-only 可派生 —— 它的 full.json
+# 是手写主定义（upsert 三段流 + native-update 基线），必须随库分发。
 tracks/**/challenges/full.json
+!tracks/geonames-upsert/challenges/full.json
 
 # —— 部署机（/testing/raceway）本地留档：只留机器上，不入库 ——
 # 赛道定义已定版进库（tracks/geonames、tracks/hv1024、tracks/nested、tracks/hv1024x*）。

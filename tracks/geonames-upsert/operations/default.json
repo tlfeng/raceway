@@ -1,0 +1,68 @@
+    {
+      "name": "index-append-ids",
+      "operation-type": "bulk",
+      "bulk-size": {{bulk_size | default(5000)}},
+      "ingest-percentage": {{ingest_percentage | default(100)}},
+      "conflicts": "sequential",
+      "conflict-probability": 0
+    },
+    {
+      "name": "index-update-native",
+      "operation-type": "bulk",
+      "bulk-size": {{bulk_size | default(5000)}},
+      "ingest-percentage": {{ingest_percentage | default(100)}},
+      "conflicts": "sequential",
+      "on-conflict": "update",
+      "conflict-probability": {{conflict_probability | default(100)}},
+      "recency": {{recency | default(0)}}
+    },
+    {
+      "name": "upsert-insert",
+      "operation-type": "bulk",
+      "param-source": "upsert-source",
+      "bulk-size": {{upsert_bulk_size | default(500)}},
+      "ingest-percentage": {{ingest_percentage | default(100)}},
+      "new-doc-ratio": 0
+    },
+    {
+      "name": "upsert-update",
+      "operation-type": "bulk",
+      "param-source": "upsert-source",
+      "bulk-size": {{upsert_bulk_size | default(500)}},
+      "ingest-percentage": {{ingest_percentage | default(100)}},
+      "new-doc-ratio": 0
+    },
+    {
+      "name": "upsert-mixed",
+      "operation-type": "bulk",
+      "param-source": "upsert-source",
+      "bulk-size": {{upsert_bulk_size | default(500)}},
+      "ingest-percentage": {{ingest_percentage | default(100)}},
+      "new-doc-ratio": {{new_doc_ratio | default(25)}},
+      "new-id-offset": {{new_id_offset | default(1000000000)}}
+    },
+    {
+      "name": "index-stats",
+      "operation-type": "index-stats",
+      "index": "_all"
+    },
+    {
+      "name": "refresh",
+      "operation-type": "refresh"
+    },
+    {
+      "name": "force-merge",
+      "operation-type": "force-merge",
+      "request-timeout": 7200
+    },
+    {
+      "name": "wait-until-merges-finish",
+      "operation-type": "index-stats",
+      "index": "_all",
+      "condition": {
+        "path": "_all.total.merges.current",
+        "expected-value": 0
+      },
+      "retry-until-success": true,
+      "include-in-reporting": false
+    }

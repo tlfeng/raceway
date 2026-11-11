@@ -194,10 +194,22 @@ def render_cars(cars, tag):
 #   GIST 系：ds-g960 / ds-g1920
 # 两套都是 1M docs、float、dot_product HNSW，差的是**向量数据集本身** ——
 # 分布不同，召回与吞吐的绝对值不能跨数据集直接比。编排时必须看得见是哪一套。
+#
+# 值的第 4 位（可选，默认 True）= 该基座**支持压缩变体**：index.json 里得真有
+# index_codec / source_reuse 条件块，变体才能落进 settings。os 族 / bbqdisk /
+# geonames-upsert 的 index.json 是**烘焙定值**（无 Jinja 条件块）→ 变体排了也会
+# 在起跑前被 track_assert_storage_params 挡下 —— 干脆不生成，别让用户排了再失败。
+# hvtp200k-2s/3s 有历史数据但 runner 无分支 → 干脆不进清单（能看不能排，见 CLI 报错文案）。
 BASE_TRACKS = {
     'geo':      ('geonames', 30, None),
+    'geonames-upsert': ('geonames upsert/update', 40, 'geonames', False),
     'hnsw':     ('hnsw 2m', 25, None),
     'hv1024':   ('hv 1024 维', 30, None),
+    'hv1024x':  ('hv1024x 四臂（1024 维）', 20, None),
+    'hv1024x-bbqdisk': ('hv1024x ES bbq_disk', 20, None, False),
+    'hv1024x-os':      ('1024 维 OS · lucene hnsw', 20, None, False),
+    'hv1024x-os-bbq':  ('1024 维 OS · BBQ(32x)', 20, None, False),
+    'hv1024x-os-disk': ('1024 维 OS · on_disk(faiss)', 20, None, False),
     'nested':   ('nested', 35, None),
     'ds-g1920': ('1920 维', 56, 'GIST'),
     'ds-j2048': ('2048 维', 49, 'jina'),
@@ -208,9 +220,12 @@ BASE_TRACKS = {
     'ds-j1536': ('1536 维', 44, 'jina'),
 }
 TRACK_GROUPS = [('ds', '维度扫描 ds-*（两套数据集：jina 系 / GIST 系）'),
-                ('geo', 'geonames'),
-                ('vector', '向量 hnsw / hv1024'), ('nested', 'nested')]
-BASE_GROUP = {'geo': 'geo', 'hnsw': 'vector', 'hv1024': 'vector', 'nested': 'nested'}
+                ('geo', 'geonames（基座 / upsert 对比）'),
+                ('vector', '向量 hnsw / hv1024 / hv1024x 家族'), ('nested', 'nested')]
+BASE_GROUP = {'geo': 'geo', 'geonames-upsert': 'geo', 'hnsw': 'vector',
+              'hv1024': 'vector', 'hv1024x': 'vector', 'hv1024x-bbqdisk': 'vector',
+              'hv1024x-os': 'vector', 'hv1024x-os-bbq': 'vector',
+              'hv1024x-os-disk': 'vector', 'nested': 'nested'}
 # 压缩 token（与 vm-bench-lib.sh 的 track_compression 同一套）
 CODEC_TOKENS = ['def', 'zstd', 'bc']
 TOKEN_LABEL = {'def': 'default(LZ4)', 'zstd': 'ZSTD', 'bc': 'best_compression'}
@@ -228,17 +243,21 @@ VARIANT_EST_FACTOR = {
 
 
 def build_catalog():
-    """完整赛道清单：每个基础赛道 + 它的 6 个压缩变体。
+    """完整赛道清单：每个基础赛道 + 它的 6 个压缩变体（仅支持变体的基座）。
 
     返回 {id: {name, label, est, group, base, compression, source_reuse, engines}}
     """
     cat = {}
-    for base, (label, est, dataset) in BASE_TRACKS.items():
+    for base, spec in BASE_TRACKS.items():
+        label, est, dataset = spec[0], spec[1], spec[2]
+        can_codec = spec[3] if len(spec) > 3 else True   # 4 位缺省 = 支持变体（旧条目兼容）
         grp = BASE_GROUP.get(base, 'ds' if base.startswith('ds-') else 'geo')
         cat[base] = {'name': base, 'label': label, 'est': est, 'group': grp,
                      'base': base, 'compression': None, 'source_reuse': None,
                      'engines': H.engines_of(base), 'variant': False,
                      'dataset': dataset}
+        if not can_codec:
+            continue
         for tok in CODEC_TOKENS:
             for sr in (False, True):
                 vid = '%s-codec-%s%s' % (base, tok, '-sr' if sr else '')

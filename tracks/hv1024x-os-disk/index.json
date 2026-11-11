@@ -1,0 +1,20 @@
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 3,
+      "number_of_replicas": 0,
+      "knn": true
+    }
+  },
+  "mappings": {
+    "dynamic": "false",
+    "_source": { "excludes": ["emb"] },
+    "properties": {
+      "docid": { "type": "keyword" },
+      "emb": {
+        "type": "knn_vector", "dimension": 1024, "space_type": "cosinesimil",
+        "mode": "on_disk"
+      }
+    }
+  }
+}
