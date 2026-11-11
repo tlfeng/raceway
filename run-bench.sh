@@ -156,6 +156,16 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 
 # ds-*（维度扫描）赛道超时：≥1536 维写入给 14400s，其余 10800s；查询统一 5400s
 : "${TIMEOUT_DS_W:=10800}"; : "${TIMEOUT_DS_W_HI:=14400}"; : "${TIMEOUT_DS_Q:=5400}"
+# 基础赛道超时内置默认（vm-bench.env 有键则覆盖；set -u 下缺键不再是半途 unbound 崩）
+: "${TIMEOUT_GEO_W:=14400}";  : "${TIMEOUT_GEO_Q:=5400}"
+: "${TIMEOUT_HNSW_W:=10800}"; : "${TIMEOUT_HNSW_Q:=5400}"
+: "${TIMEOUT_HV1024_W:=10800}"; : "${TIMEOUT_HV1024_Q:=5400}"
+: "${TIMEOUT_NESTED_W:=14400}"; : "${TIMEOUT_NESTED_Q:=5400}"
+# 机器布局旋钮同理给内置默认（与 vm-bench.env.example 一致；env 值永远优先）
+: "${IBS_BASE:=/infini}"
+: "${PKG_DIR:=$ROOT/pkg}"
+: "${RESULTS_ROOT:=$ROOT/campaigns}"
+: "${MON_DIR:=$ROOT/monitor}"
 
 # ---- 排程模式（SCHEDULE_FILE + CARS_FILE）--------------------------------------
 # 用途：维度扫描这类"高维优先 + 窗底守卫"的固定排程，逐行指定 (车, 赛道, 轮次, recall, est分钟)。
