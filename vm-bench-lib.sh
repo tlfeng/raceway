@@ -58,14 +58,6 @@ runner_meta_pid() { # <campaign dir> → 仅返回身份和脚本 argv 均吻合
 vm()    { ssh "${VM_SSH_OPTS[@]}" "root@$1" "$2" </dev/null 9>&-; }
 vmPut() { scp "${VM_SSH_OPTS[@]}" "$2" "root@$1:$3" </dev/null 9>&-; }   # vmPut <ip> <local> <remote>
 
-# 对所有虚机执行命令，任一失败即 die
-vm_all() {
-  local cmd="$1" ip
-  for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "$cmd" || die "在 $ip 上执行失败: $cmd"
-  done
-}
-
 # JDK 安装（幂等）：把 OpenJDK 装到虚机的 /opt/jdks/jdk-<ver>。
 # 只认这一个约定：版本号从目录名取，安装包在 $PKG_DIR/openjdk-<ver>_linux-x64_bin.tar.gz。
 # 不猜版本、不下网 —— 装不了就返回非 0，由调用方报错。
@@ -395,43 +387,12 @@ wipe_engine_data_on_vm() { # <ip> <engine>：二次验证停净，只删统一�
     chown -R '$user:$user' \"\$dir/data\" \"\$dir/logs\""
 }
 
-# 启动一个引擎
-start_engine_on_vm() { # <ip> <engine>
-  local ip="$1" eng="$2"
-  vm "$ip" "systemctl start $eng"
-}
-
 # 断言端口空闲（返回 0=空闲）
 port_free_on_vm() { # <ip>；SSH/ss 失败不能视为空闲
   local ip="$1"
   case "${HTTP_PORT:-}" in ''|*[!0-9]*) return 1;; esac
   vm "$ip" "out=\$(ss -H -ltn) || exit 2
     if printf '%s\\n' \"\$out\" | awk '{print \$4}' | grep -qE ':${HTTP_PORT}\$'; then exit 1; fi"
-}
-
-# 后缀式段数检查：返回某索引每主分片段数>0 的分片个数（0 = 全部每分片 1 段）
-nonseg_shards() { # <index>
-  local idx="$1" ip="${VM_IPS[0]}"
-  curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 10 \
-    "https://$ip:$HTTP_PORT/_cat/segments/$idx?h=prirep,shard" 2>/dev/null \
-    | awk '$1=="p"{c[$2]++} END{n=0; for(s in c) if(c[s]>1) n++; print n+0}'
-}
-
-# 异步 forcemerge 并轮询到每分片 1 段（编排侧不调用，merge 由赛道 full challenge 负责；
-# 函数保留供手工对某个索引做"合并+验证"）。
-force_merge_to_one() { # <index> <max_wait_sec>
-  local idx="$1" maxw="${2:-1200}"
-  local ip="${VM_IPS[0]}" n deadline=$((SECONDS + maxw))
-  log "  forcemerge $idx -> 1 segment/shard"
-  curl -sk -u "$ADMIN_USER:$ADMIN_PW" -XPOST --max-time 3600 \
-    "https://$ip:$HTTP_PORT/$idx/_forcemerge?max_num_segments=1" >/dev/null 2>&1
-  while [ $SECONDS -lt $deadline ]; do
-    n=$(nonseg_shards "$idx")
-    [ "$n" = "0" ] && { log "  段数卡点通过: $idx 每主分片 1 段"; return 0; }
-    sleep 30
-  done
-  log "  段数卡点失败: $idx 仍有 $n 个分片 >1 段"
-  return 1
 }
 
 # ---------------------------------------------------------------------------
