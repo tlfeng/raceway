@@ -1,0 +1,16 @@
+{% import "rally.helpers" as rally with context %}
+{
+  "version": 2,
+  "description": "Full-scale dense-vector benchmark (2M docs) for ez2.4.0 vs es8.19.21, separated write/query with segment gate",
+  "indices": [ { "name": "vectors", "body": "index.json" } ],
+  "corpora": [
+    {
+      "name": "dense-vector",
+      "documents": [
+        { "source-file": "documents-2m.json", "document-count": 2000000, "uncompressed-bytes": 4181053134, "compressed-bytes": 4181053134 }
+      ]
+    }
+  ],
+  "operations": [ {{ rally.collect(parts="operations/*.json") }} ],
+  "challenges": [ {{ rally.collect(parts="challenges/*.json") }} ]
+}

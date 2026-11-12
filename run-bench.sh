@@ -77,7 +77,7 @@ raceway · 压测编排入口（用法页）
 
 赛道（名字 → 赛道定义在哪）
   geo                    geonames 官方基座           tracks/geonames
-  hnsw                   96 维 200 万向量            机器本地（vm-bench.env TRACK_HNSW_BASE）
+  hnsw                   96 维 200 万向量            tracks/hnsw（语料 TRACK_HNSW_BASE）
   hv1024                 1024 维 100 万向量          tracks/hv1024
   nested                 nested 文档                 tracks/nested
   hv1024x                1024 维四臂 · hnsw 基座      tracks/hv1024x
@@ -784,17 +784,18 @@ cpu_affinity_assert() { # <engine>
 }
 
 # ---------- track -------------------------------------------------------------
-prepare_hnsw_s3() {
+prepare_hnsw() {
+  # hnsw 定义已定版 tracks/hnsw/（20261112 回灌，分片 params 化默认 3）；
+  # 这里只补 git 收不了的产物：语料/查询集软链（TRACK_HNSW_BASE 指向二者所在目录）。
   # ⚠️ .offset 断点文件绝不带入（rally 会从旧断点续传，write 计量失真）
-  [ -d "$TRACK_HNSW_S3" ] && rm -f "$TRACK_HNSW_S3/documents-2m.json.offset"
-  [ -f "$TRACK_HNSW_BASE/track.json" ] || die "hnsw 基准 track 不存在: $TRACK_HNSW_BASE"
-  mkdir -p "$TRACK_HNSW_S3"
-  (cd "$TRACK_HNSW_BASE" && tar cf - --exclude='documents-2m.json*' .) | tar xf - --strip-components=1 -C "$TRACK_HNSW_S3"
-  ln -sf "$TRACK_HNSW_BASE/documents-2m.json" "$TRACK_HNSW_S3/documents-2m.json"
-  rm -f "$TRACK_HNSW_S3/documents-2m.json.offset"
-  sed -i 's/"number_of_shards": *2/"number_of_shards": 3/' "$TRACK_HNSW_S3/index.json"
-  grep -q '"number_of_shards": 3' "$TRACK_HNSW_S3/index.json" || die "hnsw 3 分片改写失败"
-  log "hnsw 3 分片变体已生成: $TRACK_HNSW_S3"
+  local d; d=$(track_dir hnsw)
+  [ -f "$d/track.json" ] || die "hnsw 赛道定义不在位: $d（仓库同步得带 tracks/）"
+  [ -f "$TRACK_HNSW_BASE/documents-2m.json" ] || die "hnsw 语料不存在: $TRACK_HNSW_BASE/documents-2m.json（查 vm-bench.env TRACK_HNSW_BASE）"
+  [ -f "$TRACK_HNSW_BASE/queries.json" ] || die "hnsw 查询集不存在: $TRACK_HNSW_BASE/queries.json（查 vm-bench.env TRACK_HNSW_BASE）"
+  ln -sf "$TRACK_HNSW_BASE/documents-2m.json" "$d/documents-2m.json"
+  ln -sf "$TRACK_HNSW_BASE/queries.json" "$d/queries.json"
+  rm -f "$d/documents-2m.json.offset"
+  log "hnsw 语料/查询集已就位: $d（软链自 $TRACK_HNSW_BASE）"
 }
 
 # ---------- 赛道准备（定义定版在 tracks/，这里只补 git 收不了的产物）----------
@@ -860,7 +861,11 @@ PY
     log "  查询集已生成（$n 条）: $q"
   fi
   local qd; qd=$(python3 -c "import json;print(len(json.loads(open('$q').readline())))" 2>/dev/null || echo 0)
-  [ "$qd" = "1024" ] || die "$(basename "$d"): 查询向量维度 $qd ≠ 1024"
+  # 维度断言只对 hv1024 系（查询集是本仓库生成器按 1024 维口径产的）；
+  # hnsw 的 queries.json 是随语料自带的 96 维查询集（prepare_hnsw 已保证在位），不适用这个断言。
+  case "$(basename "$d")" in
+    hv1024*) [ "$qd" = "1024" ] || die "$(basename "$d"): 查询向量维度 $qd ≠ 1024";;
+  esac
 }
 
 prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处理
@@ -885,8 +890,9 @@ prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处�
 }
 
 # ds-*（维度扫描）赛道：语料软链修链 + 维度/条数/字节/查询维数自检。
-# ds-* 的定义还没进 git（语料与真值在 $ROOT/corpora-ds/），软链断了就按同名在
-# corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，记录落进 campaign 台账。
+# ds-* 定义已定版进 git（20261112 回灌）；语料与真值在 $ROOT/corpora-ds/，不进 git，
+# 软链断了就按同名在 corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，
+# 记录落进 campaign 台账。
 prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道直接跳过）
   local CORPORA_DS="${CORPORA_DS:-$ROOT/corpora-ds}"
   local tk d dims f base cand want_n want_b srcf corpus real_b qdims got
@@ -1631,11 +1637,11 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
   check_track_engine_compat
 fi
 
-# hnsw 3 分片变体只在**真要跑 hnsw 族**时才生成（判据见 vm-bench-lib.sh 的 tracks_need_hnsw_prep）：
-# 无条件生成时，机器上缺 hnsw 基座定义会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
+# hnsw 语料/查询集软链只在**真要跑 hnsw 族**时才准备（判据见 vm-bench-lib.sh 的 tracks_need_hnsw_prep）：
+# 无条件准备时，机器上缺语料会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
 if tracks_need_hnsw_prep "${TRACKS[@]}"; then
-  prepare_hnsw_s3
-  [ -d "$TRACK_HNSW_S3" ] || die "hnsw 3 分片变体准备失败"
+  prepare_hnsw
+  [ -e "$(track_dir hnsw)/documents-2m.json" ] || die "hnsw 语料准备失败"
 fi
 
 # 赛道准备：定义已定版在仓库 tracks/，这里只补 git 不入库的产物（语料软链 / 查询集 / 断点）

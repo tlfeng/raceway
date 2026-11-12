@@ -1,0 +1,13 @@
+{
+  "settings": { "index": { "number_of_shards": {{number_of_shards | default(3)}}, "number_of_replicas": {{number_of_replicas | default(0)}}{% if encrypted_store is defined and encrypted_store %}, "store.type": "encrypted", "encryption.profile": "index"{% endif %} }{% if index_codec is defined %}, "index.codec": "{{index_codec}}"{% endif %}{% if source_reuse is defined and source_reuse %}, "index.source_reuse": true{% endif %} },
+  "mappings": {
+    "dynamic": "strict",
+    "_source": { "enabled": false },
+    "properties": {
+      "vector": {
+        "type": "dense_vector", "dims": 96, "index": true, "similarity": "dot_product",
+        "index_options": { "type": "hnsw", "m": 32, "ef_construction": 100 }
+      }
+    }
+  }
+}
