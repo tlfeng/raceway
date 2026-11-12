@@ -820,6 +820,7 @@ async function boot(){
 function paintCompat(){
   // 车的引擎 × 变体的兼容性：ZSTD 压缩与 index.source_reuse 是 Easysearch 专有，
   // ES 上 create-index 直接拒 —— 提前标出来，别排了再白跑一场建库。
+  // 展示按车聚合成一行摘要 + 可展开明细（全矩阵几十行平铺没法看）。
   const m=matrix();
   const bad=[];
   CARS.forEach(function(a){
@@ -828,13 +829,22 @@ function paintCompat(){
       const info=TRACKS.find(function(x){return x.name===t;});
       const allow=info?(info.engines||''):'';
       if(allow && (a.engine||'').toLowerCase()!==allow)
-        bad.push(a.name+'（'+a.engine+'）× '+t+'（只支持 '+allow+'）');
+        bad.push({car:a.name, eng:a.engine||'?', allow:allow, t:t});
     });
   });
   const box=document.getElementById('compatbox');
   if(!bad.length){ box.innerHTML='<span style="color:#080">✔ 当前矩阵的车×变体组合全部兼容</span>'; return; }
-  box.innerHTML='<span class="err">✘ '+bad.length+' 个组合不兼容（起跑会被拦下）：<br>'
-    + bad.map(esc).join('<br>')+'</span>';
+  const byCar={};
+  bad.forEach(function(b){ (byCar[b.car]=byCar[b.car]||[]).push(b); });
+  let h='<span class="err">✘ '+bad.length+' 个组合不兼容（起跑会被拦下）</span>';
+  Object.keys(byCar).forEach(function(car){
+    const rows=byCar[car];
+    h+='<details style="margin:4px 0 0 8px"><summary style="cursor:pointer;font-size:12px;color:#a33">'
+      + esc(car)+'（'+esc(rows[0].eng)+'）× '+rows.length+' 个受限变体（只支持 '+esc(rows[0].allow)+'）</summary>'
+      + '<div style="font-size:12px;color:#a33;margin:2px 0 4px 14px">'
+      + rows.map(function(b){return esc(b.t);}).join('<br>')+'</div></details>';
+  });
+  box.innerHTML=h;
 }
 function matrix(){
   const cars=[...document.querySelectorAll('.carck:checked')].map(e=>e.value);
@@ -1145,7 +1155,7 @@ async function reorderCamp(cid){
   });
   document.getElementById('custom').value=cust.join(',');
   document.getElementById('rounds').value=d.rounds||1;
-  const m=(cid||'').match(/^([A-Za-z][A-Za-z0-9]*)-\d{8}-\d{6}/);
+  const m=(cid||'').match(/^([A-Za-z][A-Za-z0-9]*)-\\d{8}-\\d{6}/);
   document.getElementById('tag').value=m?m[1]:'';
   savePrefs(); loadHist(); switchTab('compose');
   setMsg(true,'已按 '+cid+' 预填（车 '+(cars.join('/')||'?')+' × '+tracks.length+' 赛道 × '+
@@ -1447,8 +1457,9 @@ def api_stop(st, body):
                           timeout=120)
     if rc != 0:
         return 400, {'error': '停止脚本返回码 %d：\n%s\n'
-                     '（检查远端 %s 是否存在且可执行；可从仓库拷贝 stop-campaign.sh 过去）'
-                     % (rc, out.strip(), script)}
+                     '（脚本以 bash 执行、无需可执行位；检查远端 %s 是否存在 —— '
+                     '没有就从仓库拷过去：scp stop-campaign.sh %s:%s/）'
+                     % (rc, out.strip(), script, st.args.ssh or '<host>', st.args.root)}
     return 200, {'result': out.strip() or '已发送停止命令'}
 
 
@@ -1599,6 +1610,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def cmd_serve(args):
+    # --root 必须是 raceway 仓库根（要有 run-bench.sh / schedules/）。传成
+    # campaigns 目录时车定义与 dry-run 全落到不存在的路径，报错却指向别处，
+    # 用户看不出是 root 传错了 —— 起服务前先探一发。
+    probe = 'test -f %s' % shlex.quote(posixpath.join(args.root, 'run-bench.sh'))
+    if args.ssh:
+        rc, _ = ssh_run(args.ssh, probe, timeout=30)
+    else:
+        rc = 0 if os.path.exists(os.path.join(args.root, 'run-bench.sh')) else 1
+    if rc != 0:
+        raise SystemExit(
+            '--root 应该是 raceway 仓库根（%s 下没有 run-bench.sh）\n'
+            '  传成 campaigns 目录会让车定义/dry-run 全部落空；'
+            '要编排它的 campaign 也应传仓库根，例如 --root /opt/raceway' % args.root)
+
     state = ComposeState(args)
     hard = [m for s, m in state.problems if s == 'error']
     if hard:
