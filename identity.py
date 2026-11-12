@@ -51,7 +51,7 @@ Rally 从不管我们的堆和 JDK —— 手工管的那套配置正是 car con
 
 import re
 
-ENGINE_SHORT = {"easysearch": "ez", "elasticsearch": "es"}
+ENGINE_SHORT = {"easysearch": "ez", "elasticsearch": "es", "opensearch": "os"}
 
 # 厂商 → 标签前缀。vendor_detected 由 bench-sidecar.py 从 java -version 原文判定。
 JDK_VENDOR_PREFIX = {"GraalVM": "graalvm", "TencentKonaJDK": "kona", "OpenJDK": "openjdk"}
@@ -71,7 +71,7 @@ CAR_FALLBACK = {
     "kona25": {"engine": "easysearch", "version": "2.5.0", "jdk": "kona25"},
 }
 
-BUILD_UNKNOWN = "—"     # 该产品**没有** build 概念（ES 8.19.23）—— "不适用"，不是"不知道"
+BUILD_UNKNOWN = "—"     # ES/OS 没有独立 build 段 —— “不适用”，不是“不知道”
 # 有 build 概念但查不到时按车代号隔开（unk-<车>），与 JDK 位的策略一致：
 # 写 "—" 会把所有未知 build 的车挤进同一条线（和别的 build 混成一条曲线）。
 #
@@ -209,8 +209,8 @@ def series_key_of(engine, version, build_no, jdk_vendor=None, jdk_major=None, ca
     ver = str(version) if version not in (None, "") else "?"
     if build_no not in (None, ""):
         build = str(build_no)
-    elif engine == "elasticsearch":
-        build = BUILD_UNKNOWN          # ES 版本号本身没有 build 段 —— 不适用
+    elif engine in ("elasticsearch", "opensearch"):
+        build = BUILD_UNKNOWN          # ES/OS 版本号本身没有独立 build 段 —— 不适用
     elif car:
         build = "unk-%s" % car         # 有 build 概念但查不到 → 按车隔开，不挤成一条线
     else:
@@ -222,12 +222,12 @@ def series_key_of(engine, version, build_no, jdk_vendor=None, jdk_major=None, ca
 def car_of(doc):
     """文档里的**车代号**（配置代号，如 jdk25 / ez240 / es819）。
 
-    车代号只作为 user_tags.car（编排时定的名字）留着，身份靠
-    engine/version/engine_build/jdk_vendor/jdk_version/series_key 表达；
-    旧文档（车代号在顶层 car/arm）仍能读出来。
+    入库文档取 car_code；源头 race/sidecar 仍取 car/user_tags.car。
+    身份靠 engine/version/engine_build/jdk_vendor/jdk_version/series_key 表达，
+    不把 Rally 的 car 插件列表当成被测配置代号。
     """
     doc = doc or {}
-    c = doc.get("car")
+    c = doc.get("car_code") or doc.get("car")
     if isinstance(c, (list, tuple)):
         c = None                       # Rally 自己的 car 插件列表，不是车代号
     if not c:
@@ -235,6 +235,22 @@ def car_of(doc):
     if not c:
         c = (doc.get("user_tags") or {}).get("car") or (doc.get("user_tags") or {}).get("arm")
     return c or ""
+
+
+def runner_track_id(track):
+    """赛道身份统一到 runner 目录名；基础赛道及其变体都用 geo 而非 geonames。"""
+    tid = str(track or "").strip()
+    if tid == "geonames" or tid.startswith("geonames-codec-"):
+        return "geo" + tid[len("geonames"):]
+    return tid
+
+
+def comparison_key_of(series_key, track_variant):
+    """看板安全分线键：引擎身份与真实赛道身份正交，缺任一身份就拒绝拼线。"""
+    variant = runner_track_id(track_variant)
+    if not series_key or not variant:
+        raise ValueError("comparison_key 必须同时有 series_key 与 track_variant")
+    return "%s|%s" % (series_key, variant)
 
 
 def series_key_from_doc(doc):

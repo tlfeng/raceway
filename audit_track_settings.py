@@ -75,20 +75,29 @@ def main():
             print("未知参数: %s（只接受 --check；本工具只审计不修复）" % a, file=sys.stderr)
             return 2
     dirs = args or ["."]
-    n_bad = 0
+    n_bad = checked = 0
     for root in dirs:
+        if not os.path.isdir(root):
+            print("  [错] 目录不存在: %s" % root, file=sys.stderr)
+            n_bad += 1
+            continue
         for dirpath, _dn, fn in os.walk(root):
             if "index.json" not in fn:
                 continue
             p = os.path.join(dirpath, "index.json")
+            checked += 1
             status, msg = audit(p)
             if status in ("nested", "jinja-nested"):
                 n_bad += 1
                 print("  [错] %-58s %s" % (p, msg))
             elif status == "unreadable":
-                print("  [跳过] %s" % p)
-    print("%s：%d 个赛道 index.json 的 settings 结构有问题"
-          % ("仍需处理" if n_bad else "全部通过", n_bad))
+                n_bad += 1
+                print("  [错] 读不了: %s" % p)
+    if not checked:
+        print("  [错] 没有检查到任何 index.json", file=sys.stderr)
+        n_bad += 1
+    print("%s：已检查 %d 个 index.json，%d 个问题"
+          % ("仍需处理" if n_bad else "全部通过", checked, n_bad))
     return 1 if n_bad else 0
 
 

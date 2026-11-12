@@ -14,7 +14,9 @@ cd "$(dirname "$0")"
 source ./vm-bench-lib.sh
 
 cmd="${1:?用法: $0 <apply N|status [N]|clear>}"
-declare -A DIR_OF=( [easysearch]="$IBS_BASE/easysearch" [elasticsearch]="$IBS_BASE/elasticsearch" [opensearch]="$IBS_BASE/opensearch" )
+load_topology
+[ "${#VM_IPS[@]}" -gt 0 ] || die "拓扑为空，拒绝零操作成功"
+declare -A DIR_OF=( [easysearch]="$(engine_root easysearch)" [elasticsearch]="$(engine_root elasticsearch)" [opensearch]="$(engine_root opensearch)" )
 
 case "$cmd" in
   apply)
@@ -25,11 +27,13 @@ case "$cmd" in
     cpu_affinity_clear
     ;;
   status)
-    want="${2:-}" rc=0
+    want="${2:-}" rc=0; seen=0
+    [ -z "$want" ] || [[ "$want" =~ ^[1-9][0-9]*$ ]] || die "核数非法: $want"
     for ip in "${VM_IPS[@]}"; do
-      for svc in easysearch elasticsearch opensearch; do
-        l=$(cpu_allowed_of "$ip" "$svc" "${DIR_OF[$svc]}")
+      for svc in "${ENGINES[@]}"; do
+        l=$(cpu_allowed_of "$ip" "$svc" "${DIR_OF[$svc]}") || { echo "$ip $svc: 查询失败"; rc=1; continue; }
         if [ -z "$l" ]; then echo "$ip $svc: 进程未运行"; continue; fi
+        seen=$((seen+1))
         n=$(cpu_list_count "$l")
         if [ -n "$want" ] && [ "$n" != "$want" ]; then
           echo "$ip $svc: MISMATCH Cpus_allowed_list=$l（$n 核，期望 $want）"; rc=1
@@ -38,6 +42,7 @@ case "$cmd" in
         fi
       done
     done
+    [ "$seen" -gt 0 ] || { echo "没有可验证的引擎进程"; rc=1; }
     exit $rc
     ;;
   *) die "未知命令: $cmd（可选: apply N | status [N] | clear）";;

@@ -1,37 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""verify-dashboard.py —— 校验 Kibana 看板的面板是不是真的出数（Kibana 7.x / 8.x 通用）
+"""严格验收 Kibana TSVB 面板：匹配 0 个、引用/状态损坏、错误响应和无有限值均失败。
 
-为什么不能只看"文档数 > 0"：
-  terms 分组拿不到 series 时，前端画出来是空图，但 ES 侧 count 仍然大于 0。
-  真正要验的是 **Kibana 自己能不能把这个面板渲染成有数据的曲线**。
-
-怎么验：
-  直接调 Kibana 自己的 TSVB 渲染接口 `POST /api/metrics/vis/data`
-  （7.17 与 8.1 是同一个路径），对每个 TSVB 面板发一次真实请求：
-    - 参数 = 该面板 visState.params（含面板自带的 lucene filter）
-    - 再把看板级 KQL（默认 valid: true）并进 filter，还原看板真实口径
-    - 时间窗 = 该看板存的 timeFrom/timeTo
-  要求返回的 series 里至少有一条曲线的 bucket 非空。
-
-用法:
-  python3 verify-dashboard.py --kibana http://127.0.0.1:5601
-  python3 verify-dashboard.py --kibana http://127.0.0.1:5601 --dash bench-geo
-  python3 verify-dashboard.py --kibana http://127.0.0.1:5601 --json
+CLI 才访问 Kibana；verify_dashboard / verify_dashboards 接受模拟请求函数，方便离线测试。
+0 是合法值；时间戳、桶数、全 null、NaN/Infinity 不能当作出数证据。
 """
 import argparse
+import copy
 import datetime
 import json
+import math
 import re
 import sys
-import urllib.error
 import urllib.request
 
 KIBANA = 'http://127.0.0.1:5601'
 VIS_DATA = '/api/metrics/vis/data'
 
 
-# ---------------------------------------------------------------- HTTP
 def kget(path):
     req = urllib.request.Request(KIBANA + path, headers={'kbn-xsrf': 'true'})
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -39,182 +25,219 @@ def kget(path):
 
 
 def kpost(path, body):
-    req = urllib.request.Request(KIBANA + path, data=json.dumps(body).encode('utf-8'),
-                                 method='POST',
+    req = urllib.request.Request(KIBANA + path, data=json.dumps(body).encode(),
                                  headers={'kbn-xsrf': 'true', 'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=180) as r:
         return json.loads(r.read())
 
 
 def find_all(so_type, per_page=100):
-    """分页拉完某类型的全部 saved object"""
     out, page = [], 1
     while True:
-        r = kget('/api/saved_objects/_find?type=%s&per_page=%d&page=%d' % (so_type, per_page, page))
-        out.extend(r.get('saved_objects', []))
-        total = r.get('total', 0)
-        if len(out) >= total or not r.get('saved_objects'):
+        result = kget('/api/saved_objects/_find?type=%s&per_page=%d&page=%d' % (so_type, per_page, page))
+        batch = result['saved_objects']
+        if not isinstance(batch, list):
+            raise ValueError('saved_objects 不是数组')
+        out.extend(batch)
+        total = result['total']
+        if len(out) >= total:
             return out
+        if not batch:
+            raise ValueError('saved_objects 分页提前结束')
         page += 1
 
 
-# ---------------------------------------------------------------- 时间窗
-def to_epoch_ms(value, fallback):
-    """看板里的 timeFrom/timeTo：支持 'now-90d' 这类相对写法与 ISO 绝对时间"""
+def to_epoch_ms(value, now_ms, fallback=None):
     if not value:
-        return fallback
-    v = str(value).strip()
-    if v.startswith('now'):
-        m = re.match(r'^now([+-]\d+)([smhdw])$', v)
-        if m:
-            n = int(m.group(1))
-            unit = {'s': 'seconds', 'm': 'minutes', 'h': 'hours',
-                    'd': 'days', 'w': 'weeks'}[m.group(2)]
-            return fallback + n * {'seconds': 1000, 'minutes': 60000, 'hours': 3600000,
-                                   'days': 86400000, 'weeks': 604800000}[unit]
-        return fallback
-    try:
-        t = v.replace('Z', '+00:00')
-        dt = datetime.datetime.fromisoformat(t)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return int(dt.timestamp() * 1000)
-    except ValueError:
-        return fallback
+        return now_ms if fallback is None else fallback
+    if value == 'now':
+        return now_ms
+    match = re.fullmatch(r'now([+-]\d+)([smhdw])', value)
+    if match:
+        return now_ms + int(match[1]) * {'s': 1000, 'm': 60000, 'h': 3600000,
+                                       'd': 86400000, 'w': 604800000}[match[2]]
+    dt = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
-# ---------------------------------------------------------------- 面板校验
+def finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def panel_data(resp, panel_id):
-    """从 TSVB 响应里取出该面板的 series 数据点"""
-    res = resp.get(panel_id)
-    if res is None and len(resp) == 1:
-        res = list(resp.values())[0]
-    if not isinstance(res, dict):
-        return []
+    """只接受精确 panel id 下的有限 y 值；绝不以别的单一响应作兜底。"""
+    if not panel_id or not isinstance(resp, dict) or panel_id not in resp:
+        raise ValueError('TSVB 响应 panel id 不匹配: %r' % panel_id)
+    result = resp[panel_id]
+    if not isinstance(result, dict) or result.get('error') or result.get('errorMessage'):
+        raise ValueError('TSVB 面板错误响应')
+    series = result.get('series')
+    if not isinstance(series, list):
+        raise ValueError('TSVB 响应缺少 series 数组')
     points = []
-    for s in res.get('series', []) or []:
-        # TSVB 7.x/8.x 的时序曲线数据在 data 里（bucket 列表），表格在 buckets 里
+    for item in series:
+        if not isinstance(item, dict):
+            raise ValueError('TSVB series 结构错误')
         for key in ('data', 'buckets'):
-            v = s.get(key)
-            if isinstance(v, list) and v:
-                points.extend(v)
-                break
+            buckets = item.get(key)
+            if buckets is None:
+                continue
+            if not isinstance(buckets, list):
+                raise ValueError('TSVB bucket 不是数组')
+            for bucket in buckets:
+                if isinstance(bucket, (list, tuple)) and len(bucket) == 2:
+                    if finite_number(bucket[1]):
+                        points.append(bucket)
+                elif isinstance(bucket, dict) and finite_number(bucket.get('value')):
+                    points.append(bucket)
+            break
     return points
+
+
+def resolve_panel(panel, refs):
+    """直接 id 与引用名两种合法形态；显式引用缺失不静默跳过。"""
+    name = panel.get('panelRefName')
+    if name is not None:
+        if name in refs:
+            return refs[name]
+        index = panel.get('panelIndex')
+        if isinstance(name, str) and index is not None and name == 'panel_' + str(index) and str(index) in refs:
+            return refs[str(index)]
+        raise ValueError('面板引用缺失: %s' % name)
+    if panel.get('id'):
+        return panel['id']
+    index = panel.get('panelIndex')
+    if index in refs:
+        return refs[index]
+    raise ValueError('面板没有可解析的 visualization 引用')
+
+
+def _result(dashboard):
+    return {'dashboard': dashboard.get('id'), 'title': dashboard.get('attributes', {}).get('title'),
+            'checked': 0, 'ok': 0, 'empty': 0, 'failed': 0, 'skipped': 0, 'details': []}
+
+
+def verify_dashboard(dashboard, visualizations, post, now_ms):
+    report = _result(dashboard)
+
+    def fail(identifier, error):
+        report['failed'] += 1
+        report['details'].append({'id': identifier, 'error': str(error)[:300]})
+
+    try:
+        attrs = dashboard['attributes']
+        panels = json.loads(attrs['panelsJSON'])
+        if not isinstance(panels, list) or not panels:
+            raise ValueError('dashboard panelsJSON 为空或不是数组')
+        source = json.loads(attrs['kibanaSavedObjectMeta']['searchSourceJSON'])
+        if not isinstance(source, dict):
+            raise ValueError('dashboard searchSourceJSON 结构损坏')
+        query = source.get('query') or {'query': '', 'language': 'kuery'}
+        if not isinstance(query, dict) or query.get('language') not in ('kuery', 'lucene'):
+            raise ValueError('dashboard query 结构损坏')
+        if not isinstance(query.get('query'), str):
+            raise ValueError('dashboard query 必须为字符串')
+        filters = source.get('filter') or []
+        if not isinstance(filters, list):
+            raise ValueError('dashboard filters 结构损坏')
+        lo = to_epoch_ms(attrs.get('timeFrom'), now_ms, now_ms - 30 * 86400000)
+        hi = to_epoch_ms(attrs.get('timeTo'), now_ms)
+        if lo >= hi:
+            raise ValueError('dashboard 时间窗无效')
+        refs = {}
+        for ref in dashboard.get('references') or []:
+            if ref.get('type') == 'visualization':
+                if ref['name'] in refs:
+                    raise ValueError('dashboard 引用名重复')
+                refs[ref['name']] = ref['id']
+    except (KeyError, TypeError, ValueError) as exc:
+        fail(dashboard.get('id'), exc)
+        return report
+
+    for panel in panels:
+        vid = None
+        try:
+            if not isinstance(panel, dict):
+                raise ValueError('panel 不是对象')
+            if panel.get('type') != 'visualization':
+                raise ValueError('不支持验收的面板类型: %r' % panel.get('type'))
+            vid = resolve_panel(panel, refs)
+            if vid not in visualizations:
+                raise ValueError('visualization 对象缺失: %s' % vid)
+            vis = visualizations[vid]
+            state = json.loads(vis['attributes']['visState'])
+            if not isinstance(state, dict) or not isinstance(state.get('params'), dict):
+                raise ValueError('visState 结构损坏')
+            if state.get('type') == 'markdown':
+                if not isinstance(state['params'].get('markdown'), str):
+                    raise ValueError('markdown visState 损坏')
+                report['skipped'] += 1
+                continue
+            if state.get('type') != 'metrics':
+                raise ValueError('不支持验收的 visualization 类型')
+            params = copy.deepcopy(state['params'])
+            if not params.get('id') or not isinstance(params.get('series'), list) or not params['series']:
+                raise ValueError('TSVB params 缺少 id/series')
+            flt = params.get('filter')
+            if not isinstance(flt, dict) or flt.get('language') not in ('lucene', 'kuery') or not isinstance(flt.get('query'), str):
+                raise ValueError('TSVB filter 结构损坏')
+            # 保留各自语言，不把 KQL 字符串误当 Lucene；运行时与看板一样叠加查询。
+            body = {'panels': [params], 'query': [query] if query['query'].strip() else [],
+                    'filters': copy.deepcopy(filters), 'timerange': {'min': lo, 'max': hi}}
+            report['checked'] += 1
+            points = panel_data(post(VIS_DATA, body), params['id'])
+            if points:
+                report['ok'] += 1
+            else:
+                report['empty'] += 1
+                report['details'].append({'id': vid, 'error': '没有有限数值点（null/NaN/inf 不算出数）'})
+        except Exception as exc:  # 包括模拟/真实 HTTP 错误，全部计入失败
+            fail(vid or dashboard.get('id'), exc)
+    return report
+
+
+def verify_dashboards(dashboards, visualizations, post, prefix=None, now_ms=None):
+    selected = [d for d in dashboards if prefix is None or d.get('id', '').startswith(prefix)]
+    if not selected:
+        return {'passed': False, 'errors': ['没有匹配的 dashboard'], 'results': []}
+    if now_ms is None:
+        now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    vis = {v['id']: v for v in visualizations}
+    reports = [verify_dashboard(d, vis, post, now_ms) for d in selected]
+    checked = sum(r['checked'] for r in reports)
+    errors = [] if checked else ['未验收任何 TSVB 面板']
+    return {'passed': not errors and all(not (r['empty'] or r['failed']) for r in reports),
+            'errors': errors, 'results': reports}
 
 
 def main():
     global KIBANA
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--kibana', default=KIBANA)
-    ap.add_argument('--dash', default=None, help='只校验指定看板（id 前缀匹配）')
-    ap.add_argument('--json', action='store_true', help='输出 JSON')
+    ap.add_argument('--dash', help='dashboard id 前缀')
+    ap.add_argument('--json', action='store_true')
     args = ap.parse_args()
     KIBANA = args.kibana
-
-    version = (kget('/api/status').get('version') or {}).get('number', '?')
-    dashboards = find_all('dashboard')
-    vis = {v['id']: v for v in find_all('visualization')}
-
-    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    results = []
-    for d in dashboards:
-        did = d['id']
-        if args.dash and not did.startswith(args.dash):
-            continue
-        attrs = d.get('attributes', {})
-        panels = json.loads(attrs.get('panelsJSON') or '[]')
-        # 看板级 KQL（默认 valid: true）
-        kql = ''
-        try:
-            src = json.loads((attrs.get('kibanaSavedObjectMeta') or {}).get('searchSourceJSON') or '{}')
-            kql = ((src.get('query') or {}).get('query') or '').strip()
-        except Exception:                                       # noqa: BLE001
-            pass
-        lo = to_epoch_ms(attrs.get('timeFrom'), now_ms - 90 * 86400000)
-        hi = to_epoch_ms(attrs.get('timeTo'), now_ms)
-
-        checked = ok = empty = failed = skipped = 0
-        details = []
-        # 面板 → 可视化对象的 id 有两种形态：
-        #   老对象直接把 id 写在 panelsJSON 里；
-        #   经 Kibana 的 dashboard 迁移（7.11+ / 8.x）后改写成
-        #   panelRefName + references —— 7.17 实测：references 的 name 是
-        #   panelIndex（"2"），面板侧是 panelRefName（"panel_2"），两边对不上
-        #   名字，要按 panelIndex 关联。
-        ref_map = {r.get('name'): r.get('id')
-                   for r in (d.get('references') or []) if r.get('name')}
-
-        def resolve(panel):
-            keys = [panel.get('id'), panel.get('panelRefName'),
-                    (panel.get('panelRefName') or '').replace('panel_', ''),
-                    panel.get('panelIndex')]
-            for k in keys:
-                if k and k in ref_map:
-                    return ref_map[k]
-            return None
-
-        for p in panels:
-            if p.get('type') != 'visualization':
-                continue
-            vid = resolve(p)
-            vo = vis.get(vid) if vid else None
-            if not vo:
-                continue
-            try:
-                vs = json.loads(vo.get('attributes', {}).get('visState') or '{}')
-            except Exception:                                   # noqa: BLE001
-                continue
-            if vs.get('type') != 'metrics':                     # markdown / 段标题
-                skipped += 1
-                continue
-            params = json.loads(json.dumps(vs.get('params') or {}))
-            # 把看板级 KQL 并进面板 filter，还原看板真实口径
-            flt = params.get('filter') or {}
-            if isinstance(flt, dict) and kql:
-                base = (flt.get('query') or '').strip()
-                flt['query'] = '(%s) AND (%s)' % (kql, base) if base else kql
-                params['filter'] = flt
-            checked += 1
-            try:
-                resp = kpost(VIS_DATA, {'panels': [params],
-                                        'timerange': {'min': lo, 'max': hi}})
-                pts = panel_data(resp, params.get('id'))
-                if pts:
-                    ok += 1
-                else:
-                    empty += 1
-                    details.append({'id': vid, 'title': vo.get('attributes', {}).get('title'),
-                                    'filter': (params.get('filter') or {}).get('query')})
-            except urllib.error.HTTPError as e:
-                failed += 1
-                body = e.read().decode('utf-8', 'replace')[:200]
-                details.append({'id': vid, 'error': 'HTTP %s %s' % (e.code, body)})
-            except Exception as e:                               # noqa: BLE001
-                failed += 1
-                details.append({'id': vid, 'error': str(e)[:200]})
-        results.append({'dashboard': did, 'title': attrs.get('title'),
-                        'checked': checked, 'ok': ok, 'empty': empty,
-                        'failed': failed, 'skipped': skipped,
-                        'details': details})
-
+    try:
+        version = kget('/api/status')['version']['number']
+        result = verify_dashboards(find_all('dashboard'), find_all('visualization'), kpost, args.dash)
+        result['kibana'] = version
+    except Exception as exc:
+        result = {'passed': False, 'errors': [str(exc)], 'results': []}
     if args.json:
-        print(json.dumps({'kibana': version, 'results': results},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print('Kibana %s · 校验 %d 个看板' % (version, len(results)))
-        tot_ok = tot_empty = tot_failed = 0
-        for r in results:
-            print('  %-14s TSVB 面板 %3d 个：出数 %3d / 空 %2d / 失败 %2d  %s'
-                  % (r['dashboard'], r['checked'], r['ok'], r['empty'], r['failed'],
-                     r['title'] or ''))
-            for det in r['details'][:5]:
-                print('       - %s %s' % (det.get('id'),
-                                         det.get('error') or det.get('title')))
-            tot_ok += r['ok']; tot_empty += r['empty']; tot_failed += r['failed']
-        print('  合计：出数 %d / 空 %d / 失败 %d' % (tot_ok, tot_empty, tot_failed))
-
-    bad = sum(r['empty'] + r['failed'] for r in results)
-    return 1 if bad else 0
+        print('PASS' if result['passed'] else 'FAIL')
+        for error in result['errors']:
+            print('  ' + error)
+        for report in result['results']:
+            print('  %s: checked=%d ok=%d empty=%d failed=%d skipped=%d' % (
+                report['dashboard'], report['checked'], report['ok'], report['empty'], report['failed'], report['skipped']))
+            for detail in report['details']:
+                print('    %s: %s' % (detail['id'], detail['error']))
+    return 0 if result['passed'] else 1
 
 
 if __name__ == '__main__':

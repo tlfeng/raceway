@@ -28,7 +28,7 @@ class KnnParamSource:
         return self
 
     def params(self):
-        result = {"index": self._index_name, "cache": self._params.get("cache", False), "size": self._params.get("k", 10)}
+        result = {"index": self._index_name, "cache": self._params.get("cache", False)}
 
         if self._exact_scan:
             result["body"] = {
@@ -53,6 +53,8 @@ class KnnParamSource:
                 },
                 "_source": False,
             }
+        # Rally search runner 只发送 body，不读取外层 size。
+        result["body"]["size"] = self._params.get("k", 10)
         self._iters += 1
         if self._iters >= len(self._queries):
             self._iters = 0

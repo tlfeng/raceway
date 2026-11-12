@@ -27,6 +27,8 @@
 # ============================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+RACEWAY_ENV_OPTIONAL=1
+source "$HERE/vm-bench-lib.sh" || exit 1
 
 # campaigns 目录：环境变量 RESULTS_ROOT > vm-bench.env 里的 RESULTS_ROOT > ./campaigns
 # （env 文件在子 shell 里 source 取值，不污染本脚本；stop-campaign.sh 用 --print-root 问它）
@@ -63,18 +65,6 @@ fmt_epoch() { date -d "@$1" '+%F %T' 2>/dev/null || date -r "$1" '+%F %T'; }
 restore_mtime() {  # restore_mtime <file> <epoch>
   touch -d "@$2" "$1" 2>/dev/null || touch -t "$(date -r "$2" '+%Y%m%d%H%M.%S')" "$1"
 }
-pid_cmd() { ps -p "$1" -o command= 2>/dev/null; }
-# "runner 活着" = 有 shell 进程在执行 run-bench.sh。pgrep -f 匹配整条命令行，
-# vim/tail/less/ssh 命令行里带这个文件名的也会命中，所以再按 comm 过滤只留 shell。
-runner_pids() {
-  local p
-  for p in $(pgrep -f 'run-bench[.]sh' 2>/dev/null); do
-    case "$(ps -p "$p" -o comm= 2>/dev/null)" in
-      bash|sh|dash|zsh|*/bash|*/sh|*/dash|*/zsh) echo "$p";;
-    esac
-  done
-}
-runner_alive() { [ -n "$(runner_pids)" ]; }
 
 # 与 bench-queue.build_campaign 同语义：结束行必须出现在最后一次起跑头之后。
 is_ended() {
@@ -82,23 +72,13 @@ is_ended() {
 }
 
 # 活跃判定；返回 0 = 活着（不能收尾），并在 stdout 给出原因
-is_live() {  # is_live <cid> <dir>
+is_live() {  # is_live <cid> <dir>；锁忙也不能补结束行
   local cid="$1" dir="$2" pid
-  if [ -f "$dir/RUNNER.pid" ]; then
-    pid=$(tr -dc '0-9' < "$dir/RUNNER.pid")
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_cmd "$pid" | grep -q 'run-bench'; then
-      echo "RUNNER.pid $pid 仍是活着的 run-bench.sh"; return 0
-    fi
-    return 1   # 有 pid 文件但进程已不在 → 明确已死
+  if pid=$(runner_meta_pid "$dir"); then
+    echo "RUNNER.pid $pid 身份验证通过"; return 0
   fi
-  if pgrep -f "esrally.*campaign:${cid}," >/dev/null 2>&1; then
-    echo "有 esrally 进程带 campaign:$cid"; return 0
-  fi
-  if [ "$FORCE" != 1 ] && runner_alive; then
-    local age=$(( ( $(date +%s) - $(mtime_of "$dir/PROGRESS.txt") ) / 60 ))
-    if [ "$age" -lt "$STALE_MIN" ]; then
-      echo "宿主机有 run-bench.sh 在跑且进度文件 ${age} 分钟前刚更新（--force 可忽略）"; return 0
-    fi
+  if [ -f "$ROOT/.runner.lock" ] && ! (exec 9> "$ROOT/.runner.lock"; flock -n 9); then
+    echo "实例 runner 锁忙，不能确认该 campaign 已停止"; return 0
   fi
   return 1
 }

@@ -1,0 +1,15 @@
+{
+  "settings": { "index": { "number_of_shards": 3, "number_of_replicas": 0 } },
+  "mappings": {
+    "dynamic": "false",
+    "_source": { "enabled": false },
+    "properties": {
+      "docid": { "type": "keyword" },
+      "emb": {
+        "type": "dense_vector", "element_type": "float", "dims": 768,
+        "index": true, "similarity": "dot_product",
+        "index_options": { "type": "hnsw", "m": 32, "ef_construction": 100 }
+      }
+    }
+  }
+}

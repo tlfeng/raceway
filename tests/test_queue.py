@@ -185,8 +185,8 @@ class TestLegacyCampaign(unittest.TestCase):
         d = make_legacy_campaign(self.root, 'c4', cars, tracks, rounds,
                                  [(f, 'VALID', 20) for f in expected])
         # 时间线：jdk26-r1 / jdk27-r1 先失败，修好后重跑 → 同一 fid 在中间再出现一次
-        events = [('jdk26-ds-j1024-r1', 1), ('jdk27-ds-j1024-r1', 1),
-                  ('jdk26-ds-j1024-r1', 1), ('jdk27-ds-j1024-r1', 1),
+        events = [('jdk26-ds-j1024-r1', 1), ('jdk27-ds-j1024-r1', 2),
+                  ('jdk26-ds-j1024-r1', 1), ('jdk27-ds-j1024-r1', 2),
                   ('jdk27-ds-j1024-r2', 3), ('jdk26-ds-j1024-r2', 4)]
         lines = ['[2026-10-20 10:00:00] campaign c4 启动: cars=[%s] tracks=%s rounds=%d'
                  % (' '.join(cars), ' '.join(tracks), rounds)]

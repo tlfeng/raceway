@@ -33,8 +33,8 @@ git 里是什么，跑的就是什么。回答一个问题：**跑结果用的�
 | `hv1024/` | ✅ 定义齐；起跑前补 `queries.json`（`bzcat $HV_QUERIES_BZ2 \| head -2000`）与语料软链 `ln -sfn $HV_CORPUS documents-1024.json`（1M×1024 维，22 739 096 214 字节，断言在 track.json） | m=32/efC=100；`_source` **整个关掉**（`enabled: false`） |
 | `hv1024x/` | ✅ 完整（四臂收成一份定义 + params） | 1024 维量化/压缩四臂：**一份基座定义**，各臂差异只由两个参数维度表达 —— 量化档 `vector_index_type=int8_hnsw\|bbq_hnsw`（`index_options.type`）、压缩档 `index_codec=ZSTD + source_reuse=true`（settings，**仅 Easysearch**）。量化/压缩两侧通用性：int8/bbq 两侧通用（ES 8.19.23 与 ez 都能建），ZSTD+sr 仅 ez。`create-only` 建索引探针随基座保留。索引名 `vectors`，语料同 hv1024（VARIANT.txt 记台账）；`queries-recall.jsonl`/`truth.jsonl` 为 recall 探针数据，不进 git。结论：`REPORT-hvbbq-1024维量化压缩对比-20261104.md` |
 
-| `ds-j{512,768,1024,1536,2048}`、`ds-g{960,1920}` | ⏳ **待从压测机回灌**（`$ROOT/tracks/ds-*` 定义文件，不含语料；生成器已不在树内，静态定版是唯一留存机会） | 语料在 `$ROOT/corpora-ds/`；起跑时由 run-bench 修链 + 自检（维度/条数/字节/查询维数） |
-| `hnsw2m-2m`（→ 建议落 `hnsw/`，分片 params 化） | ⏳ 待从压测机回灌（手工搭的基座） | 96 维 200 万向量 |
+| `ds-j{512,768,1024,1536,2048}`、`ds-g{960,1920}` | ✅ 完整（20261112 自压测机回灌定版；与部署机逐字节比对一致，`esrally info` 七个全过） | dimsweep 语料不进 git（部署机 `$ROOT/corpora-ds/` 与软链）；起跑时由 run-bench 修链 + 自检（维度/条数/字节/查询维数） |
+| `hnsw/` | ✅ 完整（20261112 自压测机回灌定版：原 `hnsw2m-2m-s3` 现生成流程退役，分片 params 化默认 3，`index_codec`/`source_reuse`/`encrypted_store` 条件块在位 → `hnsw-codec-*` 变体可用） | 96 维 200 万向量，`dynamic: strict`；语料/查询集不进 git（`TRACK_HNSW_BASE` 指向二者所在目录，起跑时软链） |
 | `hvtp200k-2s/3s` | 🗑 一次性，不回灌（需要时分片走 params） | |
 
 > **为什么 `hv1024` 与 `hv1024x` 不合并成一份**：
@@ -50,7 +50,7 @@ git 里是什么，跑的就是什么。回答一个问题：**跑结果用的�
 
 - **直接消费**：`vm-bench-lib.sh` 的 `track_dir` 把赛道 id 映射到本目录下的子目录
   （`geo → tracks/geonames`、`hv1024 → tracks/hv1024`、`nested → tracks/nested`、
-  `hv1024x*` 四臂 → `tracks/hv1024x`）。
+  `hv1024x*` 四臂 → `tracks/hv1024x`、`hnsw → tracks/hnsw`、`ds-*` 同名目录）。
   跑的就是 git 里这一份定义，**没有第二份运行时生成的副本**。
   编排层的 track id 仍叫 `geo`（不改名：跑分的场次名与入库口径不能漂）。
 - **起跑前只补 git 收不了的产物**（`run-bench.sh` 的 `prepare_tracks`）：语料软链（GB 级）、
@@ -66,27 +66,41 @@ git 里是什么，跑的就是什么。回答一个问题：**跑结果用的�
   里有没有对应条件块——少一个条件块，该维度会**静默失效**（压缩臂跑成同一个 / 量化臂跑成
   hnsw 基座，数据看着正常、结论全废），所以起跑前就挡住。
 
+## 搜索预算与更新对照协议
+
+hv1024 六个目录的 ANN/exact 分支都在**最终 body** 写入 `size=k`，分别返回10/100条。
+请求参数不能靠 Rally 参数字典外层的 size 表达。操作名保留 `knn-search-10-100` /
+`knn-search-100-1000`，但末尾数字在不同引擎中**不表示等价工作量**：
+
+| 赛道 / 引擎 | operation 参数 → 最终请求 | 实际口径 |
+|---|---|---|
+| hv1024 / hv1024x，ES/Easysearch HNSW | num-candidates → knn.num_candidates=100/1000 | 每分片近邻候选预算 |
+| hv1024x-bbqdisk，ES | num-candidates → knn.num_candidates=100/1000 | bbq_disk 自有聚类/访问策略；不是 HNSW ef_search，也未固定 visit_percentage |
+| hv1024x-os / os-bbq，Lucene HNSW | ef-search → query.knn.emb.method_parameters.ef_search=100/1000 | 搜索宽度 max(k,ef_search)，量化策略依引擎 |
+| hv1024x-os-disk，Faiss HNSW | ef-search → method_parameters.ef_search=100/1000；oversample-factor → rescore.oversample_factor=2.0 | 显式 on_disk + 32x + m32/efC100，不是 IVF |
+
+OS disk 协议要求 OpenSearch ≥3.3；Lucene fp32/BBQ 定义的目标版本为 ≥3.6。
+ES bbq_disk 与 OS on_disk 只是驻盘策略对照，**并非同算法**。比较需固定查询集、返回 k，
+并提供相近实测 recall 的证据；不能把相同预算数字/任务名称当成跨引擎可比性的保证。
+
+`geonames-upsert` 的五个写操作统一 `bulk_size:500`、`bulk_indexing_clients:8`（都可覆盖），
+共享自然 geonameid 分区与顺序。cold/index 写 `raceway_revision:0`，hot/native 写1，mixed写2；
+所有 update 显式 `detect_noop:false`。native 基座先 index 同一自然 ID 全集，再逐 ID 纯 update，
+不使用 conflicts 模型；hot/native 文档内容相同，仅有无 doc_as_upsert 不同。完整协议见
+[geonames-upsert/README.md](geonames-upsert/README.md)。
+
+离线运行时回归在 `tests/test_track_runtime.py`，不依赖 esrally，不读取真实 terms/语料，
+以合成数据和可审计请求桩检查 body、ID、更新内容、分区及任务参数。
+
 ## 还没切完的部分（压测机侧，一次性）
 
-1. **geonames 挑战比对**：仓库里的 `tracks/geonames/challenges/{write-only,query-only}.json`
-   是从上游 `append-no-conflicts` 机械派生的；压测机基座 `$ROOT/tracks/geo/challenges/`
-   里的同名文件是 raceway 自己那份。切之前逐字比对一次：
-   ```bash
-   diff $ROOT/tracks/geo/challenges/write-only.json $ROOT/tracks/geonames/challenges/write-only.json
-   diff $ROOT/tracks/geo/challenges/query-only.json $ROOT/tracks/geonames/challenges/query-only.json
-   ```
-   有实质差异 → 以压测机那份为准回灌进 git，再切（别让口径在切换当天悄悄变）。
-2. **ds-* 定义回灌**：`$ROOT/tracks/ds-*`（不含语料）落进 git，语料留机器。
-3. **hnsw 基座回灌**：`hnsw2m-2m` 还在机器上（`$ROOT/tracks/hnsw2m-2m`），它的
-   `index.json` 没有 `index_codec` 条件块 → `hnsw-codec-*` 变体会被
-   `track_assert_storage_params` **直接拦下**（这是有意的：条件块缺失时压缩档会静默失效）。
-   回灌时顺手把条件块补上，压缩变体才能用。
-4. **旧目录清理**：压测机上的 `tracks/geo/`、`tracks/hv1024-s3/`、`tracks/nested-s3/`、
-   `tracks/geo-codec-*/` 切换后不再被使用，确认无回灌需求再删；
+1. **旧目录清理**：压测机上的 `tracks/hv1024-s3/`、`tracks/nested-s3/`、
+   `tracks/geo-codec-*/`、`tracks/hnsw2m-2m-s3/`（含旧 `hnsw2m-2m` 基座，已随 20261112
+   回灌定版进 `tracks/hnsw/` 而退役）切换后不再被使用，确认无回灌需求再删；
    量化族同理（旧的 `tracks/hv1024x-int8/`、`-bbq/`、`-codec-zstd-sr/` 三份目录，
    机器上被 gitignore 的语料软链等残留还在，可手动清理）。
    ⚠️ 旧目录里的 `queries.json` / 语料软链是 gitignore 的产物，pull 不会自动清掉——
-   留着不影响（runner 只认 `tracks/hv1024x`），但别被它们误导成"还在用"。
-5. **编排台与看板的 `geo` 键**：编排层的 track id 保持 `geo` 不变，因此
+   留着不影响（runner 只认定版目录），但别被它们误导成"还在用"。
+2. **编排台与看板的 `geo` 键**：编排层的 track id 保持 `geo` 不变，因此
    `bench-compose.py` 的 `'geo'` 键、RACES.md 记账、看板 `track:'geo'` 过滤**都不用改**
    （改名会让已有数据的口径漂移）；只有真要把 id 改成 `geonames` 时才需要联动。
