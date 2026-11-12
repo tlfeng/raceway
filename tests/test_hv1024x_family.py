@@ -147,6 +147,21 @@ class TestHv1024xFamily(unittest.TestCase):
         self.assertIn('"name": "write-only"', txt)
         self.assertIn('"name": "query-only"', txt)
 
+    def test_dir_family_force_merge_not_recorded(self):
+        """独立目录成员的 force-merge 必须停记指标（include-in-reporting: false）。
+
+        合并成本泄漏进 write/query 数字 = 单段门禁的成本记到了查询头上
+        （hv1024 族在 90773a6 修过，os 族是同一口径的独立目录，漏网在此补齐）。
+        """
+        for d in ('hv1024x-os', 'hv1024x-os-bbq', 'hv1024x-os-disk', 'hv1024x-bbqdisk'):
+            p = os.path.join(ROOT, 'tracks', d, 'challenges', 'default.json')
+            txt = _read(p)
+            self.assertIn('"name": "force-merge"', txt, '%s 缺 force-merge' % p)
+            fm_line = [l for l in txt.splitlines() if '"operation-type": "force-merge"' in l]
+            self.assertEqual(len(fm_line), 1, '%s force-merge 行数不对' % p)
+            self.assertIn('"include-in-reporting": false', fm_line[0],
+                          '%s 的 force-merge 仍在记指标（合并成本会漏进写/查数字）' % p)
+
 
 if __name__ == '__main__':
     unittest.main()

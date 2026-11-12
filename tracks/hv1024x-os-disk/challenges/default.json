@@ -15,7 +15,7 @@
     { "name": "refresh-after-index", "operation": { "operation-type": "refresh", "request-timeout": 1200, "include-in-reporting": true } },
     {
       "name": "force-merge",
-      "operation": { "operation-type": "force-merge", "mode": "polling", "max-num-segments": {{max_num_segments | default(1)}}, "request-timeout": 7200, "include-in-reporting": true }
+      "operation": { "operation-type": "force-merge", "mode": "polling", "max-num-segments": {{max_num_segments | default(1)}}, "request-timeout": 7200, "include-in-reporting": false }
     },
     { "name": "refresh-after-force-merge", "operation": "refresh" },
     {

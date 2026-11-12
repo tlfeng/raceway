@@ -516,8 +516,10 @@ q = q.strip().rstrip(",")
 merge_ops = []
 if '"force-merge"' not in w:  # 写段已自带 merge（如 nested-s3 / geonames write-only）就不重复插
     merge_ops = [
+        # include-in-reporting=false：合并成本不进 write/query 指标
+        # （与 hv1024 族 baked challenge 的 90773a6 同一口径；派生路径漏了这层）
         '{ "operation": { "operation-type": "force-merge", "max-num-segments": 1,'
-        ' "request-timeout": 7200 } }',
+        ' "request-timeout": 7200, "include-in-reporting": false } }',
         '{ "name": "refresh-after-force-merge", "operation": "refresh" }',
         '{ "name": "wait-until-merges-finish",'
         ' "operation": { "operation-type": "index-stats", "index": "_all",'
