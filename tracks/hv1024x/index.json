@@ -2,7 +2,7 @@
   "settings": {
     "index": {
       "number_of_shards": 3,
-      "number_of_replicas": 0
+      "number_of_replicas": 0{% if encrypted_store is defined and encrypted_store %}, "store.type": "encrypted", "encryption.profile": "index"{% endif %}
     }{% if index_codec is defined %}, "index.codec": "{{index_codec}}"{% endif %}{% if source_reuse is defined and source_reuse %}, "index.source_reuse": true{% endif %}
   },
   "mappings": {
