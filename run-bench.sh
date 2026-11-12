@@ -576,6 +576,25 @@ ibs_ready_wait() { # <engine> <timeout_sec> <logfile>
   return 1
 }
 
+# 清掉三节点上两个引擎的**遗留索引数据**（data 目录内容），目录本身保留并修正属主。
+# 调用时机：每场 race 的最开头（引擎切换之前）——此时没有引擎在跑，清空无副作用；
+# 随后的 ibs wipe 会重建 data 并冷启动。
+# 为什么必须清：precheck 发生在引擎切换之前，上一场的索引还躺在盘上时，
+#   bbqdisk 赛道（每场 ~35G）会把磁盘压到卡点（<20G）以下 → 本场直接 SKIP，
+#   重试也救不回来（残留还在）。20261112 当天因此连挂多场。
+purge_stale_index_data() {
+  local ip out
+  for ip in "${VM_IPS[@]}"; do
+    out=$(vm "$ip" 'for d in /infini/easysearch /infini/elasticsearch; do
+            [ -d "$d/data" ] || continue
+            sz=$(du -sg "$d/data" 2>/dev/null | cut -f1)
+            rm -rf "$d/data" && mkdir -p "$d/data" && chown $(stat -c "%U" "$d"):$(stat -c "%U" "$d") "$d/data"
+            echo "$(basename $d)=${sz}G"
+          done' 2>/dev/null)
+    [ -n "$out" ] && PROGSTEP "  清理上一场残留索引数据 ${ip}: $out"
+  done
+}
+
 # 确保引擎已安装且 build 正确。以 ip.txt 第4列完整 build 号为部署状态单一事实来源
 # （REST 只报 version core，无法区分 build 号 → live 探测对 build 差异必然漏判）。
 ensure_engine() { # <engine>
@@ -1032,6 +1051,12 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
   local sidx; sidx=$(track_index "$tk")
   [ -n "$sidx" ] && curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
     "https://${VM_IPS[0]}:$HTTP_PORT/$sidx/_settings?flat_settings=true" > "$d/index-settings.txt" 2>&1 || true
+  # 每分片真实段数（force merge 后应为每分片 1 段；段数没收敛就不该进查询口径）
+  [ -n "$sidx" ] && curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
+    "https://${VM_IPS[0]}:$HTTP_PORT/$sidx/_segments" > "$d/index-segments.txt" 2>&1 || true
+  # 实测生效的映射（dot_product / index_options.type —— 决定跑的是不是目标量化格式）
+  [ -n "$sidx" ] && curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
+    "https://${VM_IPS[0]}:$HTTP_PORT/$sidx/_mapping" > "$d/index-mapping.txt" 2>&1 || true
   python3 "$LIB_DIR/bench-sidecar.py" --raw "$d" --out "$CAMP_DIR/results/$fid-$ph-sidecar.json" \
     --campaign "$CAMP_ID" --fid "$fid" --phase "$ph" --race-id "$LAST_RACE_ID" \
     --car "$CAR_LABEL" --track "$tk" --challenge "$ch" --round "$rnd" --attempt "$att" \
@@ -1173,6 +1198,13 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local t0=$(date +%s)
 
   PROGSTEP "===== [$seq] $fid 开始 ====="
+
+  # 0) 清上一场遗留的索引数据（两个引擎都清）。
+  #    precheck 跑在引擎切换之前：若上一场的索引还留在盘上（bbqdisk 每场 ~35G），
+  #    磁盘卡点（<20G）会把本场直接 SKIP —— 20261112 当天连挂数场的真根因。
+  #    此刻没有任何引擎在跑（上一场已结束、切换尚未开始），清空最安全；
+  #    后续 ibs wipe 会重建 data 目录并冷启动。
+  purge_stale_index_data
 
   # 1) 清场（只停集群）+ 赛前负载检测（each 模式逐场；once 模式只在 campaign 起跑前查一次）
   ./reset-env.sh all --no-wipe >/dev/null 2>&1
