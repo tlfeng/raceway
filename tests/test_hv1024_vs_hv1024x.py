@@ -42,7 +42,7 @@ def _read(path):
 
 
 def render(tmpl, params):
-    """按 rally 的 Jinja 语义渲染这两份 index.json（只有这几种占位）。"""
+    """按 rally 的 Jinja 语义渲染这两份 index.json（占位清单见各条件分支）。"""
     s = tmpl
     # index_codec 条件块
     if 'index_codec' in params:
@@ -57,6 +57,13 @@ def render(tmpl, params):
                    lambda m: m.group(1), s, flags=re.S)
     else:
         s = re.sub(r'\{%\s*if\s+source_reuse\s+is\s+defined\s+and\s+source_reuse\s*%\}.*?\{%\s*endif\s*%\}',
+                   '', s, flags=re.S)
+    # encrypted_store 条件块（20261112 整改：加密存储改为可选开关，默认关）
+    if params.get('encrypted_store'):
+        s = re.sub(r'\{%\s*if\s+encrypted_store\s+is\s+defined\s+and\s+encrypted_store\s*%\}(.*?)\{%\s*endif\s*%\}',
+                   lambda m: m.group(1), s, flags=re.S)
+    else:
+        s = re.sub(r'\{%\s*if\s+encrypted_store\s+is\s+defined\s+and\s+encrypted_store\s*%\}.*?\{%\s*endif\s*%\}',
                    '', s, flags=re.S)
     # 标量占位
     s = re.sub(r'\{\{\s*number_of_shards\s*\|\s*default\(3\)\s*\}\}', '3', s)
@@ -91,6 +98,27 @@ class TestHv1024FamilySeparation(unittest.TestCase):
                          'hv1024 的 _source 口径变了（应为整个关掉）')
         self.assertEqual(b['mappings']['_source'], {'excludes': ['emb']},
                          'hv1024x 的 _source 口径变了（应为保留 docid、排除 emb）')
+
+    def test_encrypted_store_is_an_opt_in_switch(self):
+        """encrypted_store（20261112 整改）默认关、开了才写 store.type。
+
+        曾经烘焙死 store.type=encrypted 直接把 create-index 打 400（两引擎都不认），
+        rally on-error=continue 静默吞掉后 bulk 自动建了 1 分片默认索引 —— 整轮作废。
+        默认渲染出 settings 里绝不允许出现 store.type。
+        """
+        for d in (A, B):
+            off = json.loads(render(_read(os.path.join(d, 'index.json')), {}))
+            self.assertNotIn('store.type', off['settings'].get('index', {}),
+                             '%s: encrypted_store 关的时候不该有 store.type' % os.path.basename(d))
+            on = json.loads(render(_read(os.path.join(d, 'index.json')),
+                                   {'encrypted_store': 'true'}))
+            idx = on['settings']['index']
+            self.assertEqual(idx.get('store.type'), 'encrypted',
+                             '%s: encrypted_store 开了但 store.type 没写进去' % os.path.basename(d))
+            self.assertEqual(idx.get('encryption.profile'), 'index',
+                             '%s: encryption.profile 没写进去' % os.path.basename(d))
+            self.assertEqual(idx.get('number_of_shards'), 3,
+                             '%s: 开关不影响分片口径' % os.path.basename(d))
 
     def test_both_families_render_valid_json(self):
         for d, params in ((A, {}), (B, {'vector_index_type': 'int8_hnsw'})):
