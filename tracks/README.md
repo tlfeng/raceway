@@ -33,7 +33,7 @@ git 里是什么，跑的就是什么。回答一个问题：**跑结果用的�
 | `hv1024/` | ✅ 定义齐；起跑前补 `queries.json`（`bzcat $HV_QUERIES_BZ2 \| head -2000`）与语料软链 `ln -sfn $HV_CORPUS documents-1024.json`（1M×1024 维，22 739 096 214 字节，断言在 track.json） | m=32/efC=100；`_source` **整个关掉**（`enabled: false`） |
 | `hv1024x/` | ✅ 完整（四臂收成一份定义 + params） | 1024 维量化/压缩四臂：**一份基座定义**，各臂差异只由两个参数维度表达 —— 量化档 `vector_index_type=int8_hnsw\|bbq_hnsw`（`index_options.type`）、压缩档 `index_codec=ZSTD + source_reuse=true`（settings，**仅 Easysearch**）。量化/压缩两侧通用性：int8/bbq 两侧通用（ES 8.19.23 与 ez 都能建），ZSTD+sr 仅 ez。`create-only` 建索引探针随基座保留。索引名 `vectors`，语料同 hv1024（VARIANT.txt 记台账）；`queries-recall.jsonl`/`truth.jsonl` 为 recall 探针数据，不进 git。结论：`REPORT-hvbbq-1024维量化压缩对比-20261104.md` |
 
-| `ds-j{512,768,1024,1536,2048}`、`ds-g{960,1920}` | ⏳ **待从压测机回灌**（`$ROOT/tracks/ds-*` 定义文件，不含语料；生成器已不在树内，静态定版是唯一留存机会） | 语料在 `$ROOT/corpora-ds/`；起跑时由 run-bench 修链 + 自检（维度/条数/字节/查询维数） |
+| `ds-j{512,768,1024,1536,2048}`、`ds-g{960,1920}` | ✅ 完整（20261112 自压测机回灌定版；与部署机逐字节比对一致，`esrally info` 七个全过） | dimsweep 语料不进 git（部署机 `$ROOT/corpora-ds/` 与软链）；起跑时由 run-bench 修链 + 自检（维度/条数/字节/查询维数） |
 | `hnsw2m-2m`（→ 建议落 `hnsw/`，分片 params 化） | ⏳ 待从压测机回灌（手工搭的基座） | 96 维 200 万向量 |
 | `hvtp200k-2s/3s` | 🗑 一次性，不回灌（需要时分片走 params） | |
 
@@ -94,25 +94,18 @@ ES bbq_disk 与 OS on_disk 只是驻盘策略对照，**并非同算法**。比�
 
 ## 还没切完的部分（压测机侧，一次性）
 
-1. **geonames 挑战比对**：仓库里的 `tracks/geonames/challenges/{write-only,query-only}.json`
-   是从上游 `append-no-conflicts` 机械派生的；压测机基座 `$ROOT/tracks/geo/challenges/`
-   里的同名文件是 raceway 自己那份。切之前逐字比对一次：
-   ```bash
-   diff $ROOT/tracks/geo/challenges/write-only.json $ROOT/tracks/geonames/challenges/write-only.json
-   diff $ROOT/tracks/geo/challenges/query-only.json $ROOT/tracks/geonames/challenges/query-only.json
-   ```
-   有实质差异 → 以压测机那份为准回灌进 git，再切（别让口径在切换当天悄悄变）。
-2. **ds-* 定义回灌**：`$ROOT/tracks/ds-*`（不含语料）落进 git，语料留机器。
-3. **hnsw 基座回灌**：`hnsw2m-2m` 还在机器上（`$ROOT/tracks/hnsw2m-2m`），它的
+1. **geonames 挑战比对**（✅ 已过时：压测机旧 `tracks/geo/` 已删，git 里这份就是唯一权威，
+   无从比对也无须比对）。
+2. **hnsw 基座回灌**：`hnsw2m-2m` 还在机器上（`$ROOT/tracks/hnsw2m-2m-s3`），它的
    `index.json` 没有 `index_codec` 条件块 → `hnsw-codec-*` 变体会被
    `track_assert_storage_params` **直接拦下**（这是有意的：条件块缺失时压缩档会静默失效）。
    回灌时顺手把条件块补上，压缩变体才能用。
-4. **旧目录清理**：压测机上的 `tracks/geo/`、`tracks/hv1024-s3/`、`tracks/nested-s3/`、
+3. **旧目录清理**：压测机上的 `tracks/hv1024-s3/`、`tracks/nested-s3/`、
    `tracks/geo-codec-*/` 切换后不再被使用，确认无回灌需求再删；
    量化族同理（旧的 `tracks/hv1024x-int8/`、`-bbq/`、`-codec-zstd-sr/` 三份目录，
    机器上被 gitignore 的语料软链等残留还在，可手动清理）。
    ⚠️ 旧目录里的 `queries.json` / 语料软链是 gitignore 的产物，pull 不会自动清掉——
    留着不影响（runner 只认 `tracks/hv1024x`），但别被它们误导成"还在用"。
-5. **编排台与看板的 `geo` 键**：编排层的 track id 保持 `geo` 不变，因此
+4. **编排台与看板的 `geo` 键**：编排层的 track id 保持 `geo` 不变，因此
    `bench-compose.py` 的 `'geo'` 键、RACES.md 记账、看板 `track:'geo'` 过滤**都不用改**
    （改名会让已有数据的口径漂移）；只有真要把 id 改成 `geonames` 时才需要联动。
