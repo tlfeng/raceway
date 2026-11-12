@@ -10,8 +10,9 @@ raceway 的"队列"现在散在四个文件里，没有统一形态：
 |---|---|---|
 | `PROGRESS.txt`   | 追加文本，逐场时间线（含 write/query 分相位） | runner |
 | `RACES.md`       | 判定表，一场一行；**重试会追加多行**（`-try2`/`-try3`） | runner |
-| `STATE.txt`      | 排程模式断点续跑状态：`OK/FAIL/SKIP <行号>` | runner |
-| `<排程文件>`      | 待跑清单：`<车> <赛道> <轮次> <recall|norecall> <est分钟>` | 人 |
+| `STATE.txt`      | `OK/FAIL/SKIP <基础fid>`，每个 fid 单一最终状态 | runner |
+| `PLAN.tsv`       | 不可变待跑计划：fid/config/track/round/recall/est | runner |
+| `DEADLINE`       | 固定窗底 epoch；0 表示不启用 | runner |
 
 后果是"还剩哪些场次"在非排程模式下**根本不存在**（只在 `run-bench.sh` 的嵌套
 for 循环里），起跑后外部无法知道队列全貌；排程模式下也只有"已跑过的"，没有
@@ -19,8 +20,8 @@ for 循环里），起跑后外部无法知道队列全貌；排程模式下也�
 
 本工具把上面四个文件**推导**成一份队列视图：
 
-- **不改 runner 就能用**（纯读，零侵入）
-- runner 将来落盘 `QUEUE.json` 后优先读它（权威源）
+- 优先读取 runner 落盘的不可变 `PLAN.tsv` 与稳定 fid 键 `STATE.txt`
+- 没有 PLAN 的旧 campaign 才从日志/排程推导；推导不一致时明确标未知
 
 它同时负责暴露四类"看不见的问题"：
 
@@ -45,6 +46,7 @@ for 循环里），起跑后外部无法知道队列全貌；排程模式下也�
 只读，不写任何文件、不碰集群、不碰被测引擎。
 """
 import argparse
+import csv
 import datetime
 import json
 import os
@@ -65,7 +67,7 @@ STATUS_FAILS = (
     'ENGINE-FAIL', 'JDK-SWAP-FAIL', 'JDK-FIX-FAIL', 'JDK-ASSERT-FAIL',
     'COLD-START-FAIL', 'CLUSTER-NOT-READY', 'HEAP-ASSERT-FAIL',
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
-    'SEG-ASSERT-FAIL', 'RACE-FAIL',
+    'SEG-ASSERT-FAIL', 'ENV-FAIL', 'RACE-FAIL',
 )
 KNOWN_STATUS = (STATUS_VALID, STATUS_SKIP, STATUS_DEADLINE) + STATUS_FAILS
 
@@ -478,15 +480,40 @@ def parse_races(text):
 
 
 def parse_state(text):
-    """从 STATE.txt 抽：行号 → [状态, ...]（同一行可能有 FAIL 和 OK 并存）。"""
+    """STATE 的 key 是基础 fid；数字旧格式仅供历史解析，不应用到新计划。"""
     out = {}
     if not text:
         return out
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[0] in ('OK', 'FAIL', 'SKIP'):
-            out.setdefault(int(parts[1]), []).append(parts[0])
+        if len(parts) == 2 and parts[0] in ('OK', 'FAIL', 'SKIP'):
+            key = int(parts[1]) if parts[1].isdigit() else base_fid(parts[1])
+            out.setdefault(key, []).append(parts[0])
     return out
+
+
+def parse_plan(text):
+    """runner 不可变 PLAN.tsv；tab 保留完整配置行中的空格。损坏时不能回落猜计划。"""
+    reader = csv.DictReader((text or '').splitlines(), delimiter='\t')
+    expected = ['fid', 'config', 'track', 'round', 'recall', 'est']
+    if reader.fieldnames != expected:
+        raise ValueError('PLAN.tsv 列头应为 ' + '/'.join(expected))
+    rows, seen = [], set()
+    for line_number, row in enumerate(reader, 2):
+        try:
+            fid, track = row['fid'], row['track']
+            rnd, est = int(row['round']), int(row['est'])
+            suffix = '-%s-r%d' % (track, rnd)
+            if (not fid or not track or not fid.endswith(suffix) or not fid[:-len(suffix)]
+                    or rnd < 1 or est < 0 or fid in seen or not row['config']
+                    or row['recall'] not in ('recall', 'norecall') or None in row):
+                raise ValueError()
+        except (TypeError, ValueError, KeyError):
+            raise ValueError('PLAN.tsv 第 %d 行无效或 fid 重复' % line_number)
+        seen.add(fid)
+        rows.append({'fid': fid, 'car': fid[:-len(suffix)], 'track': track,
+                     'rnd': rnd, 'est': est, 'recall': row['recall']})
+    return rows
 
 
 def parse_schedule(text):
@@ -533,41 +560,68 @@ def build_campaign(src, cid, schedule_override=None):
     c.started_at = prog['started_at']
     c.runner_started_at = prog['runner_started_at']
     c.ended = prog['ended']
+    frozen_plan = src.read(cid, 'PLAN.tsv')
+    deadline_epoch = src.read(cid, 'DEADLINE')
+    if deadline_epoch is not None:
+        try:
+            epoch = int(deadline_epoch.strip())
+            if epoch < 0:
+                raise ValueError()
+            # runner 的进度时间及目录名均为 UTC+8，不依赖观测机的本地时区。
+            local = datetime.timezone(datetime.timedelta(hours=8))
+            c.deadline = (datetime.datetime.fromtimestamp(epoch, local).strftime('%Y-%m-%d %H:%M:%S')
+                          if epoch else '')
+            c.deadlines = [c.deadline] if c.deadline else []
+        except (ValueError, OverflowError, OSError):
+            c.deadline = ''
+            c.deadlines = []
+            c.warnings.append('DEADLINE 文件无效，不能用进度日志猜窗底')
 
     # ---- 1) 排程清单（待跑队列的来源）
-    # 实际执行顺序：时间线里每场的「开始」，按基础 fid 归并。
-    # 归并规则是**首次出现去重**，不是折叠连续重复 —— 重跑是同一场的又一次尝试，
-    # 会把同一个 fid 再次插回时间线。按连续折叠会把这些重跑当成"别处插进来的新场次"，
-    # 顺序比对必然对不上，于是把本来正确的排程误判成"推导不可信"。
+    # runner 的 seq 包含“不兼容跳过”及续跑跳过，只有 start 的列表不是队列前缀。
+    # 同序号/同基础 fid 的重试归并；同序号不同 fid 必须保留给自校验发现。
     observed = []
     seen_obs = set()
     for kind, g in prog['events']:
-        if kind != 'start':
+        if kind not in ('start', 'skip', 'deadline'):
             continue
-        b = base_fid(g[2])
-        if b in seen_obs:
+        item = (int(g[1]), base_fid(g[2]))
+        if item in seen_obs:
             continue
-        seen_obs.add(b)
-        observed.append(b)
+        seen_obs.add(item)
+        observed.append(item)
 
     plan_rows = []
     sched_path = schedule_override or prog['schedule_file']
-    if sched_path:
+    if frozen_plan is not None:
+        c.mode = 'plan'
+        try:
+            plan_rows = parse_plan(frozen_plan)
+            c.cars = list(dict.fromkeys(r['car'] for r in plan_rows))
+            c.tracks = list(dict.fromkeys(r['track'] for r in plan_rows))
+            c.rounds = max((r['rnd'] for r in plan_rows), default=0)
+            c.plan_known = True
+        except ValueError as exc:
+            c.warnings.append(str(exc) + ' —— 不回落读取可变排程文件')
+    elif sched_path:
         resolved = src.resolve(sched_path)
-        # 排程文件不在 campaigns 目录里，按解析出的路径读
         plan_rows = parse_schedule(src.read_abs(resolved))
         c.schedule_file = resolved
         c.mode = 'schedule' if plan_rows else 'schedule?'
-    if not plan_rows:
+    if not plan_rows and frozen_plan is None:
         c.mode = 'legacy' if (c.tracks and c.rounds and c.cars) else 'unknown'
 
     if plan_rows:
-        # 排程文件是权威源：清单直接照它来
+        # PLAN.tsv 优先于可变 schedules 文件；旧 campaign 无 PLAN 才读原排程。
         c.plan_known = True
         for i, r in enumerate(plan_rows, 1):
-            c.fields.append(Field(seq=i, fid='%s-%s-r%d' % (r['car'], r['track'], r['rnd']),
+            c.fields.append(Field(seq=i, fid=r.get('fid') or '%s-%s-r%d' % (r['car'], r['track'], r['rnd']),
                                   car=r['car'], track=r['track'], rnd=r['rnd'],
                                   recall=r['recall'], est=r['est']))
+        if frozen_plan is not None:
+            expected = [(f.seq, f.fid) for f in c.fields]
+            if len(observed) > len(expected) or observed != expected[:len(observed)]:
+                c.warnings.append('实际执行序号/场次与不可变 PLAN.tsv 不一致')
     elif c.mode == 'legacy':
         # 非排程模式：按 run-bench.sh:1067-1075 的展平规则推导
         #（赛道外层 → 轮次 → 车右旋），但**推导必须自校验**：
@@ -582,9 +636,9 @@ def build_campaign(src, cid, schedule_override=None):
                     seq += 1
                     plan.append(Field(seq=seq, fid='%s-%s-r%d' % (car, tk, r),
                                       car=car, track=tk, rnd=r))
-        derived = [f.fid for f in plan]
-        n = min(len(observed), len(derived))
-        consistent = (not observed) or derived[:n] == observed[:n]
+        derived = [(f.seq, f.fid) for f in plan]
+        # 长度不可截到 min：计划外的尾部、序号错位和同序号换身份都应当拒绝。
+        consistent = len(observed) <= len(derived) and observed == derived[:len(observed)]
         if consistent:
             c.plan_known = True
             c.fields.extend(plan)
@@ -698,25 +752,41 @@ def build_campaign(src, cid, schedule_override=None):
         if m:
             f.attempts = max(f.attempts, int(m.group(1)))
 
-    # ---- 5) STATE 合并 + 行号错位检测
-    for seq, sts in sorted(state.items()):
-        f = next((x for x in c.fields if x.seq == seq), None)
+    # ---- 5) STATE 按稳定 fid 合并；新 PLAN 绝不把旧数字 key 猜成行号。
+    for key, sts in sorted(state.items(), key=lambda item: str(item[0])):
+        if isinstance(key, int) and frozen_plan is not None:
+            c.warnings.append('STATE 含旧行号 %d，不能绑定不可变 PLAN 的场次' % key)
+            continue
+        f = (next((x for x in c.fields if x.seq == key), None) if isinstance(key, int)
+             else by_base.get(key))
+        label = ('第 %d 行' % key) if isinstance(key, int) else key
         if f is None:
-            c.warnings.append('STATE 里有第 %d 行的记录，但排程/计划里没有第 %d 行（行号已错位）'
-                              % (seq, seq))
+            c.warnings.append('STATE %s 不在排程/计划中' % label)
             continue
         if len(set(sts)) > 1:
-            c.warnings.append('STATE 第 %d 行同时有 %s 记录（同一行被判过多种结果）'
-                              % (seq, '/'.join(sorted(set(sts)))))
-        if 'OK' in sts and f.status == STATUS_PENDING:
+            c.warnings.append('STATE %s 同时有 %s 记录（同一场被判过多种结果）'
+                              % (label, '/'.join(sorted(set(sts)))))
+        latest = sts[-1]
+        desired = {'OK': STATUS_VALID, 'FAIL': 'RACE-FAIL', 'SKIP': STATUS_SKIP}[latest]
+        if not isinstance(key, int):
+            agrees = ((latest == 'FAIL' and is_fail(f.status))
+                      or (latest == 'SKIP' and f.status in (STATUS_SKIP, STATUS_DEADLINE))
+                      or f.status == desired)
+            if f.status not in (STATUS_PENDING, STATUS_RUNNING) and not agrees:
+                c.warnings.append('STATE %s=%s 与判定表/时间线 %s 不一致'
+                                  % (key, latest, f.status))
+            # STATE 是 runner 的最终判定；正在写入下一轮尝试时不覆盖 RUNNING。
+            if f.status != STATUS_RUNNING:
+                f.status = f.status if agrees else desired
+        elif latest == 'OK' and f.status == STATUS_PENDING:
             f.status = STATUS_VALID
 
-    # ---- 6) 排程文件运行期间被改过？
-    if c.schedule_file:
+    # ---- 6) 仅旧 campaign 需要查可变排程文件；新 PLAN 已固化，不误报原排程 mtime。
+    if c.schedule_file and frozen_plan is None:
         mt = src.mtime(c.schedule_file)
         started_dt = _parse_ts(c.started_at)
         if mt and started_dt:
-            mtd = datetime.datetime.fromtimestamp(mt)
+            mtd = datetime.datetime.fromtimestamp(mt, datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
             if mtd > started_dt + datetime.timedelta(seconds=5):
                 c.warnings.append(
                     '排程文件 %s 在 campaign 起跑后被修改过（mtime %s > 起跑 %s）——'
@@ -734,7 +804,7 @@ def build_campaign(src, cid, schedule_override=None):
     # 窗底漂移：DEADLINE = now + DS_HOURS - 20min 是**每次 runner 启动**重算的，
     # 所以重启几次，"12h 窗口"就被推后几次 —— 它约束的是单次 runner，不是整个 campaign。
     if len(set(c.deadlines)) > 1:
-        now = datetime.datetime.now()
+        now = _runner_now()
         msg = ('窗底被 runner 重启推后了 %d 次（%s）：DS_HOURS 约束的是**单次 runner**，'
                '不是整个 campaign'
                % (len(c.deadlines) - 1, ' → '.join(c.deadlines)))
@@ -744,7 +814,7 @@ def build_campaign(src, cid, schedule_override=None):
                 c.deadlines[0], (now - first).total_seconds() / 60.0)
         c.warnings.append(msg)
     if dl and c.pending:
-        left = (dl - datetime.datetime.now()).total_seconds() / 60.0
+        left = (dl - _runner_now()).total_seconds() / 60.0
         need = c.est_remaining_min
         pending_est = sorted([f for f in c.fields
                               if f.status == STATUS_PENDING and f.est],
@@ -773,6 +843,11 @@ def build_campaign(src, cid, schedule_override=None):
         else:
             c.warnings.append('待跑清单未知 —— 只显示已跑过的场次')
     return c
+
+
+def _runner_now():
+    """runner 日志以 UTC+8 表示；观测机可以位于任意时区。"""
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
 
 
 def _parse_ts(s):
@@ -962,7 +1037,7 @@ def render_summary(c):
 
 
 def campaign_json(c):
-    now = datetime.datetime.now()
+    now = _runner_now()
     for f in c.fields:
         if f.status == STATUS_RUNNING and f.started:
             st = _parse_ts(f.started)

@@ -7,6 +7,9 @@
   "mappings": {
     "dynamic": "strict",
     "properties": {
+      "raceway_revision": {
+        "type": "integer"
+      },
       "elevation": {
         "type": "integer"
       },

@@ -3,7 +3,7 @@
 # load-monitor.sh —— 虚机侧系统负载采样器（在每台虚机上运行，零依赖，纯 /proc）
 # 由 run-bench.sh 通过 ssh 启停；也可手动使用：
 #   ENGINE_MARK=<标记> ./load-monitor.sh start <tag>   # 周期采样 -> mon-<tag>.csv
-#   ./load-monitor.sh stop  [tag]     # 停止（无 tag 停全部）
+#   ./load-monitor.sh stop <tag>      # 仅停止该 tag，校验 PID 起始身份与完整参数
 #   ./load-monitor.sh probe [seconds] # 快速探测 N 秒并输出均值（供赛前卡点，1s 采样）
 #   ./load-monitor.sh summary <csv>   # 赛后判定 ENV-VERDICT
 #
@@ -24,9 +24,11 @@
 # ts,cpu_usr,cpu_sys,cpu_steal,load1,mem_avail_gb,swpin_s,
 # disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu
 # ============================================================================
-set -u
-MON_DIR=${RACEWAY_MON_DIR:-/opt/raceway/monitor}   # CSV/pid 落位（与编排侧 BENCH_BASE 一致）
+set -uo pipefail
+MON_DIR=${RACEWAY_MON_DIR:-/opt/raceway/monitor}   # runner 显式透传同一个目录
+case "$MON_DIR" in /|''|*[!A-Za-z0-9_./-]*|*/../*|*/..|*/./*|*/.|*//*|*/) exit 1;; /*) ;; *) exit 1;; esac
 INTERVAL=${MON_INTERVAL:-5}
+[[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]] || exit 1
 # 赛后判定阈值（独立运行时的回退默认）。主旋钮在 vm-bench.env 的 VERDICT_*，
 # runner 会经 ssh 显式传入（缺键时才落到这里的默认值）——一处改，赛前卡点同口径生效。
 VERDICT_STEAL_MAX=${VERDICT_STEAL_MAX:-2.0}
@@ -54,13 +56,63 @@ load_snapshot() { # 把 <pid:cmdline是否bench> 与 utime+stime 打到临时文
   done > "$out"
 }
 
-start_sampler() { # <tag>
-  local tag="$1"
-  local csv="$MON_DIR/mon-$tag.csv"
-  [ -f "$MON_DIR/mon-$tag.pid" ] && kill "$(cat "$MON_DIR/mon-$tag.pid")" 2>/dev/null
-  nohup bash "$0" _loop "$csv" "$tag" >/dev/null 2>&1 &
-  echo $! > "$MON_DIR/mon-$tag.pid"
-  echo "monitor started: $csv (pid $!)"
+valid_tag() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+sampler_starttime() {
+  local line rest
+  line=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest="${line##*) }"; set -- $rest
+  [ "${1:-Z}" != Z ] && [ -n "${20:-}" ] || return 1
+  printf '%s' "${20}"
+}
+sampler_owned() { # <tag> <pid> <start> <boot>；精确参数和 boot 防止 PID 复用
+  local tag="$1" pid="$2" start="$3" boot="$4" arg
+  local -a argv=()
+  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
+  [ "$boot" = "$(cat /proc/sys/kernel/random/boot_id)" ] || return 1
+  [ "$(sampler_starttime "$pid")" = "$start" ] || return 1
+  while IFS= read -r -d '' arg; do argv+=("$arg"); done < "/proc/$pid/cmdline"
+  [ "${#argv[@]}" -eq 5 ] && [ "${argv[1]}" = "$(readlink -f "$0")" ] &&
+    [ "${argv[2]}" = _loop ] && [ "${argv[3]}" = "$MON_DIR/mon-$tag.csv" ] && [ "${argv[4]}" = "$tag" ]
+}
+stop_sampler() { # <tag>，从不全局 pkill
+  local tag="$1" f pid start boot extra
+  valid_tag "$tag" || return 1
+  f="$MON_DIR/mon-$tag.pid"
+  [ -f "$f" ] || return 0
+  read -r pid start boot extra < "$f" || return 1
+  if sampler_owned "$tag" "$pid" "$start" "$boot"; then
+    kill -TERM "$pid" || return 1
+    for i in {1..30}; do
+      sampler_owned "$tag" "$pid" "$start" "$boot" || break
+      sleep 0.1
+    done
+    sampler_owned "$tag" "$pid" "$start" "$boot" && return 1
+  elif [ -e "/proc/${pid:-invalid}" ]; then
+    echo "拒绝停止身份不符的 sampler: $tag" >&2; return 1
+  fi
+  rm -f "$f"
+  echo "monitor stopped: $tag"
+}
+start_sampler() { # <tag>；不覆盖仍活跃的同 tag 文件
+  local tag="$1" csv pid start i
+  valid_tag "$tag" || return 1
+  csv="$MON_DIR/mon-$tag.csv"
+  exec 8> "$MON_DIR/mon-$tag.lock" || return 1
+  flock -n 8 || return 1
+  stop_sampler "$tag" || return 1
+  [ ! -e "$csv" ] || { echo "拒绝覆盖监控: $csv" >&2; return 1; }
+  RACEWAY_MON_DIR="$MON_DIR" MON_INTERVAL="$INTERVAL" ENGINE_MARK="$ENGINE_MARK" \
+    nohup bash "$(readlink -f "$0")" _loop "$csv" "$tag" 8>&- >/dev/null 2>&1 &
+  pid=$!
+  start=$(sampler_starttime "$pid") || return 1
+  printf '%s %s %s\n' "$pid" "$start" "$(cat /proc/sys/kernel/random/boot_id)" > "$MON_DIR/mon-$tag.pid.tmp" &&
+    mv "$MON_DIR/mon-$tag.pid.tmp" "$MON_DIR/mon-$tag.pid" || return 1
+  for i in {1..30}; do
+    [ -s "$csv" ] && break
+    sleep 0.1
+  done
+  [ -s "$csv" ] || return 1
+  echo "monitor started: $csv (pid $pid)"
 }
 
 _loop() { # <csv> <tag>
@@ -69,6 +121,9 @@ _loop() { # <csv> <tag>
   mb10=$(( 1048576 * INTERVAL / 10 ))   # 0.1MB/s 分辨率的除数（防整除截断吞掉小流量）
   echo "ts,cpu_usr,cpu_sys,cpu_steal,load1,mem_avail_gb,swpin_s,disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu" > "$csv"
   local c0 c1 s0 s1 d0 d1 n0 n1 p0 p1
+  p0=''; p1=''
+  trap 'rm -f "${p0:-}" "${p1:-}"' EXIT
+  trap 'exit 0' TERM INT HUP
   c0=$(cpu_line)
   s0=$(awk '/pswpin /{print $2}' /proc/vmstat)
   d0=$(grep " $dev " /proc/diskstats)
@@ -119,22 +174,15 @@ join_delta() {
   ' "$1" "$2"
 }
 
-stop_all() {
-  local f p
-  for f in "$MON_DIR"/mon-*.pid; do
-    [ -f "$f" ] || continue
-    p=$(cat "$f"); kill "$p" 2>/dev/null; rm -f "$f"
-  done
-  pkill -f "load-monitor.sh _loo[p]" 2>/dev/null
-  echo "monitors stopped"
-}
-
-probe() { # <seconds>
-  local sec="${1:-6}" csv; csv=$(mktemp --suffix=.csv)
-  MON_INTERVAL=1 bash "$0" _loop "$csv" probe & local pid=$!
-  sleep $((sec + 2)); kill $pid 2>/dev/null
-  summary_quiet "$csv"
+probe() { # <seconds>，只管理自己刚创建的子进程
+  local sec="${1:-6}" csv pid rc
+  [[ "$sec" =~ ^[1-9][0-9]*$ ]] || return 1
+  csv=$(mktemp --suffix=.csv) || return 1
+  MON_INTERVAL=1 bash "$(readlink -f "$0")" _loop "$csv" probe & pid=$!
+  sleep $((sec + 2)); kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  summary_quiet "$csv"; rc=$?
   rm -f "$csv"
+  return "$rc"
 }
 
 # summary_quiet <csv> — 输出均值行（供 probe/卡点）
@@ -143,7 +191,7 @@ summary_quiet() {
     n++; st+=$4; l+=$5; f+=$12; b+=$11
     if($4>stM)stM=$4; if($12>fM)fM=$12
   } END {
-    if(n==0){print "probe: no data"; exit}
+    if(n==0){print "probe: no data"; exit 1}
     printf "load1_avg=%.2f steal_avg=%.2f%% steal_max=%.2f%% foreign_cpu_avg=%.2f%% foreign_cpu_max=%.2f%% bench_cpu_avg=%.2f%%\n",
       l/n, st/n, stM, f/n, fM, b/n
   }' "$1"
@@ -155,6 +203,9 @@ summary() {
   [ -s "$csv" ] || { echo "ENV-VERDICT: NO-DATA ($csv 不存在或为空)"; exit 2; }
   awk -F, -v stM="$VERDICT_STEAL_MAX" -v fM="$VERDICT_FOREIGN_MAX" '
     NR>1 {
+      if (NF!=12) {bad=1; next}
+      for (i=1;i<=NF;i++) if ($i !~ /^[0-9]+([.][0-9]+)?$/) bad=1
+      if (bad) next
       n++; st+=$4; f+=$12; sw+=$7
       us+=$2; sy+=$3; bc+=$11; dr+=$8; rx+=$9; tx+=$10
       if($4>stMx)stMx=$4; if($12>fMx)fMx=$12
@@ -162,7 +213,7 @@ summary() {
       if($8>drMx)drMx=$8
       if(mn==""||$6+0<mn+0)mn=$6
     } END {
-      if(n==0){print "ENV-VERDICT: NO-DATA"; exit 1}
+      if(n==0 || bad){print "ENV-VERDICT: NO-DATA"; exit 1}
       # 摘要量纲（都是每 5 秒采到的值）：
       #   bench_cpu = 被测引擎进程的 CPU 占用（跨引擎直接可比）
       #   cpu_usr/cpu_sys = 整机 CPU 占用（负载占比）
@@ -181,7 +232,12 @@ summary() {
 
 case "${1:-}" in
   start)  start_sampler "${2:?tag}";;
-  stop)   stop_all;;
+  stop)
+    tag="${2:?stop 需要 tag}"
+    valid_tag "$tag" || exit 1
+    exec 8> "$MON_DIR/mon-$tag.lock" || exit 1
+    flock -n 8 || exit 1
+    stop_sampler "$tag";;
   probe)  probe "${2:-6}";;
   summary) summary "${2:?csv}";;
   _loop)  shift; _loop "$@";;

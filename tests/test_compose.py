@@ -244,7 +244,7 @@ class TestControlConsole(unittest.TestCase):
         st = C.ComposeState(args)
         code, payload = C.api_compare(st, {'a': 'x', 'b': 'x', 'car': ''})
         self.assertEqual(code, 400)
-        self.assertIn('同一个', payload['error'])
+        self.assertIn('不同车', payload['error'])
         code, payload = C.api_compare(st, {'a': '../etc', 'b': 'y', 'car': ''})
         self.assertEqual(code, 400)
 
@@ -283,7 +283,8 @@ class TestControlConsole(unittest.TestCase):
         bash = shutil.which('bash')
         if not bash:
             self.skipTest('本机没有 bash')
-        p = subprocess.run([bash, '-n', os.path.join(repo, 'doctor.sh')],
+        from tests.test_cli_selfdoc import _bash_path
+        p = subprocess.run([bash, '-n', _bash_path(os.path.join(repo, 'doctor.sh'))],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         with open(os.path.join(repo, 'doctor.sh'), encoding='utf-8') as f:

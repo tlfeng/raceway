@@ -92,24 +92,31 @@ EOF
   log "Kibana 启动中 pid=$(cat $PID_KB)（日志 /tmp/kibana.out）"
 }
 
+status_ready() {
+  # stdin 必须是同一次 HTTP 成功请求的 JSON，字段存在不代表 ready。
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    overall = d["status"]["overall"]
+    checks = [("state", "green"), ("level", "available")]
+    values = [overall[k] == good for k, good in checks if k in overall]
+    ready = bool(values) and all(values)
+    if ready:
+        print("  overall:", overall.get("state") or overall.get("level"),
+              " version:", d.get("version", {}).get("number", "unknown"))
+    sys.exit(0 if ready else 1)
+except (ValueError, KeyError, TypeError, AttributeError):
+    sys.exit(1)
+'
+}
+
 wait_ready() {
   local n=0
   while [ $n -lt 90 ]; do
-    if curl -s --max-time 5 "http://127.0.0.1:$KB_PORT/api/status" 2>/dev/null | grep -q '"state"'; then
+    # -f 拒绝 HTTP 4xx/5xx；pipefail 同时检查 curl 与状态解析，不能只 grep state。
+    if curl -fsS --max-time 5 "http://127.0.0.1:$KB_PORT/api/status" 2>/dev/null | status_ready; then
       log "Kibana /api/status 就绪"
-      curl -s --max-time 10 "http://127.0.0.1:$KB_PORT/api/status" | python3 -c '
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    s = d.get("status", {})
-    print("  overall:", s.get("overall", {}).get("state"), " version:", s.get("version", {}).get("number"))
-    for k, v in sorted(s.items()):
-        st = v.get("state") if isinstance(v, dict) else None
-        if st in ("red", "degraded"):
-            print("  非绿:", k, st)
-except Exception as e:
-    print("  解析状态失败:", e)
-' 2>/dev/null
       return 0
     fi
     n=$((n+1)); sleep 5
@@ -122,7 +129,7 @@ case "${1:-start}" in
   start)
     start_shim
     # shim 通不通先验一下
-    curl -sk --max-time 10 "http://127.0.0.1:$SHIM_PORT/" | head -c 300; echo
+    curl -fsS --max-time 10 "http://127.0.0.1:$SHIM_PORT/" >/dev/null || die "shim HTTP 检查失败"
     start_kibana
     wait_ready
     log "看板入口: http://127.0.0.1:$KB_PORT/app/dashboards#/view/bench-overview"

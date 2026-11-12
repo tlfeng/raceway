@@ -1,122 +1,92 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""car-env-table.py —— 三车×多赛道的"性能 × 环境"联合表（在压测机上跑）
+"""car-env-table.py —— 完整有效测量的性能与环境联合表。
 
-  ssh root@<压测机> 'python3 - <campaign 目录> [--detail]' < scripts/car-env-table.py
-
-数据源（都是编排每场落的）：
-  results/<fid>-{w,q}-race.json      → 口径A(rally Median Throughput) 与 口径B(语料÷duration)
-  monitors/<fid>-<node>-summary.txt  → 该场采样汇总的 steal/foreign/swapin/verdict
-口径A=warmup 之后样本的中位速率，口径B=含 warmup 的全程平均（docs/metrics.rst:140 duration 含 warmup）。
+python3 car-env-table.py <campaign 目录...> [--detail]
+按实测引擎身份、赛道变体、任务隔离，不按可复用的车代号混合 build。
 """
-import glob
-import json
-import os
-import re
+import argparse
 import statistics
-import sys
 
-DOCS = {"track": 11396503, "hnsw2m-2m-s3": 2000000, "nested-s3": 11203029,
-        "hv1024-s3": 1000000}
-NAME = {"track": "geo", "hnsw2m-2m-s3": "hnsw", "nested-s3": "nested", "hv1024-s3": "hv1024"}
-WARMUP = {"track": 20, "hnsw2m-2m-s3": 40, "nested-s3": 25, "hv1024-s3": 25}
+from result_selection import finite, monitor_summary, select_measurements
 
 
-def summary_of(camp_dir, fid):
-    """该场三节点环境摘要（取三节点里的最坏值）"""
-    agg = {"samples": 0, "steal_avg": 0.0, "steal_max": 0.0,
-           "foreign_max": 0.0, "swapin": 0, "verdict": "NO-DATA"}
-    files = glob.glob(os.path.join(camp_dir, "monitors", "%s-*-summary.txt" % fid))
-    for p in files:
-        t = open(p, encoding="utf-8", errors="replace").read()
-        g = lambda k, cast=float: (cast(re.search(k + r"=([0-9.]+)", t).group(1))
-                                   if re.search(k + r"=([0-9.]+)", t) else 0)
-        agg["samples"] += g("samples", int)
-        for k, key in (("steal_avg", "steal_avg"), ("steal_max", "steal_max"),
-                       ("foreign_max", "foreign_max")):
-            agg[key] = max(agg[key], g(k))
-        agg["swapin"] += g("swapin", int)
-        m = re.search(r"ENV-VERDICT: (\S+)", t)
-        if m:
-            v = m.group(1)
-            order = {"OK": 0, "WARN": 1, "CONTAMINATED": 2, "NO-DATA": 3}
-            if order.get(v, 9) >= order.get(agg["verdict"], 9) or agg["verdict"] == "NO-DATA" and v == "OK":
-                agg["verdict"] = v
-    if not files:
-        agg["verdict"] = "无监控"
-    return agg
+def summary_of(camp_dir, fid, phases=None, expected_nodes=None):
+    return monitor_summary(camp_dir, fid, phases, expected_nodes)
+
+
+def collect(camps):
+    rows = []
+    for camp in dict.fromkeys(camps):
+        for measurement in select_measurements(camp):
+            phase = "wq" if "wq" in measurement["races"] else "w"
+            d = measurement["races"][phase]
+            side = measurement["sides"][phase]
+            docs = (side.get("corpus") or {}).get("docs")
+            for op in (d.get("results") or {}).get("op_metrics") or []:
+                tp = op.get("throughput") or {}
+                if tp.get("unit") != "docs/s":
+                    continue
+                duration = op.get("duration")
+                dur = duration / 1000 if finite(duration) and duration > 0 else None
+                svc = op.get("service_time") or {}
+                scale = {"ms": 1, "s": 1000}.get(svc.get("unit", "ms"))
+                def percentile(key):
+                    return svc[key] * scale if scale is not None and finite(svc.get(key)) else None
+                rows.append({"fid": measurement["fid"], "car": measurement["series_key"],
+                             "track": measurement["track"], "task": op.get("task"),
+                             "round": measurement["round"], "camp": measurement["camp"],
+                             "a": tp.get("median"),
+                             "b": docs / dur if finite(docs) and dur else None,
+                             "dur": dur, "env": measurement["env"],
+                             "signature": measurement["signature"],
+                             "p99": percentile("99_0"), "p100": percentile("100_0")})
+    return rows
+
+
+def shown(value, digits=1):
+    return ("%.*f" % (digits, value)) if finite(value) else "-"
 
 
 def main():
-    args = [a for a in sys.argv[1:]]
-    detail = "--detail" in args
-    camps = [a for a in args if not a.startswith("--")]
-    if not camps:
-        print(__doc__)
-        return 1
-    rows = []
-    for camp in camps:
-        for p in sorted(glob.glob(os.path.join(camp, "results", "*-w-race.json"))
-                        + glob.glob(os.path.join(camp, "results", "*-wq-race.json"))):
-            try:
-                d = json.load(open(p, encoding="utf-8"))
-            except (ValueError, OSError):
-                continue
-            if d.get("challenge") not in ("write-only", "full"):
-                continue
-            om = (d.get("results") or {}).get("op_metrics") or []
-            if not om:
-                continue
-            tr = d.get("track")
-            if tr not in DOCS:
-                continue
-            suffix = "-wq-race.json" if p.endswith("-wq-race.json") else "-w-race.json"
-            fid = os.path.basename(p)[:-len(suffix)]
-            a = (om[0].get("throughput") or {}).get("median")
-            dur = (om[0].get("duration") or 0) / 1000.0
-            b = DOCS[tr] / dur if dur else None
-            env = summary_of(camp, fid)
-            rows.append({"fid": fid, "car": fid.split("-")[0], "track": NAME.get(tr, tr),
-                         "round": d["user-tags"].get("round"), "camp": os.path.basename(camp),
-                         "a": a, "b": b, "dur": dur, "win": dur - WARMUP.get(tr, 0), "env": env,
-                         "p99": (om[0].get("service_time") or {}).get("99_0"),
-                         "p100": (om[0].get("service_time") or {}).get("100_0")})
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("campaigns", nargs="+")
+    ap.add_argument("--detail", action="store_true")
+    args = ap.parse_args()
+    rows = collect(args.campaigns)
     if not rows:
-        print("没有 write-only/full 的 race.json 可解析")
+        print("没有完整有效的写入测量")
         return 1
-
-    if detail:
-        print("%-20s %-7s %-4s %9s %9s %6s %6s %8s %8s %s" % (
-            "场", "车", "轮", "口径A", "口径B", "任务s", "窗口s", "steal峰", "foreign峰", "判定"))
-        for r in sorted(rows, key=lambda x: (x["track"], x["camp"], x["fid"])):
+    if args.detail:
+        print("| 场 | 身份 | 赛道/任务 | 圈 | 口径A docs/s | 口径B docs/s | 任务 s | steal峰 % | foreign峰 % | 判定 |")
+        print("|---|---|---|---|---|---|---|---|---|---|")
+        for r in rows:
             e = r["env"]
-            print("%-20s %-7s %-4s %9s %9.0f %6.1f %6.1f %8.2f %8.2f %s" % (
-                r["fid"][:20], r["car"], "r%s" % r["round"], ("%.0f" % r["a"]) if r["a"] else "NULL",
-                r["b"] or 0, r["dur"], r["win"], e["steal_max"], e["foreign_max"], e["verdict"]))
-
-    print("\n=== 按 车 × 赛道：性能 × 环境 ===")
-    print("%-7s %-7s %3s %9s %8s %8s %9s %8s %8s %8s %s" % (
-        "车", "赛道", "n", "口径B 中位", "极差%", "A-B偏移%", "bulk p99", "p100", "steal峰", "foreign峰", "判定"))
-    grp = {}
-    for r in rows:
-        grp.setdefault((r["car"], r["track"]), []).append(r)
-    for (car, track), v in sorted(grp.items(), key=lambda x: (x[0][1], -statistics.median([y["b"] or 0 for y in x[1]]))):
-        bs = [y["b"] for y in v if y["b"]]
-        ab = [(y["a"] / y["b"] - 1) * 100 for y in v if y["a"] and y["b"]]
-        p99 = [y["p99"] for y in v if y["p99"]]
-        p100 = [y["p100"] for y in v if y["p100"]]
-        st = max((y["env"]["steal_max"] for y in v), default=0)
-        fo = max((y["env"]["foreign_max"] for y in v), default=0)
-        verd = " / ".join(sorted({y["env"]["verdict"] for y in v}))
-        print("%-7s %-7s %3d %9.0f %8.1f %8.2f %8s %8s %8.2f %8.2f %s" % (
-            car, track, len(v), statistics.median(bs) if bs else 0,
-            (max(bs) / min(bs) - 1) * 100 if bs and min(bs) else 0,
-            statistics.mean(ab) if ab else 0,
-            ("%.0f" % statistics.median(p99)) if p99 else "-",
-            ("%.0f" % statistics.median(p100)) if p100 else "-",
-            st, fo, verd))
+            print("| %s/%s | %s | %s/%s | %s | %s | %s | %s | %s | %s | %s |" % (
+                r["camp"], r["fid"], r["car"], r["track"], r["task"], r["round"],
+                shown(r["a"]), shown(r["b"]), shown(r["dur"]), shown(e["steal_max"]),
+                shown(e["foreign_max"]), e["verdict"]))
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["car"], row["track"], row["task"]), []).append(row)
+    print("\n| 身份 | 赛道 | 任务 | n | 口径B中位 docs/s | 极差 % | bulk p99 ms | p100 ms | steal峰 % | foreign峰 % |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for (car, track, task), group in sorted(groups.items()):
+        if any(r["signature"] != group[0]["signature"] for r in group[1:]):
+            print("%s/%s 实测条件不一致，拒绝合池" % (car, track))
+            return 1
+        def median(key):
+            values = [r[key] for r in group if finite(r[key])]
+            return statistics.median(values) if values else None
+        rates = [r["b"] for r in group if finite(r["b"])]
+        spread = (max(rates) / min(rates) - 1) * 100 if rates and min(rates) > 0 else None
+        print("| %s | %s | %s | %d | %s | %s | %s | %s | %s | %s |" % (
+            car, track, task, len(group), shown(median("b")), shown(spread),
+            shown(median("p99")), shown(median("p100")),
+            shown(max(r["env"]["steal_max"] for r in group)),
+            shown(max(r["env"]["foreign_max"] for r in group))))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
