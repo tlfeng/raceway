@@ -92,7 +92,7 @@ raceway · 压测编排入口（用法页）
   <赛道>-codec-<def|zstd|bc>[-sr]                    压缩变体（走 --track-params，不另存目录）
   gdef / gzstd / gbc      上面几个压缩变体的历史别名
   codec / both / all      批量跑法（geo-codec-* 六变体 / geo+hnsw / geo+hnsw+nested）
-  ds / ds-<档名>          维度扫描（定义待回灌，见 tracks/README.md）
+  ds / ds-<档名>          维度扫描（定义已定版 tracks/ds-*，语料 CORPORA_DS）
 
 跑起来之后
   tail -f campaigns/<campaign>/PROGRESS.txt   实时进度（当前场次 + 阶段）

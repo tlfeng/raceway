@@ -202,11 +202,15 @@ track_availability_table() {
     else
       [ -n "$_d" ] || _d="（路径解析失败）"
       printf '  %s %-24s %s\n' "⚠" "$_t" "$_d"
-      echo "      ↳ 定义不在位：仓库没同步全（同步得带 tracks/），或这条还没回灌进 git（见 tracks/README.md）"
+      echo "      ↳ 定义不在位：仓库没同步全（同步得带 tracks/），见 tracks/README.md"
     fi
   done
-  echo "  ⚠ ds-<档名>              $ROOT/tracks/ds-<档名>"
-  echo "      ↳ 7 档维度扫描的定义待回灌（语料在机器上）；要跑先按 tracks/README.md「还没切完的部分」回灌"
+  if [ -f "$ROOT/tracks/ds-j1024/track.json" ]; then
+    echo "  ✔ ds-<档名>（7 档）       $ROOT/tracks/ds-*（定义已定版；语料在 CORPORA_DS，起跑时自检）"
+  else
+    echo "  ⚠ ds-<档名>              $ROOT/tracks/ds-*"
+    echo "      ↳ 维度扫描定义不在位：仓库同步得带 tracks/（定义已定版进 git，见 tracks/README.md）"
+  fi
 }
 track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
   local b; b=$(track_base "$1")
