@@ -132,16 +132,17 @@ else
     esac
   done < <(grep -oE '^[[:space:]]*TRACK_[A-Z0-9_]+' vm-bench.env)
   # 定版赛道定义（git 里那份）：缺一份 = 起跑必炸（而不是跑出一个错的赛道）
-  for _td in geonames hv1024 nested hv1024x; do
+  for _td in geonames hv1024 nested hv1024x hnsw \
+             ds-g960 ds-g1920 ds-j512 ds-j768 ds-j1024 ds-j1536 ds-j2048; do
     _p="$ROOT/tracks/$_td"
     if [ -f "$_p/track.json" ]; then ok "tracks/$_td → $_p（定版定义在位）"
     else bad "tracks/$_td 定义缺失: $_p（仓库里应有 tracks/$_td/；同步仓库时记得带 tracks/）"; fi
   done
   # 赛道可用性总表 —— 和 `run-bench.sh list` 同一份实现（vm-bench-lib.sh 的
   # track_availability_table），两处各写一份映射表 = 迟早漂移。
-  # "起不来"最常见的原因是定义没同步全 / 还没回灌进 git —— 这里一次说清。
+  # "起不来"最常见的原因是定义没同步全 —— 这里一次说清。
   if declare -F track_availability_table >/dev/null 2>&1; then
-    echo "  赛道可用性（✔ 定义在位 / ⚠ 不在位 → 同步仓库时带上 tracks/，或先按 tracks/README.md 回灌）："
+    echo "  赛道可用性（✔ 定义在位 / ⚠ 不在位 → 同步仓库时带上 tracks/）："
     track_availability_table
   fi
   # hv1024 系语料与查询集：**本地语料**（track.json 里没有 base-url，rally 不会自动下载）
