@@ -282,8 +282,12 @@ flock -n 9
         code = function('load-monitor.sh', 'valid_tag') + function('load-monitor.sh', 'stop_sampler')
         code += r'''
 MON_DIR="$FIX"
-printf '123 456 boot\n' > "$MON_DIR/mon-own.pid"
-printf '234 567 boot\n' > "$MON_DIR/mon-other.pid"
+# pid 夹具必须取宿主机此刻不存在的值：身份守卫对“存活但身份不符”的 pid 是拒绝停止，
+# 撞上真实进程（如压测机上早已占用的低 pid）会误触发拒绝分支
+own=$(seq 40000 65535 | while read -r p; do [ -e "/proc/$p" ] || { echo "$p"; break; }; done)
+other=$(seq 40000 65535 | tail -n +500 | while read -r p; do [ -e "/proc/$p" ] || { echo "$p"; break; }; done)
+printf '%s 456 boot\n' "$own" > "$MON_DIR/mon-own.pid"
+printf '%s 567 boot\n' "$other" > "$MON_DIR/mon-other.pid"
 sampler_owned() { return 1; }
 kill() { printf 'unsafe'; exit 4; }
 stop_sampler own

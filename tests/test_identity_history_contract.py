@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""身份、历史覆盖与采集契约回归；纯离线，不启动 shell/SSH/ES，不写夹具文件。"""
+"""身份、历史覆盖与采集契约回归；纯离线，不启动 shell/SSH/ES，仅临时目录夹具。"""
 import copy
 import importlib
 import json
 import os
 import pathlib
+import shutil
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -371,6 +373,31 @@ class TestSidecarVectorContract(NoExternalCalls):
         self.assertEqual(params['k_by_task'], {'knn-search-10-100': 10, 'knn-search-100-1000': 100})
         self.assertNotIn('ef_search', params)
         self.assertNotIn('num_candidates', params)
+
+    def test_runtime_symlink_and_oversized_artifacts_are_not_read_as_specs(self):
+        # prepare_tracks 会把语料软链进 track 目录（documents-*.json → GB 级语料）。
+        # track_meta 只认 git 定版定义：软链与超限运行时产物不得整读，
+        # 否则在压测机上会把 22.7GB 语料读进内存，sidecar 当场挂死。
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        (d / 'index.json').write_text(
+            '{"mappings":{"properties":{"emb":{"type":"dense_vector","dims":1024}}}}', encoding='utf-8')
+        corpus = d / 'documents-1024.json'
+        corpus.write_bytes(b'x' * 4096)
+        link = d / 'documents-1024-link.json'
+        os.symlink(str(corpus), str(link))
+        real_read = S.read
+
+        def reject_runtime_artifacts(raw, name):
+            p = os.path.join(raw, name)
+            if os.path.islink(p) or (os.path.isfile(p) and os.path.getsize(p) > S.SPEC_MAX_BYTES):
+                raise AssertionError('运行时产物不得整读: ' + p)
+            return real_read(raw, name)
+
+        with patch.object(S, 'read', reject_runtime_artifacts), \
+                patch.object(S, 'SPEC_MAX_BYTES', 1024):
+            meta = S.track_meta(str(d), '')
+        self.assertEqual(meta['knn_params']['dims'], 1024)
 
     def test_opensearch_ef_search_is_not_num_candidates(self):
         spec = '''{"mappings":{"properties":{"emb":{"type":"knn_vector","dimension":1024,
