@@ -66,6 +66,32 @@ git 里是什么，跑的就是什么。回答一个问题：**跑结果用的�
   里有没有对应条件块——少一个条件块，该维度会**静默失效**（压缩臂跑成同一个 / 量化臂跑成
   hnsw 基座，数据看着正常、结论全废），所以起跑前就挡住。
 
+## 搜索预算与更新对照协议
+
+hv1024 六个目录的 ANN/exact 分支都在**最终 body** 写入 `size=k`，分别返回10/100条。
+请求参数不能靠 Rally 参数字典外层的 size 表达。操作名保留 `knn-search-10-100` /
+`knn-search-100-1000`，但末尾数字在不同引擎中**不表示等价工作量**：
+
+| 赛道 / 引擎 | operation 参数 → 最终请求 | 实际口径 |
+|---|---|---|
+| hv1024 / hv1024x，ES/Easysearch HNSW | num-candidates → knn.num_candidates=100/1000 | 每分片近邻候选预算 |
+| hv1024x-bbqdisk，ES | num-candidates → knn.num_candidates=100/1000 | bbq_disk 自有聚类/访问策略；不是 HNSW ef_search，也未固定 visit_percentage |
+| hv1024x-os / os-bbq，Lucene HNSW | ef-search → query.knn.emb.method_parameters.ef_search=100/1000 | 搜索宽度 max(k,ef_search)，量化策略依引擎 |
+| hv1024x-os-disk，Faiss HNSW | ef-search → method_parameters.ef_search=100/1000；oversample-factor → rescore.oversample_factor=2.0 | 显式 on_disk + 32x + m32/efC100，不是 IVF |
+
+OS disk 协议要求 OpenSearch ≥3.3；Lucene fp32/BBQ 定义的目标版本为 ≥3.6。
+ES bbq_disk 与 OS on_disk 只是驻盘策略对照，**并非同算法**。比较需固定查询集、返回 k，
+并提供相近实测 recall 的证据；不能把相同预算数字/任务名称当成跨引擎可比性的保证。
+
+`geonames-upsert` 的五个写操作统一 `bulk_size:500`、`bulk_indexing_clients:8`（都可覆盖），
+共享自然 geonameid 分区与顺序。cold/index 写 `raceway_revision:0`，hot/native 写1，mixed写2；
+所有 update 显式 `detect_noop:false`。native 基座先 index 同一自然 ID 全集，再逐 ID 纯 update，
+不使用 conflicts 模型；hot/native 文档内容相同，仅有无 doc_as_upsert 不同。完整协议见
+[geonames-upsert/README.md](geonames-upsert/README.md)。
+
+离线运行时回归在 `tests/test_track_runtime.py`，不依赖 esrally，不读取真实 terms/语料，
+以合成数据和可审计请求桩检查 body、ID、更新内容、分区及任务参数。
+
 ## 还没切完的部分（压测机侧，一次性）
 
 1. **geonames 挑战比对**：仓库里的 `tracks/geonames/challenges/{write-only,query-only}.json`

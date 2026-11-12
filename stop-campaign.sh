@@ -1,58 +1,64 @@
-#!/bin/bash
-# 停掉指定 campaign 的运行进程（按 campaign 标签精确定位，不误伤自身）
-# 用法: stop-campaign.sh <campaign标签>
-set +e
-CAMP="${1:?需要 campaign 标签，如 ds2c}"
-SELF=$$
+#!/usr/bin/env bash
+# 停止一个完整 campaign id；只认本次 runner 的 PID/starttime/boot/script 身份。
+set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+RACEWAY_ENV_OPTIONAL=1
+source "$HERE/vm-bench-lib.sh" || exit 1
+CAMP="${1:?用法: stop-campaign.sh <完整 campaign-id>}"
+[[ "$CAMP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "campaign id 非法"
+ROOT="${RESULTS_ROOT:-$HERE/campaigns}"
+DIR="$ROOT/$CAMP"
+[ -d "$DIR" ] || die "campaign 不存在: $CAMP（只接受完整 id）"
 
-# runner = 有 shell 进程在执行 run-bench.sh。pgrep -f 匹配整条命令行，vim/tail/less/ssh
-# 命令行里带这个文件名的也会命中 —— 按 comm 过滤只留 shell，别把人家的编辑器杀了。
-runner_pids() {
-  local p
-  for p in $(pgrep -f 'run-bench[.]sh' 2>/dev/null); do
-    [ "$p" = "$SELF" ] && continue
-    case "$(ps -p "$p" -o comm= 2>/dev/null)" in
-      bash|sh|dash|zsh|*/bash|*/sh|*/dash|*/zsh) echo "$p";;
-    esac
-  done
+# 只选择此 runner 的后代；rally 同时必须携带完整 campaign tag，防前缀误匹配。
+owned_children() { # <runner pid> → pid:starttime
+  python3 - "$1" "$CAMP" <<'PY'
+import pathlib, sys
+parent, camp = int(sys.argv[1]), sys.argv[2]
+rows = {}
+for p in pathlib.Path('/proc').glob('[0-9]*'):
+    try:
+        stat = (p / 'stat').read_text().rsplit(') ', 1)[1].split()
+        argv = (p / 'cmdline').read_bytes().split(b'\0')
+        rows[int(p.name)] = (int(stat[1]), stat[19], argv)
+    except (OSError, ValueError, IndexError):
+        continue
+chosen = {parent}
+for _ in range(len(rows)):
+    new = {pid for pid, (ppid, _, _) in rows.items() if ppid in chosen}
+    if new <= chosen:
+        break
+    chosen |= new
+for pid in sorted(chosen - {parent}, reverse=True):
+    _, start, argv = rows[pid]
+    # 后代全部属该 runner；额外校验 rally tag，绝不跨 campaign。
+    if any(b'esrally' in a for a in argv):
+        tags = [a.split(b'=', 1)[-1].decode(errors='replace') for a in argv if b'campaign:' in a]
+        if not any('campaign:' + camp in t.split(',') for t in tags):
+            continue
+    print('%s:%s' % (pid, start))
+PY
 }
-rally_pids() { pgrep -f "esrally .*campaign:${CAMP}" 2>/dev/null | grep -vx "$SELF"; }
-
-echo "=== [1] 停调度器 ==="
-for p in $(runner_pids); do echo "  TERM $p"; kill -TERM "$p" 2>/dev/null; done
+signal_identity() { # <pid:starttime> <signal>
+  local token="$1" sig="$2" pid="${1%%:*}" start="${1#*:}"
+  [ "$(proc_start "$pid")" = "$start" ] || return 0
+  echo "  $sig $pid"
+  kill "-$sig" "$pid" 2>/dev/null || [ ! -e "/proc/$pid" ]
+}
+pid=$(runner_meta_pid "$DIR") || die "无可验证的活 runner 身份，不发送信号（可用 close-campaign.sh 收尾已死 campaign）"
+start=$(proc_start "$pid") || die "runner 已退出"
+children=$(owned_children "$pid") || die "无法枚举目标 runner 后代"
+echo "=== 停止 campaign $CAMP（runner $pid）==="
+# 子进程先停，runner trap 得以收监控；仅发给刚捕获且 starttime 未变的 PID。
+for token in $children; do signal_identity "$token" TERM || die "停止后代失败"; done
+[ "$(runner_meta_pid "$DIR")" = "$pid" ] && signal_identity "$pid:$start" TERM
 sleep 3
-
-echo "=== [2] 停 esrally（含该 campaign 标签的）==="
-for p in $(rally_pids); do echo "  TERM $p"; kill -TERM "$p" 2>/dev/null; done
-sleep 4
-
-echo "=== [3] 兜底 KILL ==="
-for p in $(rally_pids); do echo "  KILL $p"; kill -KILL "$p" 2>/dev/null; done
-for p in $(runner_pids); do echo "  KILL $p"; kill -KILL "$p" 2>/dev/null; done
-sleep 2
-
-echo "=== [4] 残留检查 ==="
-left=""
-for p in $(runner_pids) $(rally_pids); do left="$left$(ps -p "$p" -o pid=,command= 2>/dev/null)
-"; done
-left=$(printf '%s' "$left" | sed '/^[[:space:]]*$/d')
-if [ -n "$left" ]; then echo "$left"; else echo "  无残留 ✓"; fi
-
-# 被 KILL 的 runner 写不了"campaign 结束"行（TERM 能由 run-bench.sh 的 trap 自己补），
-# 进度台会一直显示运行中 —— 停干净后兜底补写。参数既可能是全 id（控制台传的），
-# 也可能是前缀标签（手敲 ds2c）：有目录按 id，否则按前缀扫。
-echo "=== [5] 补结束行 ==="
-CLOSE="$HERE/close-campaign.sh"
-if [ -n "$left" ]; then
-  echo "  有残留进程，不补结束行；清干净后手动: $CLOSE ${CAMP}"
-elif [ ! -x "$CLOSE" ]; then
-  echo "  缺 $CLOSE，跳过"
-else
-  ROOT=$("$CLOSE" --print-root)
-  if [ -f "$ROOT/$CAMP/PROGRESS.txt" ]; then
-    "$CLOSE" --reason "stop-campaign.sh 停止" "$CAMP"
-  else
-    "$CLOSE" --reason "stop-campaign.sh 停止" --prefix "${CAMP}-"
-  fi
-fi
+for token in $children; do signal_identity "$token" KILL || die "停止后代失败"; done
+signal_identity "$pid:$start" KILL || die "停止 runner 失败"
+left=0
+for token in $children "$pid:$start"; do
+  [ "$(proc_start "${token%%:*}")" = "${token#*:}" ] && left=1
+done
+[ "$left" = 0 ] || die "目标 campaign 仍有残留，不补结束行"
+echo "  无残留"
+"$HERE/close-campaign.sh" --root "$ROOT" --reason "stop-campaign.sh 停止" "$CAMP"

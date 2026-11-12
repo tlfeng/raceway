@@ -17,6 +17,7 @@ raw 目录里是编排抓好的原始探针（缺失项记 null，不猜值）:
   packages.txt    campaign PACKAGES.txt 内容
 """
 import argparse
+import ast
 import datetime
 import hashlib
 import json
@@ -99,7 +100,7 @@ def latency_modes_of(operations):
     return modes
 
 
-def track_meta(track_dir, track_params):
+def track_meta(track_dir, track_params, mapping_text=None, settings_text=None):
     tp = dict(kv_track_params(track_params))
     res = {
         "shards": num(tp.get("number_of_shards")),
@@ -113,7 +114,19 @@ def track_meta(track_dir, track_params):
         "operations": {},
         "latency_modes": {},
         "source": {"bulk_size": None, "clients": None, "corpus_docs": None},
+        "knn_params": parse_knn_params('', {}, track_params=tp, mapping_text=mapping_text),
     }
+    measured_settings = index_settings(settings_text) or {}
+    for setting, field in (('number_of_shards', 'shards'), ('number_of_replicas', 'replicas')):
+        values = []
+        for settings in measured_settings.values():
+            value = settings.get('index.' + setting)
+            if value is None:
+                value = (settings.get('index') or {}).get(setting)
+            values.append(num(value))
+        if values and all(value is not None and value == values[0] for value in values):
+            res[field] = values[0]
+            res['source'][field] = 'index settings measured'
     if not track_dir or not os.path.isdir(track_dir):
         return res
     tj = os.path.join(track_dir, "track.json")
@@ -141,10 +154,17 @@ def track_meta(track_dir, track_params):
             if fn.endswith(".json"):
                 t = read(d, fn) or ""
                 spec.append(t)
-                op_files[fn] = t
+                op_files[sub + '/' + fn] = t
             elif fn.endswith(".py"):
                 py_blob.append(read(d, fn) or "")
     blob = "\n".join(spec)
+    rendered_index = render_param_values(read(track_dir, 'index.json'), tp)
+    for setting, field in (('number_of_shards', 'shards'), ('number_of_replicas', 'replicas')):
+        if res[field] is None:
+            match = re.search(r'"(?:index\.)?%s"\s*:\s*(\d+)' % setting, rendered_index)
+            if match:
+                res[field] = int(match.group(1))
+                res['source'][field] = 'track index rendered'
     for key, pat in (("bulk_size", r'"bulk-size"\s*:\s*\{\{\s*bulk_size\s*\|\s*default\((\d+)\)\}\}'),
                      ("clients", r'"clients"\s*:\s*\{\{\s*bulk_indexing_clients\s*\|\s*default\((\d+)\)\}\}')):
         if res[key] is None:
@@ -154,55 +174,153 @@ def track_meta(track_dir, track_params):
                 res["source"][key] = "track spec default"
     res["operations"] = parse_operations(blob)
     res["latency_modes"] = latency_modes_of(res["operations"])
-    res["knn_params"] = parse_knn_params(blob, op_files, "\n".join(py_blob))
+    res["knn_params"] = parse_knn_params(blob, op_files, "\n".join(py_blob),
+                                          track_params=tp, mapping_text=mapping_text)
     return res
 
 
-def parse_knn_params(spec_blob, op_files, py_blob=""):
-    """KNN 索引/查询参数 —— 没有就不臆造。
-
-    KNN 赛道只比吞吐不看召回、不记索引参数，"快"就无从判断是检索算法更优
-    还是候选集/近似程度不同。这里把 dims / 索引类型 / m / ef_construction /
-    num_candidates / 每个 task 的 k 一起落库。
-    """
-    p = {}
-    m = re.search(r'"dims"\s*:\s*(\d+)', spec_blob or "")
-    if m:
-        p["dims"] = int(m.group(1))
-    m = re.search(r'"element_type"\s*:\s*"([^"]+)"', spec_blob or "")
-    if m:
-        p["element_type"] = m.group(1)
-    m = re.search(r'"index_options"\s*:\s*\{[^}]*?"type"\s*:\s*"([^"]+)"', spec_blob or "", re.S)
-    if m:
-        p["index_type"] = m.group(1)
-    for key, field in (("m", "m"), ("ef_construction", "ef_construction")):
-        mm = re.search(r'"index_options"\s*:\s*\{[^}]*?"%s"\s*:\s*(\d+)' % key, spec_blob or "", re.S)
-        if mm:
-            p[field] = int(mm.group(1))
-    # num_candidates 在 param-source 的 .py 里（默认 100），spec JSON 里也可能出现
-    for blob in (spec_blob or "", py_blob or ""):
-        mm = re.search(r'"num[-_]candidates"\s*:\s*(\d+)', blob) or \
-             re.search(r'"num-candidates"\s*,\s*(\d+)', blob)
-        if mm:
-            p["num_candidates"] = int(mm.group(1))
-            break
-    kmap = {}
-    for fname, text in (op_files or {}).items():
-        try:
-            d = json.loads(text)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(d, dict):
-            continue
-        name = d.get("name")
-        k = d.get("k")
-        if name and k is not None:
+def render_param_values(blob, params):
+    """只替换参数及字面量 default，不执行模板代码；未知表达式留空，绝不落库 Jinja。"""
+    def replace(match):
+        expr = match.group(1).strip()
+        parsed = re.fullmatch(r"([a-zA-Z_]\w*)(?:\s*\|\s*default\((.*?)\))?", expr)
+        if not parsed:
+            return ''
+        name, default = parsed.groups()
+        value = params.get(name)
+        if value is None and default is not None:
             try:
-                kmap[name] = int(k)
-            except (TypeError, ValueError):
-                pass
+                value = ast.literal_eval(default.strip())
+            except (ValueError, SyntaxError):
+                value = None
+        return str(value) if value is not None else ''
+    return re.sub(r'\{\{(.*?)\}\}', replace, blob or '', flags=re.S)
+
+
+def mapping_knn_params(mapping_text):
+    """从实测 mapping 中取 dense_vector / knn_vector，冲突字段不混成一套配置。"""
+    if not mapping_text:
+        return None
+    try:
+        mapping = json.loads(mapping_text) if isinstance(mapping_text, str) else mapping_text
+    except (ValueError, TypeError):
+        return None
+    vectors = []
+    def visit(value):
+        if not isinstance(value, dict):
+            return
+        kind = value.get('type')
+        if kind in ('dense_vector', 'knn_vector'):
+            options = value.get('index_options') or {}
+            method = value.get('method') or {}
+            parameters = method.get('parameters') or {}
+            record = {'dims': value.get('dims', value.get('dimension')),
+                      'element_type': value.get('element_type', value.get('data_type')),
+                      'index_type': options.get('type') or method.get('name'),
+                      'm': options.get('m', parameters.get('m')),
+                      'ef_construction': options.get('ef_construction', parameters.get('ef_construction')),
+                      'engine': method.get('engine'), 'encoder': parameters.get('encoder'),
+                      'mode': value.get('mode'), 'compression_level': value.get('compression_level')}
+            vectors.append({k: v for k, v in record.items() if v is not None})
+        for child in value.values():
+            if isinstance(child, dict):
+                visit(child)
+    visit(mapping)
+    if not vectors:
+        return None
+    keys = set().union(*(v.keys() for v in vectors))
+    agreed = {k: vectors[0][k] for k in keys if k in vectors[0]
+              and all(v.get(k) == vectors[0][k] for v in vectors)}
+    agreed['index_params_source'] = 'index mapping measured'
+    return agreed
+
+
+def parse_knn_params(spec_blob, op_files, py_blob='', track_params=None, mapping_text=None):
+    """KNN 参数以实测 mapping 优先；声明只做参数/default 渲染，不保存 Jinja。"""
+    tp = dict(kv_track_params(track_params)) if isinstance(track_params, str) else (track_params or {})
+    spec = render_param_values(spec_blob, tp)
+    p = {}
+    for key, field in (('dims', 'dims'), ('dimension', 'dims')):
+        match = re.search(r'"%s"\s*:\s*(\d+)' % key, spec)
+        if match:
+            p[field] = int(match.group(1))
+            break
+    for key in ('element_type', 'index_type'):
+        pattern = (r'"element_type"\s*:\s*"([^"{}]+)"' if key == 'element_type'
+                   else r'"index_options"\s*:\s*\{[^}]*?"type"\s*:\s*"([^"{}]+)"')
+        match = re.search(pattern, spec, re.S)
+        if match:
+            p[key] = match.group(1)
+    # OpenSearch 的 knn_vector 使用 method.name/engine/parameters。
+    method = re.search(r'"method"\s*:\s*\{(.*?)\n?\s*\}', spec, re.S)
+    if method:
+        for key, field in (('name', 'index_type'), ('engine', 'engine')):
+            match = re.search(r'"%s"\s*:\s*"([^"{}]+)"' % key, method.group(1))
+            if match:
+                p[field] = match.group(1)
+    for key in ('m', 'ef_construction'):
+        match = re.search(r'"(?:index_options|parameters)"\s*:\s*\{[^}]*?"%s"\s*:\s*(\d+)' % key,
+                          spec, re.S)
+        if match:
+            p[key] = int(match.group(1))
+    for key in ('mode', 'compression_level'):
+        match = re.search(r'"%s"\s*:\s*"([^"{}]+)"' % key, spec)
+        if match:
+            p[key] = match.group(1)
+    if p:
+        p['index_params_source'] = 'track spec rendered'
+    measured = mapping_knn_params(mapping_text)
+    if measured:
+        # 不拿声明补实测缺失值（引擎默认值未知），避免把拒绝/回落掩盖成声明成功。
+        p = measured
+    operation_texts = [render_param_values(text, tp) for text in (op_files or {}).values()]
+    search_blob = '\n'.join(operation_texts + [spec, py_blob or ''])
+    for names, field in ((r'num[-_]candidates', 'num_candidates'), (r'ef[-_]search', 'ef_search')):
+        match = re.search(r'"(?:%s)"\s*:\s*(\d+)' % names, search_blob) or \
+                re.search(r'"(?:%s)"\s*,\s*(\d+)' % names, search_blob)
+        override = tp.get(field) or tp.get(field.replace('_', '-'))
+        value = num(override) if override is not None else (int(match.group(1)) if match else None)
+        if value is not None:
+            p[field] = value
+    if 'ef_search' in p:
+        p['search_budget_type'] = 'ef_search'
+    elif 'num_candidates' in p:
+        p['search_budget_type'] = 'num_candidates'
+    operation_rows = []
+    for text in operation_texts:
+        try:
+            operations = json.loads(text)
+        except (ValueError, TypeError):
+            try:
+                # operations/default.json 是多个 JSON 对象的片段（由 track collect 拼成数组）。
+                operations = json.loads('[' + text + ']')
+            except (ValueError, TypeError):
+                continue
+        if isinstance(operations, dict):
+            operations = [operations]
+        if isinstance(operations, list):
+            operation_rows.extend(op for op in operations if isinstance(op, dict))
+    kmap, budgets = {}, {}
+    for operation in operation_rows:
+        name, k = operation.get('name'), operation.get('k')
+        if not name:
+            continue
+        if type(k) is int:
+            kmap[name] = k
+        for field in ('ef_search', 'num_candidates'):
+            value = operation.get(field, operation.get(field.replace('_', '-')))
+            if type(value) is int:
+                budgets[name] = {'type': field, 'value': value}
+                break
+    if budgets:
+        p['search_budget_by_task'] = budgets
+        # 多任务预算不同，单个 scalar 不能冒充整场统一预算。
+        for field in ('ef_search', 'num_candidates'):
+            values = {b['value'] for b in budgets.values() if b['type'] == field}
+            if len(values) > 1:
+                p.pop(field, None)
     if kmap:
-        p["k_by_task"] = kmap
+        p['k_by_task'] = kmap
     return p or None
 
 
@@ -396,7 +514,8 @@ def main():
         }
 
     host = kv(read(args.raw, "host.txt"))
-    tm = track_meta(args.track_dir, args.track_params)
+    tm = track_meta(args.track_dir, args.track_params, read(args.raw, "index-mapping.txt"),
+                    read(args.raw, "index-settings.txt"))
     pkg = read(args.raw, "packages.txt") or ""
     sha = None
     if args.pkg:
@@ -526,17 +645,16 @@ def index_settings(text):
 def engine_name(pkg):
     """包名 → 引擎名（es819 车不能再记成 easysearch）"""
     b = os.path.basename(pkg or "")
-    if b.startswith("elasticsearch"):
-        return "elasticsearch"
-    if b.startswith("easysearch"):
-        return "easysearch"
+    for name in ("elasticsearch", "easysearch", "opensearch"):
+        if b.startswith(name + "-"):
+            return name
     return None
 
 
 def version_from_pkg(pkg):
     if not pkg:
         return None
-    m = re.search(r"^(?:easysearch|elasticsearch)-([0-9][^-]*(?:-[0-9]+)?)-", os.path.basename(pkg))
+    m = re.search(r"^(?:easysearch|elasticsearch|opensearch)-([0-9][^-]*(?:-[0-9]+)?)-", os.path.basename(pkg))
     return m.group(1) if m else None
 
 

@@ -34,7 +34,7 @@ QUIET_FREE_GB=${QUIET_FREE_GB:-20}         # 磁盘可用 GB
 #
 # 只查"这几个端口有没有人在听"，不查进程名（避免误伤别人的同端口服务）。
 # 逃生阀：HOST_QUIET_PORTS="" 可关掉这条检查（vm-bench.env 里设）。
-HOST_QUIET_PORTS=${HOST_QUIET_PORTS:-"9202 9237 5601"}
+HOST_QUIET_PORTS=${HOST_QUIET_PORTS-"9202 9237 5601"}
 
 # 另查指标库的**开机自启**状态：端口查不到 ≠ 窗口期不会被拉回来。
 # 逃生阀：HOST_QUIET_AUTOSTART="" 可关掉这条检查（vm-bench.env 里设）。
@@ -55,26 +55,29 @@ host_busy_ports() { # 列出宿主上正在监听的旁路端口（空格分隔�
 # 把监控脚本分发到虚机（幂等）
 push_monitor() {
   local ip
+  safe_abs_path "$MON_DIR" || return 1
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "mkdir -p $MON_DIR"
-    vmPut "$ip" "$LIB_DIR/load-monitor.sh" "$MON_DIR/load-monitor.sh"
-    vm "$ip" "chmod +x $MON_DIR/load-monitor.sh"
+    vm "$ip" "mkdir -p '$MON_DIR'" &&
+    vmPut "$ip" "$LIB_DIR/load-monitor.sh" "$MON_DIR/load-monitor.sh" &&
+    vm "$ip" "chmod +x '$MON_DIR/load-monitor.sh'" || return 1
   done
 }
 
 quiet_check() {
-  push_monitor
-  local fail=0 ip out load steal bench free foreign
+  push_monitor || { log "FAIL: 监控脚本分发失败"; return 1; }
+  local fail=0 ip out load steal bench free foreign i
   for i in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$i]}"
-    out=$(vm "$ip" "ENGINE_MARK='$ENGINE_MARK' $MON_DIR/load-monitor.sh probe 6" 2>/dev/null) || { log "FAIL ${VM_NAMES[$i]}: probe 执行失败"; fail=1; continue; }
+    out=$(vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") ENGINE_MARK=$(shell_quote "$ENGINE_MARK") '$MON_DIR/load-monitor.sh' probe 6" 2>/dev/null) || { log "FAIL ${VM_NAMES[$i]}: probe 执行失败"; fail=1; continue; }
     log "  ${VM_NAMES[$i]}: $out"
     load=$(echo "$out"    | grep -o 'load1_avg=[0-9.]*'     | cut -d= -f2)
     steal=$(echo "$out"   | grep -o 'steal_max=[0-9.]*'     | cut -d= -f2)
     bench=$(echo "$out"   | grep -o 'bench_cpu_avg=[0-9.]*' | cut -d= -f2)
     foreign=$(echo "$out" | grep -o 'foreign_cpu_max=[0-9.]*' | cut -d= -f2)
-    free=$(vm "$ip" "df -BG --output=avail / | tail -1 | tr -d 'G'")
-    [ -z "$load" ]    && { log "FAIL ${VM_NAMES[$i]}: probe 无输出"; fail=1; continue; }
+    free=$(vm "$ip" "df -BG --output=avail / | tail -1 | tr -d ' G'") || { log "FAIL ${VM_NAMES[$i]}: 磁盘检查失败"; fail=1; continue; }
+    if ! [[ "$load" =~ ^[0-9]+([.][0-9]+)?$ && "$steal" =~ ^[0-9]+([.][0-9]+)?$ && "$bench" =~ ^[0-9]+([.][0-9]+)?$ && "$foreign" =~ ^[0-9]+([.][0-9]+)?$ && "$free" =~ ^[0-9]+$ ]]; then
+      log "FAIL ${VM_NAMES[$i]}: probe/磁盘字段缺失或非法"; fail=1; continue
+    fi
     if awk -v a="$load" -v b="$QUIET_LOAD1" 'BEGIN{exit !(a>b)}'; then log "FAIL ${VM_NAMES[$i]}: load1=$load > $QUIET_LOAD1（虚机不安静）"; fail=1; fi
     if awk -v a="${steal:-0}" -v b="$QUIET_STEAL" 'BEGIN{exit !(a>=b)}'; then log "FAIL ${VM_NAMES[$i]}: steal_max=${steal}% >= $QUIET_STEAL%（宿主机超卖/邻居噪声）"; fail=1; fi
     if awk -v a="${bench:-0}" -v b="$QUIET_BENCH_CPU" 'BEGIN{exit !(a>=b)}'; then log "FAIL ${VM_NAMES[$i]}: bench 进程 CPU ${bench}% >= $QUIET_BENCH_CPU%（残留引擎或 ENGINE_MARK 错位）"; fail=1; fi
@@ -98,7 +101,7 @@ quiet_check() {
   # 注意：压测后用 systemctl start 看数**不会**改变 enable 状态，只有显式
   # enable 才会；所以这里只在"显式 enable 过"时拦。
   # 逃生阀：HOST_QUIET_AUTOSTART="" 可关掉这条检查（vm-bench.env 里设）。
-  if [ -n "${HOST_QUIET_AUTOSTART:-on}" ]; then
+  if [ -n "${HOST_QUIET_AUTOSTART-on}" ]; then
     local ms_enabled; ms_enabled=$(systemctl is-enabled easysearch-metric-store.service 2>/dev/null || echo "")
     if [ "$ms_enabled" = "enabled" ]; then
       log "FAIL 压测机: 指标库开机自启还开着（easysearch-metric-store.service = enabled）"

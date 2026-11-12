@@ -1,7 +1,7 @@
 {% import "rally.helpers" as rally with context %}
 {
   "version": 2,
-  "description": "OpenSearch k-NN 1024-dim float vectors (on_disk mode: faiss ivf + binary quantization + rescore), 1M docs, separated write/query with segment gate",
+  "description": "OpenSearch k-NN 1024-dim float vectors (on_disk: faiss HNSW m=32/efC=100 + 32x binary quantization + rescore 2.0), 1M docs, separated write/query with segment gate",
   "indices": [ { "name": "vectors", "body": "index.json" } ],
   "corpora": [
     {

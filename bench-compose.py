@@ -31,7 +31,9 @@ serve 是三合一 Web 控制台（原"排程编排台"扩容）：
 """
 import argparse
 import datetime
+import hashlib
 import importlib
+import secrets
 import json
 import os
 import posixpath
@@ -42,6 +44,8 @@ import sys
 import threading
 import time
 import webbrowser
+from dataclasses import dataclass
+from types import MappingProxyType
 from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -57,6 +61,72 @@ DS_TIERS = ['ds-g1920', 'ds-j2048', 'ds-j1024', 'ds-g960', 'ds-j768', 'ds-j512',
 DEFAULT_EST = 45
 
 Car = namedtuple('Car', 'name label engine build jdk_dir config')
+SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
+
+
+def safe_name(value, label='tag'):
+    if not isinstance(value, str) or not SAFE_NAME.fullmatch(value):
+        raise ValueError('%s 只能是安全单文件名（1–80 位字母/数字/._-，首位为字母或数字）' % label)
+    return value
+
+
+def integer(value, label, minimum=0, maximum=100000):
+    if isinstance(value, bool) or not re.fullmatch(r'-?\d+', str(value)):
+        raise ValueError('%s 必须是整数' % label)
+    result = int(value)
+    if not minimum <= result <= maximum:
+        raise ValueError('%s 必须在 %d–%d 之间' % (label, minimum, maximum))
+    return result
+
+
+def canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+@dataclass(frozen=True)
+class ComposeSnapshot:
+    """单请求的不可变执行材料；上传、dry-run、起跑不得再读共享页面状态。"""
+    cars: tuple
+    rows: tuple
+    tag: str
+    schedule: str
+    cars_text: str
+    what: str
+    ds_hours: int
+    camp_prefix: str
+    digest: str
+    est_total_min: int
+
+    def payload(self):
+        return {'tag': self.tag, 'schedule': self.schedule, 'cars': self.cars_text,
+                'what': self.what, 'ds_hours': self.ds_hours,
+                'camp_prefix': self.camp_prefix, 'digest': self.digest}
+
+
+def make_snapshot(cars, rows, tag, est_map, est_default, recall, what, ds_hours=0,
+                  camp_prefix=None):
+    ds_hours = integer(ds_hours, 'DS_HOURS', 0, 8760)
+    prefix = safe_name(camp_prefix or 'jdk3', 'campaign 前缀')
+    if not rows:
+        raise ValueError('排程不能为空')
+    if not isinstance(what, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', what):
+        raise ValueError('非法 runner 赛道分支')
+    # 自动 tag 取内容摘要而非时钟；跨 CLI preview/start 仍能复用相同材料。
+    seed = {'cars': [list(a) for a in cars], 'rows': rows,
+            'est': {tk: est_map.get(tk, est_default) for _, tk, _ in rows},
+            'est_default': est_default, 'recall': recall, 'what': what,
+            'ds_hours': ds_hours, 'camp_prefix': prefix}
+    tag = safe_name(tag or ('compose-' + hashlib.sha256(canonical_json(seed).encode('utf-8')).hexdigest()[:20]))
+    schedule = render_schedule(rows, cars, tag, est_map, est_default, recall)
+    cars_text = render_cars(cars, tag)
+    back = [(a, t, r) for a, t, r, _, _ in schedule_rows_from_text(schedule)]
+    if back != list(rows):
+        raise ValueError('渲染结果与生成序不一致')
+    material = {'tag': tag, 'schedule': schedule, 'cars': cars_text, 'what': what,
+                'ds_hours': ds_hours, 'camp_prefix': prefix}
+    digest = hashlib.sha256(canonical_json(material).encode('utf-8')).hexdigest()
+    return ComposeSnapshot(tuple(cars), tuple(rows), tag, schedule, cars_text, what,
+                           ds_hours, prefix, digest, est_total_min(rows, est_map, est_default))
 
 # ============================================================ 纯函数（可测）
 
@@ -90,7 +160,16 @@ def validate_cars(cars):
     """
     problems = []
     seen = {}
+    names = set()
     for a in cars:
+        for value, label in ((a.name, '车名'), (a.label, 'CAR_LABEL')):
+            try:
+                safe_name(value, label)
+            except ValueError as e:
+                problems.append(('error', str(e)))
+        if a.name in names:
+            problems.append(('error', '车名重复: %s' % a.name))
+        names.add(a.name)
         if a.label in seen:
             problems.append(('error', 'CAR_LABEL 重复: %s（%s 与 %s）' % (a.label, seen[a.label], a.name)))
         else:
@@ -119,7 +198,7 @@ def parse_est_overrides(pairs):
         k, _, v = p.partition('=')
         if not k or not v.isdigit():
             raise ValueError('--est 期望 <赛道>=<分钟>，得到: %r' % p)
-        out[k] = int(v)
+        out[k] = integer(v, '--est 分钟', 1, 100000)
     return out
 
 
@@ -131,10 +210,9 @@ def render_schedule(rows, cars, tag, est_map=None, est_default=DEFAULT_EST, reca
     """
     est_map = est_map or {}
     by_name = {a.name: a for a in cars}
-    now = datetime.datetime.now().strftime('%F %T')
     head = [
         '# raceway compose 排程：tag=%s' % tag,
-        '# 生成：bench-compose.py @ %s' % now,
+        '# 生成：bench-compose.py（确定性快照）',
         '# 车序（order_for_round 右旋基准序）： %s' % ' '.join(a.name for a in cars),
         '# 交错：赛道外层 → 轮次 → 车右旋（复刻 run-bench.sh 非排程主循环，方法学不变）',
         '# 每行：<车> <赛道> <轮次> <recall|norecall> <est分钟>',
@@ -163,10 +241,9 @@ def schedule_rows_from_text(text):
 
 def render_cars(cars, tag):
     """把车候选固化为 <tag>-cars.conf（campaign 自带车定义，可指纹化）。"""
-    now = datetime.datetime.now().strftime('%F %T')
     head = [
         '# raceway compose 车定义：tag=%s' % tag,
-        '# 生成：bench-compose.py @ %s（源自所选车定义文件）' % now,
+        '# 生成：bench-compose.py（确定性快照；源自所选车定义文件）',
         '# 每行：<车名> <配置行...>   配置行语法与 CONF_FILE 一致',
         '',
     ]
@@ -334,13 +411,15 @@ def what_for(tracks):
 # ============================================================ ssh / 远端
 
 def ssh_run(ssh_target, cmd, input_text=None, timeout=120):
-    """跑一条远端命令，返回 (returncode, stdout)。ssh 约定与 bench-queue 相同。
-
-    stderr 合并进 stdout：dry-run 的报错全在 stderr，丢了就是"rc=1 空输出"没法排障。
-    """
-    full = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15']
-    full += (ssh_target or '').split()
-    full += [cmd + ' 2>&1']
+    """执行远端命令（或 Unix 本机）；返回码与 stderr 都必须保留。"""
+    if ssh_target:
+        full = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15']
+        full += ssh_target.split()
+        full += [cmd + ' 2>&1']
+    else:
+        if os.name == 'nt':
+            raise SystemExit('Windows 上执行 runner 操作必须指定 --ssh；gen/cars 可离线使用')
+        full = ['/bin/bash', '-c', cmd + ' 2>&1']
     p = subprocess.run(full, input=input_text, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout
 
@@ -356,65 +435,227 @@ def read_cars_file(args):
         return f.read()
 
 
-def upload(args, tag, schedule_text, cars_text):
-    """排程 + 车定义落到 <root>/schedules/<tag>.conf / <tag>-cars.conf。"""
-    sdir = posixpath.join(args.root, 'schedules')
-    rc, out = ssh_run(args.ssh, 'mkdir -p %s' % shlex.quote(sdir))
+# 远端只执行这一份结构化辅助程序。参数是 JSON，文件内容经 JSON 传入而不是拼 shell。
+# runner 的原子锁是最终互斥边界；这里的 mutex 仅作起跑前预检。
+_REMOTE = r'''
+import fcntl, hashlib, json, os, pathlib, re, subprocess, sys, tempfile, time
+mode, p = sys.argv[1], json.load(sys.stdin)
+root = pathlib.Path.cwd().resolve()
+results = pathlib.Path(os.environ['RESULTS_ROOT'])
+if not results.is_absolute():
+    results = root / results
+results = results.resolve()
+
+def fail(message):
+    raise RuntimeError(message)
+
+def proc_identity(pid):
+    text = pathlib.Path('/proc/%d/stat' % pid).read_text()
+    fields = text[text.rfind(')') + 2:].split()
+    if fields[0] == 'Z':
+        fail('runner 已成为僵尸进程')
+    boot = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    cmd = pathlib.Path('/proc/%d/cmdline' % pid).read_bytes().split(b'\0')
+    return fields[19], boot, [os.fsdecode(x) for x in cmd if x]
+
+def files():
+    tag = p['tag']
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', tag):
+        fail('非法 tag')
+    material = {k: p[k] for k in ('tag', 'schedule', 'cars', 'what', 'ds_hours', 'camp_prefix')}
+    digest = hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True,
+                                      separators=(',', ':')).encode()).hexdigest()
+    if digest != p['digest']:
+        fail('请求摘要不匹配')
+    manifest = json.dumps({'digest': digest, 'what': p['what'], 'ds_hours': p['ds_hours'],
+                           'camp_prefix': p['camp_prefix']}, sort_keys=True) + '\n'
+    return {tag + '.conf': p['schedule'].encode(), tag + '-cars.conf': p['cars'].encode(),
+            tag + '.compose.json': manifest.encode()}
+
+def check_files(expected):
+    d = root / 'schedules'
+    if d.is_symlink() or not d.is_dir():
+        fail('schedules 必须是真实目录')
+    for name, data in expected.items():
+        path = d / name
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+            fail('排程快照不存在或内容已变更: ' + name)
+    return d
+
+try:
+    if mode == 'inspect':
+        reply = {'results_root': str(results)}
+    elif mode == 'mutex':
+        # 与 runner 共用 RESULTS_ROOT/.runner.lock；预检释放后最终加锁仍由 runner 执行。
+        results.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(results / '.runner.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fail('远端已有活跃 runner（.runner.lock 被占用）')
+        finally:
+            os.close(fd)
+        reply = {'unlocked': True, 'results_root': str(results)}
+    elif mode == 'upload':
+        expected = files()
+        d = root / 'schedules'
+        d.mkdir(exist_ok=True)
+        if d.is_symlink():
+            fail('schedules 不允许符号链接')
+        fd = os.open(str(d / '.compose-upload.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            present = [os.path.lexists(d / n) for n in expected]
+            if any(present):
+                check_files(expected)  # 只能精确同内容幂等，不补写/覆盖部分旧文件。
+            else:
+                created = []
+                with tempfile.TemporaryDirectory(prefix='.compose-', dir=d) as temp:
+                    try:
+                        for name, data in expected.items():
+                            staged = pathlib.Path(temp) / name
+                            with open(staged, 'xb') as f:
+                                f.write(data)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.chmod(staged, 0o444)
+                            os.link(staged, d / name)  # 不覆盖，逐文件原子发布。
+                            created.append(d / name)
+                        directory = os.open(str(d), os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+                    except BaseException:
+                        for path in created:
+                            path.unlink()
+                        raise
+        reply = {'digest': p['digest']}
+    elif mode == 'verify':
+        check_files(files())
+        reply = {'digest': p['digest']}
+    elif mode == 'launch':
+        d = check_files(files())
+        cid = p['cid']
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', cid):
+            fail('非法 campaign 名')
+        camp = results / cid
+        if os.path.lexists(camp):
+            fail('campaign 已存在，禁止隐式续跑')
+        log_name = 'compose-' + cid + '.log'
+        env = dict(os.environ, SCHEDULE_FILE=str(d / (p['tag'] + '.conf')),
+                   CARS_FILE=str(d / (p['tag'] + '-cars.conf')), DS_HOURS=str(p['ds_hours']),
+                   CAMP_ID=cid, CAMP_PREFIX=p['camp_prefix'], COMPOSE_DIGEST=p['digest'], DRY='0')
+        # runner exec 快照前后 PID 不变；锁路径必须与本次解析的 RESULTS_ROOT 相同。
+        env.pop('RACEWAY_SNAPSHOT_ROOT', None)
+        env.pop('RACEWAY_SOURCE_DIR', None)
+        env['RACEWAY_ENV_FILE'] = str(root / 'vm-bench.env')
+        # Popen 的真实子进程 PID 不经 shell $! / setsid 二次 fork 猜测。
+        with open(root / log_name, 'xb') as log, open(os.devnull, 'rb') as null:
+            child = subprocess.Popen([str(root / 'run-bench.sh'), p['what']], cwd=root,
+                                     env=env, stdin=null, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True, close_fds=True)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                fail('runner 提前退出 rc=%d，见 %s' % (child.returncode, log_name))
+            pidfile, meta = camp / 'RUNNER.pid', camp / 'RUNNER.meta'
+            if pidfile.is_file() and meta.is_file():
+                if pidfile.is_symlink() or meta.is_symlink() or camp.is_symlink():
+                    fail('campaign 身份文件不能是符号链接')
+                values = meta.read_text().strip().split('\t')
+                if len(values) != 4:
+                    fail('RUNNER.meta 格式错误')
+                pid, ticks, boot, script = values
+                now_ticks, now_boot, argv = proc_identity(child.pid)
+                if pid != str(child.pid) or pidfile.read_text().strip() != pid:
+                    fail('RUNNER.pid/meta 与启动 PID 不一致')
+                if ticks != now_ticks or boot != now_boot or not os.path.isabs(script) or script not in argv:
+                    fail('RUNNER.meta 与实际进程身份不一致')
+                reply = {'campaign': cid, 'pid': child.pid, 'log': log_name,
+                         'results_root': str(results), 'digest': p['digest'],
+                         'start_ticks': now_ticks, 'boot_id': now_boot, 'script': script}
+                break
+            time.sleep(0.2)
+        else:
+            fail('30 秒内未确认 runner 身份；可能已启动，禁止盲目重试，见 ' + log_name)
+    else:
+        fail('未知远端操作')
+    print(json.dumps(reply, ensure_ascii=False))
+except Exception as e:
+    print(json.dumps({'error': str(e)}, ensure_ascii=False))
+    sys.exit(1)
+'''
+
+
+def remote_operation(args, mode, payload=None, timeout=120):
+    """只在子 shell 中读取 runner 配置；RESULTS_ROOT 与 runner 同一解析环境。"""
+    root = args.root
+    if args.ssh and ('\\' in root or not posixpath.isabs(root)):
+        raise SystemExit('--root 必须是远端绝对 POSIX 路径，不能含反斜杠')
+    shell = ('set -e; cd "$1"; set -a; source ./vm-bench.env >/dev/null; '
+             ': "${ROOT:=$PWD}"; : "${RESULTS_ROOT:=$ROOT/campaigns}"; '
+             'export ROOT RESULTS_ROOT; exec python3 -B -c "$2" "$3"')
+    cmd = 'bash -c %s -- %s %s %s' % (
+        shlex.quote(shell), shlex.quote(root), shlex.quote(_REMOTE), shlex.quote(mode))
+    rc, out = ssh_run(args.ssh, cmd, input_text=canonical_json(payload or {}), timeout=timeout)
     if rc != 0:
-        raise SystemExit('远端建目录失败: %s' % out.strip())
-    for name, text in (('%s.conf' % tag, schedule_text), ('%s-cars.conf' % tag, cars_text)):
-        dst = posixpath.join(sdir, name)
-        rc, out = ssh_run(args.ssh, 'cat > %s' % shlex.quote(dst), input_text=text)
-        if rc != 0:
-            raise SystemExit('上传失败 %s: %s' % (dst, out.strip()))
-    return sdir
+        raise SystemExit('远端 %s 失败（rc=%d）: %s' % (mode, rc, out.strip()))
+    try:
+        reply = json.loads(out)
+    except ValueError:
+        raise SystemExit('远端 %s 未返回有效 JSON，拒绝继续: %s' % (mode, out.strip()))
+    if not isinstance(reply, dict) or reply.get('error'):
+        raise SystemExit('远端 %s 响应无效: %s' % (mode, out.strip()))
+    return reply
+
+
+def upload(args, snapshot):
+    """同 tag 只能复用精确同内容；不同内容须换 tag，预览不得覆写正在使用的排程。"""
+    reply = remote_operation(args, 'upload', snapshot.payload())
+    if reply.get('digest') != snapshot.digest:
+        raise SystemExit('上传摘要未确认，拒绝继续')
 
 
 def remote_mutex_check(args):
-    """互斥预检：远端已有活跃 runner 时拒绝起跑。返回 None 或原因。"""
-    rc, out = ssh_run(args.ssh, "pgrep -af '[r]un-bench' || true")
-    pids = [l for l in out.splitlines() if l.strip()]
-    if pids:
-        return '远端已有活跃 runner，拒绝起跑：\n  ' + '\n  '.join(pids)
+    """传输、配置读取、锁检查失败均 fail closed；最终互斥仍由 runner 原子锁保证。"""
+    try:
+        reply = remote_operation(args, 'mutex')
+        if reply.get('unlocked') is not True:
+            return '远端互斥状态未确认，拒绝起跑'
+    except (SystemExit, OSError, subprocess.TimeoutExpired) as e:
+        return '远端互斥预检失败，拒绝起跑: %s' % e
     return None
 
 
-def remote_dry_run(args, tag, ds_hours, what=None):
-    """跑 runner 自己的 dry-run（排程校验 + 逐场引擎身份）。"""
-    sdir = posixpath.join(args.root, 'schedules')
-    cmd = ('cd %s && SCHEDULE_FILE=%s CARS_FILE=%s DS_HOURS=%d ./%s --dry-run %s'
-           % (shlex.quote(args.root),
-              shlex.quote(posixpath.join('schedules', '%s.conf' % tag)),
-              shlex.quote(posixpath.join('schedules', '%s-cars.conf' % tag)),
-              ds_hours, 'run-bench.sh', shlex.quote(what or DEFAULT_WHAT)))
+def remote_dry_run(args, snapshot):
+    """验证远端材料摘要后，dry-run 使用与起跑完全相同的排程及窗口。"""
+    verified = remote_operation(args, 'verify', snapshot.payload())
+    if verified.get('digest') != snapshot.digest:
+        raise SystemExit('远端快照摘要未确认')
+    cmd = ('cd %s && SCHEDULE_FILE=%s CARS_FILE=%s DS_HOURS=%d COMPOSE_DIGEST=%s '
+           './run-bench.sh --dry-run %s' % (
+               shlex.quote(args.root), shlex.quote('schedules/%s.conf' % snapshot.tag),
+               shlex.quote('schedules/%s-cars.conf' % snapshot.tag), snapshot.ds_hours,
+               shlex.quote(snapshot.digest), shlex.quote(snapshot.what)))
     return ssh_run(args.ssh, cmd, timeout=180)
 
 
-def remote_start(args, tag, ds_hours, camp_prefix, what=None):
-    """互斥预检通过后 setsid nohup 起跑；稍候回读新 campaign 目录。"""
+def remote_start(args, snapshot):
     why = remote_mutex_check(args)
     if why:
         raise SystemExit(why)
-    sdir = posixpath.join(args.root, 'schedules')
-    env = ('SCHEDULE_FILE=%s CARS_FILE=%s DS_HOURS=%d'
-           % (shlex.quote(posixpath.join('schedules', '%s.conf' % tag)),
-              shlex.quote(posixpath.join('schedules', '%s-cars.conf' % tag)), ds_hours))
-    if camp_prefix:
-        env += ' CAMP_PREFIX=%s' % shlex.quote(camp_prefix)
-    log = 'compose-%s.log' % tag
-    cmd = ('cd %s && %s setsid nohup ./run-bench.sh %s </dev/null >%s 2>&1 & echo STARTED'
-           % (shlex.quote(args.root), env, shlex.quote(what or DEFAULT_WHAT),
-              shlex.quote(log)))
-    rc, out = ssh_run(args.ssh, cmd)
-    if 'STARTED' not in out:
-        raise SystemExit('起跑命令未确认（rc=%d）: %s' % (rc, out.strip()))
-    # 给 runner 一点时间建 campaign 目录，再按前缀抓最新的
-    prefix = camp_prefix or 'jdk3'
-    time.sleep(6)
-    rc, out = ssh_run(args.ssh, 'ls -dt %s 2>/dev/null | head -1'
-                      % shlex.quote(posixpath.join(args.root, 'campaigns', '%s-*' % prefix)))
-    camp = out.strip().split('/')[-1] if out.strip() else '(未知，稍后用 bench-queue list 确认)'
-    return camp, log
+    # 明确且唯一的 campaign 身份，不以 latest/glob 猜测别人的 campaign。
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    cid = '%s-%s-%s' % (snapshot.camp_prefix, stamp, secrets.token_hex(6))
+    payload = dict(snapshot.payload(), cid=cid)
+    reply = remote_operation(args, 'launch', payload, timeout=60)
+    if (reply.get('campaign') != cid or reply.get('digest') != snapshot.digest
+            or not isinstance(reply.get('pid'), int) or reply['pid'] <= 1
+            or not reply.get('results_root') or not reply.get('log')):
+        raise SystemExit('起跑身份未确认；可能已启动，请检查远端日志，禁止盲目重试')
+    return cid, reply['log']
 
 
 # ============================================================ 子命令
@@ -463,7 +704,10 @@ def build_rows(args, cars):
             '可排的赛道：%s\n'
             '库里有历史数据的其他赛道只能看不能排（例如 hvtp200k-2s/3s 是旧版 runner 跑的）。'
             % ('、'.join(unknown), '、'.join(sorted(TRACK_CATALOG))))
-    rows = interleave(cars, tracks, args.rounds)
+    if len(set(tracks)) != len(tracks):
+        raise ValueError('赛道不能重复')
+    rounds = integer(args.rounds, '轮次', 1, 100)
+    rows = interleave(cars, tracks, rounds)
     # est：先取赛道清单的实测值，再让 --est 覆盖（--est 优先）
     est_map = track_est_map()
     est_map.update(parse_est_overrides(args.est))
@@ -473,7 +717,7 @@ def build_rows(args, cars):
 def compose_all(args):
     """cars 解析 + 校验 + 历史覆盖剔除 + 渲染。
 
-    返回 (cars, schedule_text, cars_text, rows, tag, plan)。
+    返回 (ComposeSnapshot, plan)。
     """
     cars = parse_cars(read_cars_file(args))
     if not cars:
@@ -521,13 +765,10 @@ def compose_all(args):
                          + '\n（EASYSEARCH 专有：ZSTD 压缩、index.source_reuse；'
                            'ES 的 index.codec 只有 default/best_compression，也不认 source_reuse）')
 
-    tag = args.tag or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
-    sched = render_schedule(rows, cars, tag, est_map, args.est_default, recall=args.recall)
-    # round-trip 自校验：渲染出来的文件按 runner 规则读回去必须等于生成序
-    back = [(a, t, r) for a, t, r, _, _ in schedule_rows_from_text(sched)]
-    if back != rows:
-        raise SystemExit('内部错误：渲染结果与生成序不一致（round-trip 失败）')
-    return cars, sched, render_cars(cars, tag), rows, tag, plan
+    snapshot = make_snapshot(cars, rows, args.tag, est_map,
+                             integer(args.est_default, 'est 默认分钟', 1), args.recall,
+                             args.what, args.ds_hours, args.camp_prefix)
+    return snapshot, plan
 
 
 def cmd_cars(args):
@@ -539,22 +780,22 @@ def cmd_cars(args):
 
 
 def cmd_gen(args):
-    cars, sched, _, rows, _, plan = compose_all(args)
+    snapshot, plan = compose_all(args)
     rep = report_skipped(plan)
     if rep:
         print(rep, file=sys.stderr)
-    sys.stdout.write(sched)
+    sys.stdout.write(snapshot.schedule)
 
 
 def cmd_preview(args):
-    cars, sched, cars_text, rows, tag, plan = compose_all(args)
-    upload(args, tag, sched, cars_text)
-    rc, out = remote_dry_run(args, tag, args.ds_hours, what=args.what)
+    snapshot, plan = compose_all(args)
+    upload(args, snapshot)
+    rc, out = remote_dry_run(args, snapshot)
     rep = report_skipped(plan)
     if rep:
         print(rep, file=sys.stderr)
-    print('== 排程文件（tag=%s，%d 场）==' % (tag, len(rows)))
-    sys.stdout.write(sched)
+    print('== 排程文件（tag=%s，%d 场，sha256=%s）==' % (snapshot.tag, len(snapshot.rows), snapshot.digest))
+    sys.stdout.write(snapshot.schedule)
     print('== run-bench.sh --dry-run（rc=%d）==' % rc)
     sys.stdout.write(out)
     if rc != 0:
@@ -564,20 +805,20 @@ def cmd_preview(args):
 def cmd_start(args):
     if not args.yes:
         raise SystemExit('起跑需显式确认：加 --yes（先 preview 检查过 dry-run 输出）')
-    cars, sched, cars_text, rows, tag, plan = compose_all(args)
+    snapshot, plan = compose_all(args)
     why = remote_mutex_check(args)
     if why:
         raise SystemExit(why)
-    upload(args, tag, sched, cars_text)
-    rc, out = remote_dry_run(args, tag, args.ds_hours, what=args.what)
+    upload(args, snapshot)
+    rc, out = remote_dry_run(args, snapshot)
     if rc != 0:
         print(out)
         raise SystemExit('dry-run 未通过，拒绝起跑（rc=%d）' % rc)
-    camp, log = remote_start(args, tag, args.ds_hours, args.camp_prefix, what=args.what)
+    camp, log = remote_start(args, snapshot)
     rep = report_skipped(plan)
     if rep:
         print(rep)
-    print('已起跑 tag=%s（%d 场）' % (tag, len(rows)))
+    print('已起跑 tag=%s（%d 场，sha256=%s）' % (snapshot.tag, len(snapshot.rows), snapshot.digest))
     print('campaign: %s' % camp)
     print('日志: %s@%s:%s' % (args.ssh, args.root, log))
     print('观测: python3 bench-compose.py serve --ssh %s   # 控制台「运行进度」页' % (args.ssh or '本机'))
@@ -742,6 +983,8 @@ let CODEC_TOKENS = [];
 let TOKEN_LABEL = {};
 let TOKEN_CODEC = {};
 let HIST = null;
+let CSRF = '', PREVIEW = null;
+function writeHeaders(){return {'Content-Type':'application/json','X-Raceway-CSRF':CSRF};}
 // 控制台状态：当前看的 campaign、轮询定时器、campaign 摘要列表、上一轮"是否已结束"（完成提醒用）
 let CURCID = null, POLLT = null, CAMPS = [], PREV_ENDED = null;
 const VT = {VALID:'✓已跑',DEGRADED:'~降级',HALF:'半',SKIP:'跳过',FAIL:'✗失败',UNKNOWN:'?'};
@@ -750,12 +993,13 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 async function boot(){
   const r = await fetch('/api/bootstrap'); const j = await r.json();
+  CSRF=j.csrf_token;
   CARS = j.cars; TRACKS = j.tracks||[]; TRACK_GROUPS = j.track_groups||[];
   BASE_TRACKS = (j.tracks||[]).filter(function(t){return !t.variant;});
   CODEC_TOKENS = j.codec_tokens||[]; TOKEN_LABEL = j.token_label||{};
   TOKEN_CODEC = j.token_codec||{};
   document.getElementById('cars').innerHTML = CARS.map(a =>
-    `<label><input type="checkbox" class="carck" value="${a.name}" checked> ${a.name} <small>(${a.engine}${a.build?'@'+a.build:''}${a.jdk_dir? ' + '+a.jdk_dir.split('/').pop():''})</small></label>`).join('');
+        `<label><input type="checkbox" class="carck" value="${esc(a.name)}" checked> ${esc(a.name)} <small>(${esc(a.engine)}${a.build?'@'+esc(a.build):''}${a.jdk_dir? ' + '+esc(a.jdk_dir.split('/').pop()):''})</small></label>`).join('');
   // 赛道按族渲染，**两层**：基础赛道 + 它的 压缩 × source_reuse 变体网格
   // （压缩与 source_reuse 是两个独立维度，正交可比 —— 网格就是那张二维表）
   let h='';
@@ -858,9 +1102,12 @@ function matrix(){
           include_covered:document.getElementById('incov').checked,
           tag:document.getElementById('tag').value.trim()};
 }
-async function post(path){ const r=await fetch(path,{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify(matrix())});
-  return {status:r.status, j:await r.json()}; }
+async function post(path){ const m=matrix(), key=JSON.stringify(m);
+  if(path==='/api/start' && PREVIEW && PREVIEW.key===key) m.digest=PREVIEW.digest;
+  const r=await fetch(path,{method:'POST',headers:writeHeaders(),body:JSON.stringify(m)});
+  const j=await r.json();
+  if(path==='/api/preview') PREVIEW=(r.ok && j.rc===0)?{key:key,digest:j.digest}:null;
+  return {status:r.status, j:j}; }
 function show(el,text){document.getElementById(el).textContent=text;}
 function setMsg(ok,text){const m=document.getElementById('msg');
   m.className=ok?'ok':'err'; m.textContent=' '+text;}
@@ -1167,7 +1414,7 @@ async function doStop(){
   if(!confirm('确认停止 '+CURCID+'？\\n将杀掉远端 runner 与 esrally 进程；campaign 目录保留，可断点续跑。'))return;
   setMsg(true,'停止中…');
   try{
-    const r=await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch('/api/stop',{method:'POST',headers:writeHeaders(),
       body:JSON.stringify({cid:CURCID})});
     const j=await r.json();
     if(r.status!=200){ show('ptail','停止失败: '+(j.error||'未知')); setMsg(false,'停止失败'); return; }
@@ -1182,7 +1429,7 @@ async function doDoctor(){
   show('out','体检中…');
   scrollOut();
   try{
-    const r=await fetch('/api/doctor',{method:'POST'});
+    const r=await fetch('/api/doctor',{method:'POST',headers:writeHeaders()});
     const j=await r.json();
     if(r.status!=200){ show('out','体检失败: '+(j.error||'未知')); setMsg(false,'体检失败'); return; }
     show('out',j.result);
@@ -1197,12 +1444,12 @@ function scrollOut(){
 
 async function doCompare(){
   const a=document.getElementById('cmpa').value, b=document.getElementById('cmpb').value;
-  if(!a||!b||a===b){ setMsg(false,'请选择两个不同的 campaign'); return; }
+  if(!a||!b){ setMsg(false,'请选择两个 campaign'); return; }
   const car_a=document.getElementById('cmpcara').value.trim();
   const car_b=document.getElementById('cmpcarb').value.trim();
   show('cmpout','对比中…（远端 car-compare，可能要几十秒）');
   try{
-    const r=await fetch('/api/compare',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch('/api/compare',{method:'POST',headers:writeHeaders(),
       body:JSON.stringify({a:a,b:b,car_a:car_a,car_b:car_b})});
     const j=await r.json();
     if(r.status!=200){ show('cmpout','对比失败: '+(j.error||'未知')); setMsg(false,'对比失败'); return; }
@@ -1243,12 +1490,18 @@ class ComposeState:
         self.args = args
         self.lock = threading.Lock()
         text = read_cars_file(args)
-        self.cars = parse_cars(text)
+        self.cars = tuple(parse_cars(text))
         self.cars_src_text = text
         self.problems = validate_cars(self.cars)
-        # 进度/历史页的 campaign 目录读取（本地或 ssh），与 bench-queue 同一抽象。
-        # Source 的 root 语义是 campaigns 目录，而 --root 是 raceway 根 —— 补一级。
-        self.src = Q.Source(root=posixpath.join(args.root, 'campaigns'), ssh=args.ssh)
+        # 远端从 vm-bench.env 子 shell 解析 RESULTS_ROOT；本地只读页面可显式提供。
+        if args.ssh:
+            self.results_root = remote_operation(args, 'inspect')['results_root']
+        else:
+            self.results_root = (getattr(args, 'results_root', None)
+                                 or posixpath.join(args.root, 'campaigns'))
+        self.src = Q.Source(root=self.results_root, ssh=args.ssh)
+        self.last = MappingProxyType({})  # 仅展示诊断；执行路径绝不读取它。
+        self.csrf_token = secrets.token_urlsafe(32)
         self._hist = None
         self._hist_at = 0.0
         self._hist_lock = threading.Lock()
@@ -1274,97 +1527,107 @@ class ComposeState:
         return ''
 
 
-def api_render(st, body):
-    cars = [a for a in st.cars if a.name in body['cars']] or st.cars
-    order = {a.name: i for i, a in enumerate(st.cars)}
-    cars = sorted(cars, key=lambda a: order[a.name])
-    problems = validate_cars(cars)
-    hard = [m for s, m in problems if s == 'error']
+def api_snapshot(st, body):
+    if not isinstance(body, dict):
+        raise ValueError('请求必须是 JSON 对象')
+    selected = body.get('cars')
+    if not isinstance(selected, list) or not selected or not all(isinstance(x, str) for x in selected):
+        raise ValueError('请至少选择一台车')
+    known = {a.name for a in st.cars}
+    unknown = set(selected) - known
+    if unknown or len(set(selected)) != len(selected):
+        raise ValueError('未知或重复车名: %s' % '、'.join(sorted(unknown or set(selected))))
+    cars = tuple(a for a in st.cars if a.name in selected)
+    hard = [m for s, m in validate_cars(cars) if s == 'error']
     if hard:
-        return 400, {'error': '；'.join(hard)}
-    if not body['tracks']:
-        return 400, {'error': '未选赛道'}
-    tracks = list(body['tracks'])
-    rounds = max(1, int(body['rounds']))
+        raise ValueError('；'.join(hard))
+    tracks = body.get('tracks')
+    if (not isinstance(tracks, list) or not tracks
+            or not all(isinstance(t, str) for t in tracks)):
+        raise ValueError('请至少选择一条赛道')
+    unknown = set(tracks) - set(TRACK_CATALOG)
+    if unknown or len(set(tracks)) != len(tracks):
+        raise ValueError('未知或重复赛道: %s' % '、'.join(sorted(unknown or set(tracks))))
+    rounds = integer(body.get('rounds', 1), '轮次', 1, 100)
     rows = interleave(cars, tracks, rounds)
-
-    # 已入库历史覆盖：默认剔除"当前 build 上已经跑过"的格
-    incov = bool(body.get('include_covered'))
-    cov = st.history()
-    plan = H.plan_cells(cov, cars, tracks, rounds, include_covered=incov)
-    if plan['skipped']:
-        rows = H.filter_rows(plan, rows)
+    if 'include_covered' in body and not isinstance(body['include_covered'], bool):
+        raise ValueError('include_covered 必须是布尔值')
+    plan = H.plan_cells(st.history(), cars, tracks, rounds,
+                        include_covered=body.get('include_covered', False))
+    rows = H.filter_rows(plan, rows)
     if not rows:
-        return 400, {'error': '矩阵里的每一格都已在指标库跑过（当前 build），无事可排。'
-                             '要重跑请勾选"含已跑过的格"。',
-                     'plan': plan}
-
-    # 引擎 × 变体兼容性（ZSTD / source_reuse 是 Easysearch 专有）
+        raise ValueError('矩阵里的每一格都已在指标库跑过（当前 build），无事可排。'
+                         '要重跑请勾选"含已跑过的格"。')
     bad = compat_problems(cars, rows)
     if bad:
-        return 400, {'error': '矩阵里有引擎与变体不兼容的组合：\n'
-                             + '\n'.join(x[2] for x in bad)
-                             + '\n（EASYSEARCH 专有：ZSTD 压缩、index.source_reuse；'
-                               'ES 的 index.codec 只有 default/best_compression，也不认 source_reuse）',
-                     'plan': plan}
-
-    tag = body.get('tag') or ('compose-%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
-    # est：赛道清单的实测值 → 界面/CLI 的覆盖值
+        raise ValueError('矩阵里有引擎与变体不兼容的组合：\n' + '\n'.join(x[2] for x in bad))
     est_map = track_est_map()
-    est_over = body.get('est') or ''
-    if est_over:
-        est_map.update(parse_est_overrides([p for p in est_over.split(',') if p.strip()]))
-    sched = render_schedule(rows, cars, tag, est_map,
-                            int(body.get('est_default') or DEFAULT_EST),
-                            recall=(body.get('recall') != 'norecall'))
-    # runner 的赛道分支参数：serve 模式没有 CLI 的 compose_all 推导，这里补上
-    # （GUI 的 preview/start 不能把 what=None 传给 runner，否则 dry-run 必失败）
-    what = body.get('what') or what_for(tracks)
-    est_total = est_total_min(rows, est_map, int(body.get('est_default') or DEFAULT_EST))
-    st.last = {'cars': cars, 'schedule': sched, 'tag': tag, 'plan': plan, 'what': what,
-               'est_total_min': est_total}
-    return 200, {'schedule': sched, 'rows': len(rows), 'plan': plan, 'what': what,
-                 'est_total_min': est_total}
+    overrides = body.get('est') or ''
+    if not isinstance(overrides, str):
+        raise ValueError('est 必须是 赛道=分钟 文本')
+    est_map.update(parse_est_overrides([p.strip() for p in overrides.split(',') if p.strip()]))
+    recall = body.get('recall', 'recall')
+    if recall not in ('recall', 'norecall'):
+        raise ValueError('探针必须是 recall 或 norecall')
+    snapshot = make_snapshot(cars, rows, body.get('tag'), est_map,
+                             integer(body.get('est_default', DEFAULT_EST), 'est 默认分钟', 1),
+                             recall != 'norecall', body.get('what') or what_for(tracks),
+                             body.get('ds_hours', getattr(st.args, 'ds_hours', 0)),
+                             body.get('camp_prefix') or getattr(st.args, 'camp_prefix', None))
+    expected_digest = body.get('digest')
+    if expected_digest is not None and expected_digest != snapshot.digest:
+        raise ValueError('矩阵或历史覆盖已变更，摘要与预览不一致；请重新预览后起跑')
+    return snapshot, plan
+
+
+def snapshot_response(snapshot, plan):
+    return {'schedule': snapshot.schedule, 'rows': len(snapshot.rows), 'plan': plan,
+            'what': snapshot.what, 'est_total_min': snapshot.est_total_min,
+            'tag': snapshot.tag, 'digest': snapshot.digest}
+
+
+def api_render(st, body):
+    try:
+        snapshot, plan = api_snapshot(st, body)
+    except (ValueError, TypeError) as e:
+        return 400, {'error': str(e)}
+    # 兼容控制台诊断读取，但这不是后续 preview/start 的执行材料。
+    st.last = MappingProxyType({'est_total_min': snapshot.est_total_min,
+                                'tag': snapshot.tag, 'digest': snapshot.digest})
+    return 200, snapshot_response(snapshot, plan)
 
 
 def api_preview(st, body):
-    rc_, out = api_render(st, body)
-    if rc_ != 200:
-        return rc_, out
+    try:
+        snapshot, plan = api_snapshot(st, body)
+    except (ValueError, TypeError) as e:
+        return 400, {'error': str(e)}
     with st.lock:
-        upload(st.args, st.last['tag'], st.last['schedule'], render_cars(st.last['cars'], st.last['tag']))
-        drc, dry = remote_dry_run(st.args, st.last['tag'], int(body.get('ds_hours') or 0),
-                                  what=st.last['what'])
-    n_rows = sum(1 for l in st.last['schedule'].splitlines()
-                 if l.strip() and not l.startswith('#'))
-    return 200, {'schedule': st.last['schedule'], 'dryrun': dry, 'rc': drc,
-                 'what': st.last['what'], 'rows': n_rows,
-                 'est_total_min': st.last['est_total_min']}
+        upload(st.args, snapshot)
+        drc, dry = remote_dry_run(st.args, snapshot)
+    return 200, dict(snapshot_response(snapshot, plan), dryrun=dry, rc=drc)
 
 
 def api_start(st, body):
+    try:
+        snapshot, plan = api_snapshot(st, body)
+    except (ValueError, TypeError) as e:
+        return 400, {'error': str(e)}
     with st.lock:
         why = remote_mutex_check(st.args)
         if why:
             return 400, {'error': why}
-        rc_, out = api_render(st, body)
-        if rc_ != 200:
-            return rc_, out
-        upload(st.args, st.last['tag'], st.last['schedule'], render_cars(st.last['cars'], st.last['tag']))
-        drc, dry = remote_dry_run(st.args, st.last['tag'], int(body.get('ds_hours') or 0),
-                                  what=st.last['what'])
+        upload(st.args, snapshot)
+        drc, dry = remote_dry_run(st.args, snapshot)
         if drc != 0:
             return 400, {'error': 'dry-run 未通过，拒绝起跑\n' + dry}
         try:
-            # remote_start 内部会再做一次互斥检查（防 preview/起跑竞态窗口）
-            camp, log = remote_start(st.args, st.last['tag'],
-                                     int(body.get('ds_hours') or 0), None,
-                                     what=st.last['what'])
+            camp, log = remote_start(st.args, snapshot)
         except SystemExit as e:
             return 400, {'error': str(e)}
-    return 200, {'result': '已起跑 tag=%s\ncampaign: %s\n日志: %s\n观测: 本页「运行进度」标签'
-                 % (st.last['tag'], camp, log),
-                 'campaign': camp, 'tag': st.last['tag']}
+    return 200, {'result': '已起跑 tag=%s\nsha256: %s\ncampaign: %s\n日志: %s\n观测: 本页「运行进度」标签'
+                 % (snapshot.tag, snapshot.digest, camp, log),
+                 'campaign': camp, 'tag': snapshot.tag, 'digest': snapshot.digest}
 
 
 # ---------------------------------------------------------------- 控制台 API（进度 / 历史 / 停止）
@@ -1374,7 +1637,7 @@ CID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 
 def check_cid(cid):
     """campaign 名白名单：路径片段与 shell 参数都靠它兜底。"""
-    if not cid or not CID_RE.match(cid):
+    if not isinstance(cid, str) or not CID_RE.fullmatch(cid):
         return '非法 campaign 名: %r（只允许 字母/数字/._-）' % (cid,)
     return None
 
@@ -1394,7 +1657,7 @@ def api_queue(st, cid):
     # 数据可信度证据链上屏：monitors/ENV-SUMMARY.csv（runner 收尾时拍平）→
     # 逐场最坏 ENV verdict + steal 峰值。读不到（旧 campaign 没跑监控）就不加列。
     env = parse_env_summary(st.src.read_abs(
-        posixpath.join(st.args.root, 'campaigns', cid, 'monitors', 'ENV-SUMMARY.csv')) or '')
+        posixpath.join(st.src.root, cid, 'monitors', 'ENV-SUMMARY.csv')) or '')
     if env:
         for f in d['fields']:
             e = env.get(f['fid'])
@@ -1478,6 +1741,24 @@ def api_doctor(st):
     return 200, {'result': out, 'rc': rc}
 
 
+def comparison_bundle():
+    """把本机审定版本及依赖一起送入远端内存，不 import 远端旧 helper。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    sources = {}
+    for name in ('identity', 'result_selection', 'car-compare'):
+        with open(os.path.join(here, name + '.py'), encoding='utf-8') as f:
+            sources[name] = f.read()
+    return ("import json, sys, types\n"
+            "sources = json.loads(%r)\n"
+            "for name in ('identity', 'result_selection'):\n"
+            "    module = types.ModuleType(name)\n"
+            "    module.__file__ = '<compose-bundle>/' + name + '.py'\n"
+            "    sys.modules[name] = module\n"
+            "    exec(compile(sources[name], module.__file__, 'exec'), module.__dict__)\n"
+            "exec(compile(sources['car-compare'], '<compose-bundle>/car-compare.py', 'exec'), "
+            "{'__name__':'__main__', '__file__':'<compose-bundle>/car-compare.py'})\n") % canonical_json(sources)
+
+
 def api_compare(st, body):
     """两场对比：远端执行仓库版 car-compare.py（stdin 喂脚本，不受远端旧拷贝影响）。
 
@@ -1491,8 +1772,8 @@ def api_compare(st, body):
         why = check_cid(c)
         if why:
             return 400, {'error': why}
-    if ca == cb:
-        return 400, {'error': '两个 campaign 是同一个，A/B 池合在一起没有可比性'}
+    if ca == cb and not (body.get('car_a') or body.get('car_b')):
+        return 400, {'error': '同一 campaign 对比请显式选择两台不同车'}
     car_a = (body.get('car_a') or '').strip()
     car_b = (body.get('car_b') or '').strip()
     with st.lock:
@@ -1506,17 +1787,16 @@ def api_compare(st, body):
             if not car_b:
                 diff = [c for c in cars_b if c != car_a]
                 car_b = diff[0] if diff else (cars_b or [car_a])[0]
-        here = os.path.dirname(os.path.abspath(__file__))
+        if ca == cb and car_a == car_b:
+            return 400, {'error': '同一个 campaign 的同一台车不能与自身对比'}
         try:
-            with open(os.path.join(here, 'car-compare.py'), encoding='utf-8') as f:
-                script = f.read()
+            script = comparison_bundle()
         except OSError as e:
-            return 400, {'error': '读不到仓库里的 car-compare.py: %s' % e}
-        cmd = ('cd %s && python3 - %s %s --a %s --b %s'
-               % (shlex.quote(st.args.root),
-                  shlex.quote(posixpath.join('campaigns', ca)),
-                  shlex.quote(posixpath.join('campaigns', cb)),
-                  shlex.quote(car_a), shlex.quote(car_b)))
+            return 400, {'error': '读不到本机对比程序或其依赖: %s' % e}
+        cmd = ('cd %s && python3 -B - --a %s --b %s --a-campaign %s --b-campaign %s'
+               % (shlex.quote(st.args.root), shlex.quote(car_a), shlex.quote(car_b),
+                  shlex.quote(posixpath.join(st.src.root, ca)),
+                  shlex.quote(posixpath.join(st.src.root, cb))))
         rc, out = ssh_run(st.args.ssh, cmd, input_text=script, timeout=300)
     if rc != 0 and not out.strip():
         return 400, {'error': 'car-compare 返回码 %d 且无输出（远端 python3 可用？）' % rc}
@@ -1532,10 +1812,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
         self.end_headers()
         self.wfile.write(data)
 
+    def _local_request(self, write=False):
+        expected = '127.0.0.1:%d' % self.server.server_address[1]
+        if self.headers.get('Host') != expected:
+            return False  # 包括 DNS rebinding；页面统一由 127.0.0.1 打开。
+        if write:
+            origin = self.headers.get('Origin')
+            if origin is not None and origin != 'http://' + expected:
+                return False
+            if self.headers.get('Sec-Fetch-Site') not in (None, 'same-origin', 'none'):
+                return False
+            token = self.headers.get('X-Raceway-CSRF') or ''
+            if (not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', token)
+                    or not secrets.compare_digest(token, self.server.state.csrf_token)):
+                return False
+        return True
+
     def do_GET(self):
+        if not self._local_request():
+            return self._send(403, 'application/json', '{"error":"forbidden host"}')
         u = urlparse(self.path)
         q = parse_qs(u.query)
         st = self.server.state
@@ -1551,7 +1852,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, 'text/html; charset=utf-8', _PAGE)
         elif path == '/api/bootstrap':
             self._send(200, 'application/json', json.dumps({
-                'cars': [a._asdict() for a in st.cars],
+                'cars': [{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars],
                 'problems': st.problems, 'ds_tiers': DS_TIERS,
                 # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
                 'tracks': [dict(v, name=k) for k, v in TRACK_CATALOG.items()],
@@ -1563,6 +1864,8 @@ class Handler(BaseHTTPRequestHandler):
                 'ssh': st.args.ssh or '', 'root': st.args.root,
                 'cars_file': st.args.cars_file,
                 'kibana_url': st.args.kibana_url,
+                'csrf_token': st.csrf_token,
+                'results_root': st.src.root,
             }, ensure_ascii=False))
         elif path == '/api/history':
             cov = st.history()
@@ -1582,11 +1885,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         st = self.server.state
-        n = int(self.headers.get('Content-Length') or 0)
+        if not self._local_request(write=True):
+            return self._send(403, 'application/json', '{"error":"forbidden origin or CSRF token"}')
+        if self.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/json':
+            return self._send(415, 'application/json', '{"error":"application/json required"}')
         try:
+            n = integer(self.headers.get('Content-Length') or 0, 'Content-Length', 0, 1048576)
             body = json.loads(self.rfile.read(n) or b'{}')
-        except ValueError:
-            return self._send(400, 'application/json', '{"error":"bad json"}')
+        except (ValueError, TypeError):
+            return self._send(400, 'application/json', '{"error":"bad json or length"}')
+        if not isinstance(body, dict):
+            return self._send(400, 'application/json', '{"error":"JSON object required"}')
         try:
             if self.path == '/api/render':
                 code, payload = api_render(st, body)
@@ -1624,6 +1933,8 @@ def cmd_serve(args):
             '  传成 campaigns 目录会让车定义/dry-run 全部落空；'
             '要编排它的 campaign 也应传仓库根，例如 --root /opt/raceway' % args.root)
 
+    if not args.ssh:
+        args.results_root = remote_operation(args, 'inspect')['results_root']
     state = ComposeState(args)
     hard = [m for s, m in state.problems if s == 'error']
     if hard:

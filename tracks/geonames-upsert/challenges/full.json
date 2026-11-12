@@ -1,6 +1,6 @@
     {
       "name": "full",
-      "description": "Raceway entry challenge: scenario A = upsert lifecycle (cold insert / hot update / mixed via doc_as_upsert), scenario B = Rally-native partial-doc update baseline. Both cycles build their own index; every task name is unique within the challenge.",
+      "description": "Raceway entry challenge: scenario A = upsert lifecycle (cold insert / real hot update / mixed via doc_as_upsert), scenario B = plain update without doc_as_upsert. Each cycle rebuilds the same natural-id corpus; bulk sizes, client counts and hot update content are identical.",
       "schedule": [
         {#-- 场景 A：upsert 生命周期 -------------------------------- --#}
         {
@@ -62,7 +62,7 @@
           "name": "refresh-after-mixed",
           "operation": "refresh"
         },
-        {#-- 场景 B：Rally 原生 update 对照（顺序 id 全量索引后 on-conflict=update） --#}
+        {#-- 场景 B：纯 update 对照（同一自然 ID 全集，逐文档真实重写） --#}
         {
           "operation": {
             "name": "native-delete-index",

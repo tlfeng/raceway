@@ -37,10 +37,11 @@ def write(path, text):
         f.write(text)
 
 
-@unittest.skipUnless(shutil.which('bash'), '本机没有 bash')
+@unittest.skipUnless(os.name == 'posix' and os.path.exists('/proc/self/stat') and shutil.which('bash'), '需 Linux/WSL bash 与 /proc')
 class CloseCampaignTest(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix='close-camp-')
+        base = '/mnt/c/Users/user/AppData/Local/Temp/raceway-review/runner-main'
+        self.root = tempfile.mkdtemp(prefix='close-camp-', dir=base if os.path.isdir(base) else None)
         self.addCleanup(shutil.rmtree, self.root, True)
         self.fake = None
 
@@ -57,6 +58,12 @@ class CloseCampaignTest(unittest.TestCase):
             write(os.path.join(d, 'RACES.md'), races)
         if pid is not None:
             write(os.path.join(d, 'RUNNER.pid'), '%d\n' % pid)
+            if os.path.exists('/proc/%d/stat' % pid):
+                with open('/proc/%d/stat' % pid, encoding='utf-8') as f:
+                    start = f.read().rsplit(') ', 1)[1].split()[19]
+                with open('/proc/sys/kernel/random/boot_id', encoding='utf-8') as f:
+                    boot = f.read().strip()
+                write(os.path.join(d, 'RUNNER.meta'), '%s\t%s\t%s\t%s\n' % (pid, start, boot, self.fake_script))
         if mtime is not None:
             os.utime(os.path.join(d, 'PROGRESS.txt'), (mtime, mtime))
         return d
@@ -71,15 +78,13 @@ class CloseCampaignTest(unittest.TestCase):
         with open(os.path.join(self.root, cid, 'PROGRESS.txt'), encoding='utf-8') as f:
             return f.read()
 
-    def start_fake_runner(self):
-        """起一个真 bash 执行名叫 run-bench.sh 的脚本（comm=bash，命令行含文件名），
-        和宿主机上 `./run-bench.sh ds 1` 的进程形态一致。"""
-        fake_dir = tempfile.mkdtemp(prefix='fake-runner-')
-        self.addCleanup(shutil.rmtree, fake_dir, True)
-        script = os.path.join(fake_dir, 'run-bench.sh')
+    def start_fake_runner(self, cid='live'):
+        """仅启动测试自己持有的无远端操作 runner，路径遵守 runtime 身份协议。"""
+        script = os.path.join(self.root, cid, 'runtime', 'fixture', 'run-bench.sh')
         write(script, 'sleep 60\n')
+        self.fake_script = script
         self.fake = subprocess.Popen(['bash', script])
-        time.sleep(0.3)
+        time.sleep(0.1)
         return self.fake.pid
 
     def start_decoy(self):
@@ -153,13 +158,11 @@ class CloseCampaignTest(unittest.TestCase):
         self.camp('stale', HEADER % 'stale', mtime=time.time() - 3600)    # 无 pid 文件、早停了
         out = self.run_close()
         self.assertIn('LIVE  live：RUNNER.pid', out)
-        self.assertIn('LIVE  fresh：宿主机有 run-bench.sh', out)
+        self.assertIn('CLOSE fresh', out)  # 不再用全宿主 runner 猜测另一个 campaign
         self.assertIn('CLOSE stale', out)
         self.assertFalse(Q.parse_progress(self.progress('live'))['ended'])
-        self.assertFalse(Q.parse_progress(self.progress('fresh'))['ended'])
-        # --force 只放开"进度刚更新"这条启发式，pid 活着的仍然不动
+        self.assertTrue(Q.parse_progress(self.progress('fresh'))['ended'])
         out = self.run_close('--force')
-        self.assertIn('CLOSE fresh', out)
         self.assertIn('LIVE  live', out)
 
     def test_prefix_mode_only_touches_prefix(self):
@@ -187,20 +190,27 @@ class CloseCampaignTest(unittest.TestCase):
 
     def test_stop_campaign_kills_runner_and_closes(self):
         """stop-campaign.sh 端到端：杀真 runner、放过 decoy、停完补结束行（约 9 秒）。"""
-        pid = self.start_fake_runner()
+        pid = self.start_fake_runner('ds9-20261027-1')
         decoy = self.start_decoy()
+        other_script = os.path.join(self.root, 'unrelated', 'runtime', 'fixture', 'run-bench.sh')
+        write(other_script, 'exec sleep 60\n')
+        other = subprocess.Popen(['bash', other_script])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
         self.camp('ds9-20261027-1', HEADER % 'ds9-20261027-1', races=RACES, pid=pid)
         env = dict(os.environ, RESULTS_ROOT=self.root)
         p = subprocess.run(['bash', os.path.join(ROOT_DIR, 'stop-campaign.sh'), 'ds9-20261027-1'],
                            capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn('TERM %d' % pid, p.stdout)
+        self.assertIn('runner %d' % pid, p.stdout)
+        self.assertIn('TERM ', p.stdout)  # 子进程退出时，等待它的测试 runner 可已自然结束
         self.assertNotIn('TERM %d' % decoy, p.stdout)
         self.assertNotIn('KILL %d' % decoy, p.stdout)
         self.assertIn('无残留', p.stdout)
         self.assertIn('CLOSE ds9-20261027-1  2/3', p.stdout)
         self.assertIsNotNone(self.fake.poll())                       # runner 真死了
         self.assertIsNone(self._decoy_proc.poll())                   # decoy 还活着
+        self.assertIsNone(other.poll())                             # 另一个 campaign 不受影响
         prog = self.progress('ds9-20261027-1')
         self.assertTrue(Q.parse_progress(prog)['ended'])
         self.assertIn('stop-campaign.sh 停止', prog)

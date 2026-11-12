@@ -4,138 +4,154 @@
 
 节点清单只有一个来源：ibs 的 `ip.txt`。主机名不以 `esrally` 开头的行是被测节点，`esrally` 那行是发压机。节点数、部署范围（`ops.deploy -n`）、卡点要循环的机器，全部从这份清单推导，所以 2~N 节点不用改代码。
 
-分片数是性能口径，不是拓扑事实。`SHARDS` / `REPLICAS` 两个环境变量单独配（默认 3 / 0），会写进 user-tags 和 sidecar。
+分片数是性能口径，不是拓扑事实。`SHARDS` / `REPLICAS` 单独配（默认 3 / 0），写进 user-tags 和 sidecar；集群检查断言的是实际拓扑，不写死三节点。
 
 ## 数据可信度四原则
 
-1. **冷 JVM**：每场赛前 `ibs wipe`（停服 → 清 data 和 logs → 重启 → admin 自愈），各台车口径一致。
-2. **轮内换位**：多配置按圈右旋轮换（3 配置 3 圈：r1 [A,B,C] / r2 [C,A,B] / r3 [B,C,A]），把首场偏冷和窗口波动摊到每个配置上。
-3. **只认中位与同号方向**：每个配置至少跑 3 圈取中位；跨跑分对比要看各圈散点带是否重叠，单圈差异不作证据。
-4. **卡点拦截脏数据**：环境噪声（CPU steal、外来进程、swap-in）进不了 VALID；sidecar 逐场记录实测身份（JDK 版本、堆、核数、索引 settings），事后可审计。
+1. **冷 JVM**：每场赛前 `ibs wipe`（停服 → 确认停净 → 清 data 和 logs → 重启 → admin 自愈），各台车口径一致。停机、SSH 或端口检查失败不能当成停净，更不能删除在线 data。
+2. **轮内换位**：多配置按圈右旋（3 配置 3 圈：r1 [A,B,C] / r2 [C,A,B] / r3 [B,C,A]），把首场偏冷和窗口波动摊到每个配置；显式排程按文件顺序。
+3. **只认中位与同号方向**：正式比较每个配置至少 3 圈，按相同实验条件与 task 取跨圈中位，保留逐圈散点与范围。单场 Rally p50 只是跨圈聚合的输入，不等于已经取了跨圈中位。
+4. **卡点与证据共同放行**：精确尝试判定、完整协议、有效指标和全节点监控缺一不可。sidecar 逐场记录实测 JDK、堆、核数、索引 settings/mappings；标签不能代替实测身份。
+
+## 实验与测量身份
+
+- **计划**：所有编排模式首次生成 `PLAN.tsv` 与 `PLAN.sha256`。TSV 的 tab 分隔表头为 `fid/config/track/round/recall/est`，锁定基础 fid、展开配置、赛道、轮次、召回开关、估时和顺序；同 campaign 续跑须匹配计划与摘要。
+- **窗口**：`DEADLINE` 首次保存绝对截止 epoch（`0` 为无时间窗）；`DS_HOURS` 启用时留 20 分钟余量，续跑与 `FRESH=1` 不重新计时。
+- **状态与尝试**：`STATE.txt` 以基础 fid 记 `OK / FAIL / SKIP`；`RACES.md` 保留逐实际尝试判定。新尝试号从已有最大值后递增，不覆盖报告、JSON、日志或监控。`FRESH=1` 新建尝试，不清空历史；重试不是新圈。
+- **执行**：runner 用 `flock RESULTS_ROOT/.runner.lock` 原子互斥，从 campaign 的 `runtime/` 只读脚本快照运行。赛道、环境配置和语料仍须在 campaign 期间保持不变。
+- **停机**：`RUNNER.pid` 是纯 PID，`RUNNER.meta` 为单行 tab 分隔的 `pid/start_ticks/boot_id/script绝对路径`。只停止身份验证通过的目标 runner 及其可验证后代；不按命令行子串全局扫杀。
+
+一次完整测量是同 campaign、真实 fid/attempt 下的 `full`（phase=`wq`），或同身份的一对写/查段（phase=`w` + `q`）。不能跨 campaign、尝试或 build 拼接半场。明确声明 `measurement_protocol=write-only` 的实验按写协议检查，不能从缺查询段反推它只需要写段。
 
 ## 卡点链
 
 | 卡点 | 时机 | 内容 |
 |---|---|---|
-| 静默负载卡点 | 赛前 | load1 / cpu steal / 外来进程 CPU / 磁盘可用（不过 → SKIP） |
-| 集群卡点 | 冷启动后 | 可达 / green / 节点数 / 数据节点数 / 版本 / 节点名 / **端口属主**（9200 监听进程必须在安装根下，拦手工集群顶替） |
-| 堆断言 | 卡点后 | 运行进程实际 -Xmx == 声明（堆由 ibs 部署统一设定为内存/2） |
-| 绑核断言 | 卡点后 | EXPECT_CPU_CORES=N 时进程实际亲和核数 == N |
-| 段数卡点 | write 后 | forcemerge 到每主分片 1 段 |
-| 指标断言 | query 后 | throughput 非 null（防测量窗口被暖机吃掉） |
-| ENV 判定 | 收尾 | 整场一份采样（5s 一次）的 steal / 外来进程 / swap-in 汇总；CONTAMINATED 场不可进结论 |
+| 停机与清理 | 每场前 | 按统一 `IBS_BASE` 定位目标引擎，确认停净与 HTTP 端口空闲后才清数据 |
+| 静默负载卡点 | 赛前 | load1 / CPU steal / 被测引擎与外来进程 CPU / 磁盘可用；不过则 SKIP |
+| 集群卡点 | 冷启动后 | 可达 / green / 节点数 / 数据节点数 / 版本 / 节点名 / 端口属主 |
+| 堆断言 | 卡点后 | 每节点运行进程实际 -Xmx == 声明；堆由 ibs 部署统一设定 |
+| 绑核断言 | 卡点后 | 设置 `EXPECT_CPU_CORES=N` 时，每节点实际亲和核数 == N |
+| 合并等待 | 赛道内部 | full challenge 按定义同步 force-merge 并等待完成；runner 不另设独立段数卡点 |
+| 指标断言 | race 后 | 分别检查协议要求的写任务与查询任务有有限有效吞吐且零错误；维护任务不能抵充查询 |
+| ENV 门禁 | 收尾 | 每个实际 phase、每个预期节点都必须 `samples>0` 且 `ENV-VERDICT: OK` |
+
+full 挑战默认每 5 秒采样，tag 为 `<实际fid>-wq`；拆分测量逐 phase 采集。`MON_DIR` 统一透传为 `RACEWAY_MON_DIR`。缺节点、缺文件、零样本、采集失败、`WARN`、`CONTAMINATED` 或 `NO-DATA` 均判 `ENV-FAIL`，不能 VALID；细节保留在 `monitors/*-summary.txt`。不能拿另一个尝试的摘要或 VALID 补证。
 
 ## 写入口径
 
-- **口径A** = rally 的 `Median Throughput`（区间中位速率），正式引用的口径
-- **口径B** = 语料条数 ÷ 任务 duration（全程平均）。两者的差异来自写入的慢尾，不是窗口长短；工具两个都会输出
-- **warmup**：按「任务时长的 20%、窗口不小于 50%」标定。写死一个常量会在短任务上把测量窗口吃光（`throughput=null` 而返回码还是 0）
+- **口径A** = Rally 的 `Median Throughput`（暖机后测量样本的区间中位速率），正式引用的口径。
+- **口径B** = 该写任务实际处理文档数 ÷ 任务 duration（含暖机的全程平均）。两个口径分别保留，不相互替代；参数缩小语料时不能仍用全量文档数。
+- **warmup**：按任务实测时长标定，约 20%，测量窗口至少留 50%；不能用固定暖机时间耗尽短任务的测量窗口。
+- **upsert / update**：默认 bulk_size=500、8 客户端，所有阶段遍历相同自然 `geonameid`。cold/hot/mixed 的 `raceway_revision` 分别为 0/1/2，update 显式 `detect_noop:false`；纯 update 对照用相同 ID 与 revision，不带 `doc_as_upsert`。这是全字段合并重写，不是 no-op 或少量热点 ID 更新。各 task 独立比较，不能把多个阶段加成一个写速率。
 
 ## 查询口径
 
-- query-only 全操作 ≥100 次迭代（p99 可报）；看 `service time` 的 p50/p90/p99，不引用单轮
-- codec 类对比注意：烘焙进赛道的 settings 必须与 sidecar 抓到的 `_settings` 实测值核对
-- 跨赛道只比趋势不比绝对值（bulk 尺寸/文档大小/建图成本不同）
+- 查询分位需要足够测量样本；常规 query-only 至少 100 次迭代，看 `service_time` 的 p50/p90/p99，不引用单圈作结论。
+- KNN 将 `size` 写进最终搜索 body，与 task 的 k 一致；不能只凭 k=100 就默认返回 100 条。
+- 索引类型优先取实际 mappings，声明须按本场参数渲染；Jinja 字面量不是 `knn_index_type` 的有效证据。
+- OpenSearch 的 `ef_search` 是 HNSW 搜索宽度，**不等同于 ES 的每分片 `num_candidates`**。按引擎、索引方法和 task 记录预算，IVF/磁盘/重排参数另看各变体定义；相同数字或任务名不证明搜索成本一致。
+- 量化与压缩正交：如 `hv1024x-int8-codec-def` 保留 `int8_hnsw`；codec/source_reuse 的声明须与 sidecar `_settings` 实测核对。
+- 跨赛道只比趋势，不比绝对值；bulk 尺寸、文档大小、建图成本和搜索预算可能不同。
 
 ### 时延三兄弟：别把发压机排队当成引擎慢
 
-rally 的 `latency` 有两种口径，取决于该 operation 有没有设 `target-throughput`：
+Rally 的 `latency` 口径取决于 operation 是否设 `target-throughput`：
 
 | | 闭环（无 target-throughput） | 开环（有 target-throughput） |
 |---|---|---|
-| `latency` | ≡ `service_time`（单次请求耗时） | **端到端，含发压机积压** |
-| `service_time` | 请求的服务端耗时 | 同左 |
-| `processing_time` | ≈ `service_time`（差 0.1%） | 同左 |
+| `latency` | ≡ `service_time`，单次请求耗时 | 端到端，含发压机积压 |
+| `service_time` | 请求从发出到响应的服务耗时 | 同左，不含计划发出前的积压 |
+| `processing_time` | 包含客户端处理开销 | 同左 |
 
-开环 task 饱和时，积压会把引擎耗时放大一个数量级 —— nested 赛道实测 90 分位 `latency`
-1.477s，而 `service_time` 只有 36.7ms，**差的 40 倍全是发压机积压**。
+跨引擎比较优先看 `service_time`，但它仍是客户端测得的请求耗时，不等于引擎内部执行计时。`latency` 用作 SLO 时须说明开环目标负载；`queue_time=latency−service_time` 是派生的积压差值，分位差不是独立测得的排队时间分布。
 
-因此：
-
-- **跨引擎比较看 `service_time`**（引擎侧执行时间）
-- `latency` 只作 SLO 指标看，且必须知道该 task 是不是开环的
-- `queue_time`（= latency − service_time，导出时派生）单独看，用来分清
-  "引擎慢" 还是 "发压机排队"
-- 逐 task 的开环/闭环以赛道 spec 的 `target-throughput` 为**地面真值**
-  （sidecar `run_params.latency_modes`）；没有真值时才按数据反推，
-  反推结果单独计数上报（`manifest.latency_mode_source`），不当作实测
+开环/闭环以赛道 spec 的 `target-throughput` 为真值（sidecar `run_params.latency_modes`）；没有真值才按数据推断，并在 `manifest.latency_mode_source` 单独记录，不当作实测。
 
 ## 口径契约（导出自检）
 
-`bench-export.py` 是纯函数、产出可 diff 的载荷快照 —— 口径缺陷必须在**写出前**
-被拦住，而不是等它在看板上变成一个"看起来合理但不可比"的数字。
+`bench-export.py` 从原始产物生成确定性载荷。精确未记账、非 VALID、人工污染、协议不完整或监控不合格的测量不导出，原因写入 manifest；段间身份或实验条件不一致则直接失败。
 
-**致命（导出非零退出，载荷不写出）**
+**致命（导出非零退出，不写载荷）**：
 
-| 检查 | 抓的是什么 |
+| 检查 | 约束 |
 |---|---|
-| `stat` 在闭集内 | rally 的 `99_99` 分位原样漏进 stat 列，与 `p999` 并存 |
-| `unit` 在闭集内 | 量纲越界（跨 family 求和/对比出错） |
-| `_id` 不重复 | 两行共用一个 `_id` → 后写的静默覆盖先写的 |
-| 同一 (场次, task) 的 `trusted` 一致 | 失败 task 的行与成功 task 的行混在一起 |
-| `error_rate>0` 的 task 整块 `trusted=false` | 失败 task 的"漂亮时延"混进延迟曲线 |
-| `closed_loop` 不出现积压 | 口径声明与实测自相矛盾 |
-| 场次 `trusted` 与 `degraded_tasks` 一致 | 场次级标记与行级标记打架 |
+| 数值有效 | 不接受 NaN / Infinity；task 的 error_rate 必须存在且为 [0,1] 有限数 |
+| `stat` / `unit` 闭集 | 分位与单位先归一，不能漏入未知词表 |
+| `_id` 唯一 | 不允许两行静默覆盖 |
+| 身份与变体 | `comparison_key=series_key+'\|'+track_variant`，变体非空，索引类型不得是未渲染模板 |
+| 段间一致 | 引擎、build、JDK、量化、压缩、预算、维度、堆、核数、分片等条件必须一致 |
+| task 可信度 | 同一测量、同一 task 的所有行 trusted 一致；`error_rate>0` 则整 task 为 false |
+| 场次可信度 | 场次 trusted 取各 task/段的最差，与 degraded_tasks 一致 |
+| 时延语义 | 闭环声明与积压检查不得自相矛盾 |
 
-**非致命（写进 manifest 供核对）**：字段覆盖率（`env_id` / `dims` /
-`segment_form` / `codec` / sidecar）、`stat` 归一后的兜底别名、提示列表。
+字段覆盖率、归一别名及其他非致命提示写进 manifest，不能把提示当作实测证据。
 
 ### 词表
 
-- `stat` ∈ `value | mean | p50 | p90 | p99 | p999 | p9999 | p100 | min | max`
-  （rally 的 `median` 归一为 `p50`；`99_9`→`p999`；`99_99`→`p9999`）
-- `unit` ∈ `s | ms | ops/s | docs/s | pages/s | MB/s | GB | MB | bytes | count | ratio | percent | text | ""`
-- `trusted` ∈ `true | false`（行级布尔；也是场次级布尔）
-  （导出内部按 task 判 `ok / degraded / unknown`，落库时投影成布尔：degraded → `false`。
-  **这是看板的默认闸门**，`true` 只说明"跑完了"，不说明"结果可用"）
-- `latency_mode` ∈ `open_loop | closed_loop | unknown`
+- `stat` ∈ `value | mean | p50 | p90 | p99 | p999 | p9999 | p100 | min | max`；`median`→`p50`、`99_9`→`p999`、`99_99`→`p9999`。
+- `unit` ∈ `s | ms | ops/s | docs/s | pages/s | MB/s | GB | MB | bytes | count | ratio | percent | text | ""`；导出时延统一为 s。
+- `trusted` ∈ `true | false`，裸布尔，适用于指标行与场次行。
+- `latency_mode` ∈ `open_loop | closed_loop | unknown`。
 
-### 可信度三层
+### 可信度与展示
 
-RACES.md 判定（跑没跑完）→ 场次级 `trusted`（这一场能不能用，取各 task 的最差）→ 行级
-`trusted`（这一行可不可信，按所属 task 判）。看板默认查询框 =
-`trusted: true AND NOT codec:(zstd or best_compression)`。
+精确实际 fid 的 `RACES.md` 判定 → 完整协议与全 phase 全节点 ENV 检查 → task 质量 → 场次 trusted。`trusted=true` 表示通过相应数据质量门槛，不保证实验设计、样本量或不同配置之间天然可比。
 
-**注意**：赛级指标（`store_size` / `segment_count` / GC / merge…）量的是**写阶段**
-状态，一个查询 task 失败不会把它们降级 —— 只有写阶段自己失败才降级。
+`error_rate>0` 的 task 全部指标行（含错误率证据）均 `trusted=false`，场次也为 false；若精确判定为 VALID、协议与监控完整，错误证据仍可落库。赛级指标（store/segment/GC/merge 等）按写阶段质量判，不因单个查询 task 失败一并降级。
 
+看板不使用全局 `trusted:true`：吞吐、时延、GC、资源等测量面板各自过滤可信行；**错误率面板及其预检均不加 trusted 过滤**，显示桶内最坏错误率。默认基座视图排除非默认压缩和 source_reuse，每个实际 variant 单独显示。固定分位后按 `comparison_key` 分线，正式数值跨圈取中位，不按身份混平均。时延图表统一标 s，不能把秒值直接标成 ms。
 
 ## 结果入库（三索引）
 
-把 rally race 结果灌进 ES：三索引各自独立 strict 模板 + 导出期字段白名单。
-
 ```bash
-python3 build-race-store.py --campaigns campaigns-local --out race-store   # 软链农场（幂等）
+python3 build-race-store.py --campaigns campaigns-local --out race-store
 python3 bench-export.py --out exports/<tag> --races race-store --campaigns campaigns-local
 python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--insecure] [--drop]
 ```
 
 | 索引 | 一行代表 | 用途 |
 |---|---|---|
-| `benchmark-result-env` | 一条环境台账 | 环境/身份/配置维度 |
-| `benchmark-result-race` | 一场 race | 主维度表（run 维度全在这张表） |
+| `benchmark-result-env` | 一条环境台账 | 环境、身份与配置维度 |
+| `benchmark-result-race` | 一次完整测量 | run 主维度；可由同次测量的写/查段合并 |
 | `benchmark-result-metric` | 一个指标 | 长表，一指标一行，单位归一 |
 
 口径要点：
 
-- **error_rate 按 rally 语义 0~1 原样入库**（`1.0` 表示该 task 的请求全失败），不按百分比折算
-- 实验变量 `dims` 从 user-tags 提升成 typed 列，可以 range 和排序
-- **指标表带 `track` 列**（归一化赛道名）。按赛道拆看板的前提就是它 —— 指标行没有 track就没法按赛道过滤
-- **指标表只带一个身份字段 `series_key`**，形如 `ez@2.5.0@3015@graalvm25`（引擎@版本@build@JDK）。运行维度（engine、version、jdk、dims、segment_form、env_id、round、phase、车代号…）在指标行上与 `benchmark-result-race` 完全重复，留着只是白付体积、平白多一份漂移面，要查就去主维度表查。看板按 `series_key` 分线，TSVB 的 split-by 只能吃一个字段。按引擎过滤写 `series_key:ez@*`，**不要加引号** —— 带引号是精确短语，实测匹配 0 条
-- **身份只认实测**：`jdk_vendor` / `jdk_version` 取 sidecar 的 `java -version` 原文和节点上的 JVM 版本，查不到就留空。车代号推不出 patch 号（jdk25 可能是 25.0.4，也可能是 25.0.5），不知道就不猜。厂商必须单列 —— GraalVM 25.0.4 和 TencentKonaJDK 25.0.4 的版本号一模一样，只有厂商能区分
-- **monitors 补的 system 行按场次回填 `@timestamp` / `run_start` / `trusted` / `series_key` / `race_id`**。这行是按场次采的摘要，本身没有时间戳也没有身份，不回填的话 CPU steal 这类可信度指标画不出折线（x 轴没值），也会被 `trusted: true` 整个过滤掉
-- 引擎身份 `engine`（easysearch / elasticsearch）从**包名**推导，不信 sidecar 里的 `name` 字段
-- **幂等**：文档 `_id` 是固定的（场次行 `race_id`；指标行 `race_id|phase|task|family|stat`），重复执行是覆盖，不会翻倍
-- **stat 归一后 `_id` 会变**（rally 的 `median` → `p50`、`99_99` → `p9999`），旧索引里的同一条会变成两条。改过词表必须 `bench-apply.py --drop` 重建
-- **改了 index template 也必须 `--drop` 重建索引**，旧 mapping 不会自动更新
-- **三张索引的模板都是 `dynamic: strict`**：能进索引的字段就是导出器的白名单（metric / race / env 各一份），白名单外的字段（运行维度回流）在 ES 侧直接拒收。字段精简靠机制保证，不靠口头约定
+- **error_rate 原样按 0~1 入库**，`1.0` 表示该 task 请求全失败，不再次除以 100。
+- `track` 是归一基础赛道；race 与 metric 同时保留真实 `track_variant`、已解析 `knn_index_type` 和 `comparison_key`，不能把 int8 / BBQ / codec 归到一条线。
+- **`series_key` 只表达引擎配置身份**，如 `ez@2.5.0@3015@graalvm25`（引擎@版本@build@JDK厂商主版本）；完整 JDK 版本另存 `jdk_version`。**实验分线用 `comparison_key=series_key+'|'+track_variant`**，不把处理变量塞入引擎身份。按引擎筛选可写 `series_key:ez@*`，通配符不要加引号。
+- 引擎明确区分 Easysearch、Elasticsearch、OpenSearch；不从通用 `oss` flavor 猜产品。ES / OS 无独立 build，不虚构 Easysearch 构建号。JDK 厂商与完整版本取源头证据，不凭车标签猜 patch 号。
+- `dims` 等实验变量为 typed 列；metric 物化分组必需的 track/variant/索引类型/比较键，不依赖 ES 自动 join race。
+- monitors 的 system 行按精确测量回填 `@timestamp`、`run_start`、`trusted`、`race_id` 和身份/变体键；无法匹配的摘要不借别场身份。
+- **稳定测量键**：race 的 `_id` / `race_id` 为 `campaign|真实fid|a<attempt>`，不取当前可见主段的 Rally UUID。普通指标键为 `race_id|phase|task|family|stat`；段 UUID 保留溯源，不控制测量身份。相同输入重复入库覆盖同键，不翻倍。
+- 三张模板均为 `dynamic: strict`，导出器各有字段白名单；模板外字段或错误类型不能静默入库。
+
+### 入库预检与 --drop
+
+`bench-apply.py` 在任何网络请求、特别是任何 DELETE 之前，完整检查输入目录、所选索引模板、全部 JSONL、字段类型、有限数、唯一 ID、comparison_key 和所选 race/metric 引用；已提供 manifest 时须断言通过。读取后使用同一内存快照，不在删除后重读变化中的文件。
+
+缺文件、未知或重复 `--only`、非法模板/载荷、所选总载荷为 0 均非零退出，不发送请求。`--drop` 只在预检通过后展示并删除所选索引，再建模板和入库；删除未确认成功即停止。bulk 按每条响应计失败，缺响应明细也不算成功；有失败则非零退出。
+
+## 有效结果对比
+
+`car-compare.py`、`codec-compare.py`、`car-env-table.py` 共用 `result_selection.py` 与 `identity.py`。指标只读机读 JSON，不从 Markdown 报告取数；判定表只用于精确尝试筛选。要求完整协议、sidecar 身份一致、任务零错误、监控全 OK。同一 campaign 的同一基础 fid 只取最新有效尝试，失败或无判定重试不计圈。
+
+```bash
+python3 car-compare.py --a-campaign campaigns-local/<A> --b-campaign campaigns-local/<B> \
+  --a 同车标签 --b 同车标签 --assert campaign-thresholds.example.conf
+```
+
+A/B 目录选项均可重复，同车可跨池比较；每侧内部不得混 build、JDK、量化、存储设置或运行条件。两侧赛道与任务集合须一致，空有效集合非零退出。阈值 CSV 为 `track,task,metric,>=|<=,value`，track 是实际变体；每规则要求 B 侧至少 3 个有限有效测量，检查其中位数。规则错误、空规则集、未知指标、样本不足或不达标均非零退出，不能跳过坏规则而放行 CI。
 
 ## 存储口径
 
-比落盘体积用 **forcemerge 之后**三台节点的 store 之和（sidecar 的原始探针：拆分协议落 `logs/fp/<场次名>-q/`，单挑战协议落 `-wq/`）。不要用 race.json 里的快照，那还是合并前的多段状态。
+落盘体积用赛末、合并之后全部被测节点的 store 之和，原始探针为 `logs/fp/<实际fid>-wq/nodes-stats.txt`，拆分协议取 `-q/`。探针缺失显示缺失，不用 race.json 的其他时点快照冒充。核对探针索引范围，节点级总量可能包含系统索引。
+
+upsert 的 full 含两次重建，赛末 store 属于最后的 native-update 周期，不能代表 mixed 阶段体积。
 
 ## 已知边界
 
-- 每个配置跑 3 圈，单场会有 ±5%~10% 的波动；尾部指标（p99、p100）样本少，只采信方向一致的项
-- 白天共享宿主机有噪声，正式数据跑夜里（静默卡点会自动跳过不安静的时段）
-- 跨引擎轮换时，每场有 5~8 分钟的 ibs 重装开销 —— 这正是要做轮内换位的原因
+- 单场可能有明显波动，尾部分位样本有限；正式结论保留散点、样本数和同号方向，不用一条中位线代替分布。
+- 白天共享宿主机有噪声，优先选安静窗口；任何时段都不能省略监控。
+- 跨引擎轮换包含重装开销，时长估算不是性能指标；重试耗时也不能充作新增有效圈。

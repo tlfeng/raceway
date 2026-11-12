@@ -40,7 +40,10 @@ def panel_row(idx, vis):
     series = (params.get('series') or [{}])[0]
     metrics = (series.get('metrics') or [{}])
     m0 = metrics[0]
-    agg = '%s(%s)' % (m0.get('type', 'avg'), m0.get('field', 'value'))
+    agg = '%s(%s)' % (m0.get('type', 'percentile'), m0.get('field', 'value'))
+    if m0.get('type') == 'percentile':
+        values = ','.join(str(p.get('value')) for p in m0.get('percentiles') or [])
+        agg = 'percentile[%s](%s)' % (values, m0.get('field', 'value'))
     if len(metrics) > 1:
         agg += ' 等 %d 项' % len(metrics)
     flt = ((params.get('filter') or {}).get('query') or '').strip() or '—'
@@ -118,7 +121,8 @@ def main():
         out.append('| # | 类型 | 标题 | saved object id | 过滤 (Lucene) | 分线字段 | 聚合 | 格式 | 桶 |')
         out.append('|---|---|---|---|---|---|---|---|---|')
         for n, p in enumerate(panels, 1):
-            vid = p.get('id') or refs.get(p.get('panelIndex'))
+            vid = (refs.get(p.get('panelRefName')) if p.get('panelRefName') is not None
+                   else p.get('id') or refs.get(p.get('panelIndex')))
             v = vis.get(vid) if vid else None
             if not v:
                 out.append('| %d | ? | （引用缺失 %s） | `%s` | — | — | — | — | — |'

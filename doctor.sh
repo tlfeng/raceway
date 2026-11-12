@@ -32,10 +32,16 @@ fi
 
 # ---- 1/6 驱动宿主机基础工具 ---------------------------------------------------
 section "1/6 驱动宿主机基础工具"
-for t in python3 ssh scp curl; do
+for t in python3 ssh scp curl flock readlink sha256sum; do
   command -v "$t" >/dev/null 2>&1 && ok "$t" || bad "缺 $t（apt/yum 安装）"
 done
 RALLY_BIN="${RALLY:-esrally}"
+RALLY_PYTHON_BIN="${RALLY_PYTHON:-python3}"
+if "$RALLY_PYTHON_BIN" -c 'from esrally.track.loader import render_template_from_file; from esrally.utils.opts import to_dict' >/dev/null 2>&1; then
+  ok "RALLY_PYTHON=$RALLY_PYTHON_BIN 可离线渲染赛道"
+else
+  bad "RALLY_PYTHON=$RALLY_PYTHON_BIN 缺 Rally 模块/API；应指向 RALLY wrapper 使用的 venv Python"
+fi
 if command -v "$RALLY_BIN" >/dev/null 2>&1; then
   ver=$("$RALLY_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
   case "$ver" in
