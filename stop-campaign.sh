@@ -2,11 +2,13 @@
 # 停止一个完整 campaign id；只认本次 runner 的 PID/starttime/boot/script 身份。
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REQUESTED_ROOT="${RESULTS_ROOT:-}"   # 环境变量优先于 vm-bench.env（与 close-campaign.sh 同一契约）；
+                                     # lib 会 source vm-bench.env，先取调用方的显式 env 防被覆盖
 RACEWAY_ENV_OPTIONAL=1
 source "$HERE/vm-bench-lib.sh" || exit 1
 CAMP="${1:?用法: stop-campaign.sh <完整 campaign-id>}"
 [[ "$CAMP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "campaign id 非法"
-ROOT="${RESULTS_ROOT:-$HERE/campaigns}"
+ROOT="${REQUESTED_ROOT:-${RESULTS_ROOT:-$HERE/campaigns}}"
 DIR="$ROOT/$CAMP"
 [ -d "$DIR" ] || die "campaign 不存在: $CAMP（只接受完整 id）"
 

@@ -25,6 +25,11 @@ import os
 import re
 import sys
 
+# track 目录里 git 定版定义的体积上限（现有的 git 内最大 spec 不到 1MB）。
+# 运行时产物不该被读：软链（语料）与超限文件一律跳过，否则在压测机上
+# 会把 GB 级语料整读进内存（hv1024 语料 22.7GB，读入即挂死 sidecar）。
+SPEC_MAX_BYTES = 64 << 20
+
 
 def read(raw, name):
     p = os.path.join(raw, name)
@@ -151,6 +156,9 @@ def track_meta(track_dir, track_params, mapping_text=None, settings_text=None):
         if not os.path.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
+            p = os.path.join(d, fn)
+            if os.path.islink(p) or not os.path.isfile(p) or os.path.getsize(p) > SPEC_MAX_BYTES:
+                continue
             if fn.endswith(".json"):
                 t = read(d, fn) or ""
                 spec.append(t)
