@@ -116,7 +116,8 @@ python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--inse
 ### 六、控制台（可选）
 
 ```bash
-python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 排程 / 进度 / 历史，三页合一
+python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 排程 / 进度 / 历史与对比 / 趋势 / 赛道与入库，五页合一
+#   趋势页图表用随仓库分发的 echarts.min.js（Apache-2.0）；漏同步只影响画图，表格仍可用
 python3 bench-compose.py start --cars-file <f> --tracks ds-* --rounds 3 --ds-hours 12   # 不开页面直接起跑
 ```
 

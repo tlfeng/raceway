@@ -394,5 +394,136 @@ class TestServiceSafety(NoExternalCalls):
         self.assertEqual(run.call_args.kwargs['input_text'], 'bundle')
 
 
+class TestTrend(NoExternalCalls):
+    def _st(self, es_auth=None):
+        st = state()
+        st.args.es_auth = es_auth
+        return st
+
+    def test_no_auth_returns_available_false_without_touching_es(self):
+        with patch.dict(os.environ, {'RACEWAY_ES_AUTH': ''}):
+            code, payload = C.api_trend(self._st(None), {'car': ['jdk25'], 'track': ['geo']})
+        self.assertEqual(code, 200)
+        self.assertFalse(payload['available'])
+        self.assertIn('口令', payload['error'])
+
+    def test_car_and_track_required(self):
+        st = self._st('u:p')
+        for q in ({}, {'car': ['jdk25']}, {'track': ['geo']}):
+            with self.subTest(q=q):
+                self.assertEqual(C.api_trend(st, q)[0], 400)
+
+    def test_injection_looking_params_are_400(self):
+        st = self._st('u:p')
+        for q in ({'car': ['a"b'], 'track': ['geo']},
+                  {'car': ['jdk25'], 'track': ['geo'], 'task': ['x;rm']},
+                  {'car': ['jdk25'], 'track': ['../../etc']}):
+            with self.subTest(q=q):
+                self.assertEqual(C.api_trend(st, q)[0], 400)
+
+    def test_rows_grouped_by_series_variant_task_stat(self):
+        st = self._st('u:p')
+        resp = {'hits': {'hits': [
+            {'_source': {'series_key': 'ez@2.5.0@3015', 'track_variant': 'geo', 'task': 'index-append',
+                         'stat': 'median', 'value': 100.0, 'unit': 'docs/s', 'campaign': 'c1',
+                         'direction': 'higher-better', 'run_start': '2026-11-11T10:00:00+08:00'}},
+            {'_source': {'series_key': 'es@8.19', 'track_variant': 'geo', 'task': 'index-append',
+                         'stat': 'median', 'value': 90.0, 'unit': 'docs/s', 'campaign': 'c1',
+                         'direction': 'higher-better', 'run_start': '2026-11-11T10:05:00+08:00'}},
+            {'_source': {'value': 'not-a-number'}},          # 非数值行丢弃，不进趋势
+        ]}}
+        seen = {}
+        def fake_query(ssh, body, **kw):
+            seen.update(body=body, path=kw.get('path', ''))
+            return resp
+        with patch.dict(os.environ, {'RACEWAY_ES_AUTH': 'u:p'}), \
+                patch.object(H, 'es_query', side_effect=fake_query):
+            code, payload = C.api_trend(st, {'car': ['jdk25'], 'track': ['geo'],
+                                             'family': ['throughput'], 'stat': ['median']})
+        self.assertEqual(code, 200)
+        self.assertTrue(payload['available'])
+        self.assertEqual(payload['n'], 2)
+        self.assertEqual(payload['unit'], 'docs/s')
+        keys = [s['key'] for s in payload['series']]
+        self.assertEqual(len(keys), 2)
+        self.assertTrue(any('ez@2.5.0@3015' in k for k in keys))
+        # 查询体口径：只读 + trusted 过滤 + 指标库索引
+        self.assertEqual(seen['body']['query']['bool']['filter'][2], {'term': {'trusted': True}})
+        self.assertIn('benchmark-result-metric', seen['path'])
+
+    def test_unavailable_store_reason_passes_through(self):
+        st = self._st('u:p')
+        with patch.dict(os.environ, {'RACEWAY_ES_AUTH': 'u:p'}), \
+                patch.object(H, 'es_query', side_effect=H.HistoryUnavailable('指标库没起')):
+            code, payload = C.api_trend(st, {'car': ['jdk25'], 'track': ['geo']})
+        self.assertEqual(code, 200)
+        self.assertFalse(payload['available'])
+        self.assertIn('指标库没起', payload['error'])
+
+
+class TestTracksExportsApply(NoExternalCalls):
+    def test_tracks_returns_remote_listing(self):
+        st = state()
+        with patch.object(C, 'ssh_run', return_value=(0, '可用赛道: geo ...')) as run:
+            code, payload = C.api_tracks(st)
+        self.assertEqual(code, 200)
+        self.assertIn('geo', payload['result'])
+        self.assertIn('run-bench.sh list', run.call_args.args[1])
+
+    def test_tracks_missing_script_is_400(self):
+        st = state()
+        with patch.object(C, 'ssh_run', return_value=(0, 'MISSING')):
+            code, payload = C.api_tracks(st)
+        self.assertEqual(code, 400)
+        self.assertIn('run-bench.sh', payload['error'])
+
+    def test_exports_parses_remote_json_last_line(self):
+        st = state()
+        with patch.object(C, 'ssh_run',
+                          return_value=(0, '[{"tag":"t1","assertions":"pass",'
+                                           '"counts":{"bench_metric":3},"mtime":1}]')):
+            code, payload = C.api_exports(st)
+        self.assertEqual(code, 200)
+        self.assertEqual(payload['exports'][0]['tag'], 't1')
+
+    def test_exports_unparsable_is_500(self):
+        st = state()
+        with patch.object(C, 'ssh_run', return_value=(0, 'Traceback ... 崩了')):
+            code, _ = C.api_exports(st)
+        self.assertEqual(code, 500)
+
+    def test_apply_validates_tag_and_url_before_remote(self):
+        st = state()
+        for b in ({'export': '../x', 'es': 'https://127.0.0.1:9237'},
+                  {'export': 't1', 'es': 'ftp://127.0.0.1'},
+                  {'export': 't1'},
+                  {'export': '', 'es': ''}):
+            with self.subTest(b=b):
+                self.assertEqual(C.api_apply(st, b)[0], 400)
+
+    def test_apply_builds_command_with_flags_and_dir_under_exports(self):
+        st = state()
+        with patch.object(C, 'ssh_run', return_value=(0, '完成')) as run:
+            code, _ = C.api_apply(st, {'export': 't1', 'es': 'https://127.0.0.1:9237',
+                                       'auth': 'admin:pw', 'insecure': True, 'drop': True})
+        self.assertEqual(code, 200)
+        cmd = run.call_args.args[1]
+        self.assertIn('--drop', cmd)
+        self.assertIn('--insecure', cmd)
+        self.assertIn('--auth admin:pw', cmd)
+        self.assertIn('/exports/t1', cmd)
+        self.assertTrue(run.call_args.kwargs.get('input_text', '').startswith('#!'))
+
+    def test_apply_without_auth_and_flags_omits_them(self):
+        st = state()
+        with patch.object(C, 'ssh_run', return_value=(0, '完成')) as run:
+            code, _ = C.api_apply(st, {'export': 't1', 'es': 'http://localhost:9200'})
+        self.assertEqual(code, 200)
+        cmd = run.call_args.args[1]
+        self.assertNotIn('--auth', cmd)
+        self.assertNotIn('--drop', cmd)
+        self.assertNotIn('--insecure', cmd)
+
+
 if __name__ == '__main__':
     unittest.main()

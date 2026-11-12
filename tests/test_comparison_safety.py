@@ -168,5 +168,42 @@ class ComparisonSafetyTest(unittest.TestCase):
             self.assertEqual(1, A.main())
 
 
+    def test_json_payload_matches_text_table_and_keeps_text_mode(self):
+        """--json 与文本表共用 write_rows/query_rows：数字必须同源；文本模式不受影响。"""
+        self.measurement(car='a', rnd=1)
+        self.measurement(car='b', rnd=1)
+        buf = io.StringIO()
+        with patch.object(sys, 'argv', ['car-compare', str(self.camp),
+                                        '--a', 'a', '--b', 'b', '--json']), \
+                contextlib.redirect_stdout(buf):
+            rc = C.main()
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual((payload['a'], payload['b']), ('a', 'b'))
+        self.assertEqual([t['track'] for t in payload['tracks']], ['hv1024x-int8'])
+        track = payload['tracks'][0]
+        self.assertTrue(track['series_a'] and track['series_b'])
+        wrow = next(r for r in track['write']
+                    if r['task'] == 'index-append' and r['metric'] == 'Median Throughput')
+        self.assertEqual(wrow['a_med'], 100)
+        self.assertEqual(wrow['b_med'], 100)
+        self.assertEqual(wrow['delta_pct'], 0.0)
+        self.assertEqual(wrow['direction'], 'higher-better')
+        self.assertEqual(wrow['a_n'], 1)
+        qrow = next(r for r in track['query'] if r['task'] == 'knn-search-10-100')
+        self.assertEqual((qrow['a_tput'], qrow['b_tput']), (10, 10))
+        self.assertEqual((qrow['a_p50'], qrow['b_p50']), (2, 2))
+        self.assertEqual((qrow['a_p99'], qrow['b_p99']), (4, 4))
+        self.assertEqual(track['pool']['A']['rounds'], 1)
+
+        buf2 = io.StringIO()
+        with patch.object(sys, 'argv', ['car-compare', str(self.camp), '--a', 'a', '--b', 'b']), \
+                contextlib.redirect_stdout(buf2):
+            self.assertEqual(C.main(), 0)
+        text = buf2.getvalue()
+        self.assertIn('| index-append / Median Throughput |', text)
+        self.assertIn('## hv1024x-int8 查询', text)
+
+
 if __name__ == '__main__':
     unittest.main()

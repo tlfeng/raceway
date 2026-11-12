@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""bench-compose.py — raceway 控制台（启动排程 + 运行进度 + 历史结果）
+"""bench-compose.py — raceway 控制台（启动排程 + 运行进度 + 历史结果 + 趋势 + 入库）
 
-serve 是三合一 Web 控制台（原"排程编排台"扩容）：
+serve 是五合一 Web 控制台（原"排程编排台"逐步扩容）：
 - ① 启动排程（PLAN v1：矩阵 → 排程文件 → 预览 → 起跑）
 - ② 运行进度：campaign 队列实时视图（复用 bench-queue 的推导），自动选中
   最新没收尾的 campaign；显示当前场次/相位/已进行时长、进度条、剩余预估、
-  PROGRESS.txt 尾部日志；可停止（远端 stop-campaign.sh）
+  PROGRESS.txt 尾部日志；可停止（远端 stop-campaign.sh）；窄屏可看（值班场景）
 - ③ 历史与结果：全部 campaign 清单（一次远端调用取摘要），任一场可"看进度"、
-  可"按此重排"（预填启动矩阵）；外链 Kibana 看板
+  可"按此重排"（预填启动矩阵）；两场对比为结构化表格（Δ 按方向着色）+
+  原始文本可折叠；外链 Kibana 看板
+- ④ 趋势：跨 campaign 的指标走势（只读指标库，echarts 折线；库缺失降级表格）
+- ⑤ 赛道与入库：远端 run-bench.sh list 的赛道目录 + exports/ 入库
+  （bench-apply 预检不过不发任何请求，断言状态先展示，--drop 需页面二次确认）
 
 设计要点（见 PLAN-raceway队列可视化与编排台.md §四 v1）：
 - 交错必须复刻 order_for_round（赛道外层 → 轮次 → 车右旋），直接 import
@@ -828,6 +832,7 @@ def cmd_start(args):
 
 _PAGE = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>raceway 控制台</title>
 <style>
  body{font:14px/1.6 -apple-system,'PingFang SC','Microsoft YaHei',sans-serif;margin:20px;max-width:1280px;color:#222;background:#fff;color-scheme:light}
@@ -881,6 +886,27 @@ _PAGE = """<!doctype html>
  .hmatrix td.past{opacity:.42}
  .legend span{margin-right:14px;font-size:12px}
  .skipbox{font-size:12px;color:#666;margin-top:6px;max-height:120px;overflow:auto;word-break:break-all;white-space:normal}
+ /* ---- ④ 趋势 / ⑤ 赛道与入库 ---- */
+ table.cmp{width:100%;font-size:13px;margin:6px 0 2px}
+ table.cmp td,table.cmp th{border:1px solid #ddd;padding:3px 8px}
+ table.cmp th{background:#f2f2f2}
+ table.cmp td.num{text-align:right;font-variant-numeric:tabular-nums}
+ td.d-up{color:#0a0;font-weight:600}td.d-down{color:#b00;font-weight:600}
+ #trchart{height:360px;margin:8px 0;border:1px solid #eee;border-radius:6px}
+ .trline{font-size:13px;margin:2px 0}
+ /* ---- 窄屏（手机值班看进度）：标签横滚、表格紧凑、卡片换行 ---- */
+ @media (max-width:720px){
+   body{margin:10px;max-width:none}
+   .tabs{display:flex;overflow-x:auto;white-space:nowrap}
+   .tabs button{padding:8px 12px;flex:0 0 auto}
+   td,th{padding:3px 6px}
+   table.q{font-size:12px}
+   pre{max-height:240px;font-size:12px}
+   .card{min-width:64px;padding:6px 10px}
+   .card b{font-size:16px}
+   select{max-width:52vw}
+   #trchart{height:280px}
+ }
 </style></head><body>
 <h1>raceway 控制台</h1>
 <div class="conn" id="connrow"><span id="conn">连接中…</span>
@@ -890,6 +916,8 @@ _PAGE = """<!doctype html>
  <button id="tb-compose" class="on" onclick="switchTab('compose')">① 启动排程</button>
  <button id="tb-progress" onclick="switchTab('progress')">② 运行进度</button>
  <button id="tb-history" onclick="switchTab('history')">③ 历史与结果</button>
+ <button id="tb-trend" onclick="switchTab('trend')">④ 趋势</button>
+ <button id="tb-ops" onclick="switchTab('ops')">⑤ 赛道与入库</button>
 </div>
 <span id="msg"></span>
 
@@ -965,13 +993,52 @@ _PAGE = """<!doctype html>
   &nbsp;vs&nbsp;
   B <select id="cmpb" style="max-width:250px"></select> 车 <input id="cmpcarb" size="8" placeholder="自动">
   <button onclick="doCompare()">对比</button>
-  <span class="sub">两个 campaign 作为两侧的取数池；车代号留空自动取（B 侧尽量取与 A 不同的车）。典型用法：两场各跑了 jdk25/kona25，对比 jdk25 vs kona25。</span>
-  <pre id="cmpout" style="max-height:320px">（未运行）</pre>
+  <span class="sub">两个 campaign 作为两侧的取数池；车代号留空自动取（B 侧尽量取与 A 不同的车）。典型用法：两场各跑了 jdk25/kona25，对比 jdk25 vs kona25。Δ 着色：绿=B 更好，红=B 更差，|Δ|&lt;2% 视为持平。</span>
+  <div id="cmpout"></div>
+  <details><summary>原始文本输出（复制进报告用）</summary><pre id="cmptext" style="max-height:320px">（未运行）</pre></details>
  </fieldset>
  <p class="sub">「看进度」跳到运行进度页看该场逐场明细；「按此重排」把该场的 车×赛道×轮次 预填进启动排程（可调整后重新生成）。列表按最近活动排序。</p>
  <div>筛选 <input id="hfilter" size="24" placeholder="输入 campaign 名关键字过滤" oninput="renderHistory()"></div>
  <table class="q"><thead><tr><th>campaign</th><th>状态</th><th>VALID / 数据行</th><th>最近活动</th><th>最后一条进度</th><th>操作</th></tr></thead>
  <tbody id="hrows"><tr><td colspan="6" class="sub">（加载中…）</td></tr></tbody></table>
+</div>
+
+<div id="tab-trend" class="tab">
+ <fieldset><legend>指标趋势（跨 campaign，只读指标库 benchmark-result-metric）</legend>
+  车 <input id="trcar" size="10" placeholder="jdk25">
+  赛道 <select id="trtrack"></select>
+  指标 <select id="trmetric">
+   <option value="throughput">吞吐（median）</option>
+   <option value="latency|p50">时延 p50</option>
+   <option value="latency|p99">时延 p99</option>
+   <option value="error_rate">错误率</option>
+  </select>
+  操作 <input id="trtask" size="16" placeholder="留空=全部">
+  <button onclick="doTrend()">查趋势</button>
+  <span class="sub">每个点 = 一场 campaign 的一次有效测量；同车多 build 会分线（series_key 带 build）。</span>
+ </fieldset>
+ <div id="trhint" class="sub"></div>
+ <div id="trchart"></div>
+ <div id="trtable"></div>
+</div>
+
+<div id="tab-ops" class="tab">
+ <fieldset><legend>赛道目录（远端 run-bench.sh list：定义在不在位 / 近期 campaign）</legend>
+  <button onclick="doTracks()">刷新赛道清单</button>
+  <pre id="tracksout" style="max-height:420px">（未运行）</pre>
+ </fieldset>
+ <fieldset><legend>结果入库（exports/ → ES；bench-apply 预检不过不发任何请求，退出码 0=成功 1=有拒收 2=预检失败）</legend>
+  导出 <select id="apexport" style="max-width:260px"></select>
+  <button onclick="loadExports()">刷新导出清单</button>
+  <div class="sub" id="apexpinfo">（先刷新导出清单）</div>
+  ES <input id="apes" size="34" value="https://127.0.0.1:9237">
+  口令 <input id="apauth" size="14" type="password" placeholder="user:pass（无鉴权集群留空）">
+  <label><input type="checkbox" id="apinsec" checked> 自签证书 --insecure</label>
+  <label><input type="checkbox" id="apdrop"> --drop（先删三张索引再重建；mapping 变更时必需）</label>
+  <button onclick="doApply()">入库</button>
+  <span class="sub">口令只用于本次远端命令，不在服务端留存。</span>
+  <pre id="apout" style="max-height:320px">（未运行）</pre>
+ </fieldset>
 </div>
 
 <script>
@@ -1229,12 +1296,21 @@ function onTab(name){
   return document.getElementById('tab-'+name).className.indexOf('on')>=0;
 }
 function switchTab(name){
-  ['compose','progress','history'].forEach(function(t){
+  ['compose','progress','history','trend','ops'].forEach(function(t){
     document.getElementById('tab-'+t).className='tab'+(t===name?' on':'');
     document.getElementById('tb-'+t).className=(t===name?'on':'');
   });
   if(name==='progress') pollNow();
   if(name==='history') loadCampaigns();   // 回历史页顺带刷新活动状态
+  if(name==='trend'){ fillTrackSelect(); }
+  if(name==='ops'){ loadExports(); }
+}
+function fillTrackSelect(){
+  const sel=document.getElementById('trtrack');
+  if(sel.options.length) return;
+  (TRACKS||[]).forEach(function(t){
+    sel.appendChild(new Option(t.name, t.name));
+  });
 }
 
 // 已结束里再分一档"已中止"：结束行是 trap / close-campaign.sh 补写的（括号里带"中止"），
@@ -1447,15 +1523,183 @@ async function doCompare(){
   if(!a||!b){ setMsg(false,'请选择两个 campaign'); return; }
   const car_a=document.getElementById('cmpcara').value.trim();
   const car_b=document.getElementById('cmpcarb').value.trim();
-  show('cmpout','对比中…（远端 car-compare，可能要几十秒）');
+  show('cmptext','对比中…（远端 car-compare，可能要几十秒）');
+  document.getElementById('cmpout').innerHTML='';
   try{
     const r=await fetch('/api/compare',{method:'POST',headers:writeHeaders(),
-      body:JSON.stringify({a:a,b:b,car_a:car_a,car_b:car_b})});
+      body:JSON.stringify({a:a,b:b,car_a:car_a,car_b:car_b,json:true})});
     const j=await r.json();
-    if(r.status!=200){ show('cmpout','对比失败: '+(j.error||'未知')); setMsg(false,'对比失败'); return; }
-    show('cmpout',(j.rc!=0?('（退出码 '+j.rc+'）\\n'):'')+j.result);
-    setMsg(!!j.result,'对比完成：'+a+' 的 '+j.car.split(' vs ')[0]+' vs '+b+' 的 '+j.car.split(' vs ')[1]);
-  }catch(e){ show('cmpout','对比请求失败: '+e); setMsg(false,'对比请求失败'); }
+    if(r.status!=200){ show('cmptext','对比失败: '+(j.error||'未知')); setMsg(false,'对比失败'); return; }
+    show('cmptext',(j.rc!=0?('（退出码 '+j.rc+'）\\n'):'')+j.result);
+    if(j.data) renderCompare(j.data, j.rc);
+    else show('cmpout','（无结构化数据，看下方原始文本）');
+    setMsg(true,'对比完成：'+a+' 的 '+j.car.split(' vs ')[0]+' vs '+b+' 的 '+j.car.split(' vs ')[1]);
+  }catch(e){ show('cmptext','对比请求失败: '+e); setMsg(false,'对比请求失败'); }
+}
+
+// ---- 对比结果结构化渲染：Δ 着色（方向感知：吞吐高好/时延低好），|Δ|<2% 持平 ----
+function dcell(v, dir, dec){
+  if(v==null||v===undefined) return '<td class="num sub">n/a</td>';
+  let cls='';
+  if(Math.abs(v)>=2) cls=(dir==='higher-better'? v>0 : v<0)?' class="num d-up"':' class="num d-down"';
+  else cls=' class="num"';
+  return '<td'+cls+'>'+(v>0?'+':'')+v.toFixed(dec==null?1:dec)+'%</td>';
+}
+function fmtN(v){ return (v==null)?'—':v.toLocaleString('en-US',{maximumFractionDigits:1}); }
+function renderCompare(d, rc){
+  const box=document.getElementById('cmpout');
+  let h='';
+  h+='<p class="sub">A='+esc(d.a)+' B='+esc(d.b)+' · campaign: '+esc(d.campaigns.join(', '))+
+     (rc!=0?' · <b class="err">断言未全部通过（退出码 '+rc+'）</b>':'')+'</p>';
+  (d.tracks||[]).forEach(function(t){
+    h+='<h2 style="margin-top:14px">'+esc(t.track)+' <small class="sub">A='+esc(t.series_a)+' · B='+esc(t.series_b)+
+       ' · 有效轮 A='+t.pool.A.rounds+' B='+t.pool.B.rounds+'</small></h2>';
+    if(t.pool.A.camps.length||t.pool.B.camps.length)
+      h+='<div class="sub">取数池 A: '+esc(t.pool.A.camps.join(', '))+' · B: '+esc(t.pool.B.camps.join(', '))+'</div>';
+    if((t.write||[]).length){
+      h+='<table class="cmp"><thead><tr><th>任务 / 指标</th><th>A 中位</th><th>B 中位</th><th>Δ(B/A)</th><th>有效轮 A / B</th><th>方向</th></tr></thead><tbody>';
+      t.write.forEach(function(r){
+        h+='<tr><td>'+esc(r.task)+' / '+esc(r.metric)+'</td><td class="num">'+fmtN(r.a_med)+'</td><td class="num">'+fmtN(r.b_med)+'</td>'+
+           dcell(r.delta_pct,r.direction)+ '<td class="num">'+r.a_n+' / '+r.b_n+'</td><td class="sub">'+
+           (r.direction==='higher-better'?'高好':'低好')+'</td></tr>';
+      });
+      h+='</tbody></table>';
+    }
+    if((t.query||[]).length){
+      h+='<table class="cmp"><thead><tr><th>查询操作</th><th>A ops/s</th><th>B ops/s</th><th>Δ吞吐</th><th>A p50</th><th>B p50</th><th>Δp50</th><th>A p99</th><th>B p99</th><th>Δp99</th></tr></thead><tbody>';
+      t.query.forEach(function(r){
+        h+='<tr><td>'+esc(r.task)+'</td><td class="num">'+fmtN(r.a_tput)+'</td><td class="num">'+fmtN(r.b_tput)+'</td>'+dcell(r.delta_tput,'higher-better')+
+           '<td class="num">'+fmtN(r.a_p50)+'</td><td class="num">'+fmtN(r.b_p50)+'</td>'+dcell(r.delta_p50,'lower-better')+
+           '<td class="num">'+fmtN(r.a_p99)+'</td><td class="num">'+fmtN(r.b_p99)+'</td>'+dcell(r.delta_p99,'lower-better')+'</tr>';
+      });
+      h+='</tbody></table>';
+    }
+  });
+  if(d.asserts) h+='<p class="'+(d.asserts.fails?'err':'ok')+'">断言规则 '+d.asserts.rules.length+' 条，FAIL '+d.asserts.fails+' 条</p>';
+  box.innerHTML=h;
+}
+
+// ---- ④ 趋势：跨 campaign 的指标走势（echarts 折线；库缺失降级为表格） ----
+let ECHARTS_OK = undefined;   // undefined=未探测, true/false
+function loadEcharts(){
+  if(ECHARTS_OK!==undefined) return Promise.resolve(ECHARTS_OK);
+  return new Promise(function(res){
+    const s=document.createElement('script');
+    s.src='/echarts.min.js';
+    s.onload=function(){ ECHARTS_OK=(typeof echarts!=='undefined'); res(ECHARTS_OK); };
+    s.onerror=function(){ ECHARTS_OK=false; res(false); };
+    document.head.appendChild(s);
+  });
+}
+async function doTrend(){
+  const car=document.getElementById('trcar').value.trim();
+  const track=document.getElementById('trtrack').value;
+  const fm=document.getElementById('trmetric').value.split('|');
+  const family=fm[0], stat=fm[1]||'';
+  const task=document.getElementById('trtask').value.trim();
+  if(!car){ setMsg(false,'请填车代号（如 jdk25 / ez3000）'); return; }
+  document.getElementById('trhint').textContent='查询指标库中…';
+  try{
+    const p=new URLSearchParams({car:car,track:track,family:family});
+    if(stat) p.set('stat',stat);
+    if(task) p.set('task',task);
+    const r=await fetch('/api/trend?'+p.toString());
+    const j=await r.json();
+    if(r.status!=200){ document.getElementById('trhint').textContent='查询失败: '+(j.error||'未知'); return; }
+    if(!j.available){ document.getElementById('trhint').textContent='指标库不可用：'+(j.error||'未知'); renderTrendTable(j); return; }
+    document.getElementById('trhint').textContent='共 '+j.n+' 行 · 单位 '+(j.unit||'?')+' · '+
+      (j.direction==='lower-better'?'越低越好':'越高越好');
+    renderTrendChart(car, j);
+    renderTrendTable(j);
+  }catch(e){ document.getElementById('trhint').textContent='请求失败: '+e; }
+}
+function renderTrendChart(car, j){
+  const box=document.getElementById('trchart');
+  loadEcharts().then(function(ok){
+    if(!ok){ box.innerHTML='<p class="sub">echarts.min.js 未随仓库分发（放在 bench-compose.py 同目录即可），先用下方表格看数。</p>'; return; }
+    const chart=echarts.init(box);
+    const legend=[]; const series=[]; const xs=new Set();
+    (j.series||[]).forEach(function(s){
+      legend.push(s.key);
+      (s.points||[]).forEach(function(p){ if(p.t) xs.add(p.t); });
+    });
+    const xarr=Array.from(xs).sort();
+    (j.series||[]).forEach(function(s){
+      const m={}; (s.points||[]).forEach(function(p){ if(p.t) m[p.t]=p.v; });
+      series.push({name:s.key, type:'line', connectNulls:true,
+        data:xarr.map(function(t){ return m.hasOwnProperty(t)?m[t]:null; })});
+    });
+    chart.setOption({
+      tooltip:{trigger:'axis',formatter:function(ps){
+        let h=esc(ps[0].axisValue);
+        ps.forEach(function(p){ h+='<br>'+esc(p.marker+p.seriesName+'：'+p.value); });
+        return h;}},
+      legend:{data:legend,top:0},
+      grid:{left:60,right:20,top:36,bottom:60},
+      xAxis:{type:'category',data:xarr,axisLabel:{rotate:30,fontSize:10}},
+      yAxis:{type:'value',name:j.unit||'',scale:true},
+      series:series
+    });
+    window.addEventListener('resize',function(){ chart.resize(); });
+  });
+}
+function renderTrendTable(j){
+  const box=document.getElementById('trtable');
+  let h='<table class="cmp"><thead><tr><th>序列（series | 操作 | stat）</th><th>campaign</th><th>时间</th><th>值</th><th>变体</th></tr></thead><tbody>';
+  (j.series||[]).forEach(function(s){
+    (s.points||[]).forEach(function(p,i){
+      h+='<tr><td>'+(i===0?esc(s.key):'')+'</td><td>'+esc(p.campaign||'')+'</td><td class="num">'+esc(p.t||'')+'</td>'+
+         '<td class="num">'+fmtN(p.v)+'</td><td>'+esc(p.variant||'')+'</td></tr>';
+    });
+  });
+  h+='</tbody></table>';
+  box.innerHTML=(j.series||[]).length?h:'<p class="sub">没有匹配的测量 —— 检查车代号/赛道/指标拼写，或先入库。</p>';
+}
+
+// ---- ⑤ 赛道目录与入库 ----
+async function doTracks(){
+  show('tracksout','读取中…');
+  try{
+    const r=await fetch('/api/tracks',{method:'POST',headers:writeHeaders()});
+    const j=await r.json();
+    if(r.status!=200){ show('tracksout','读取失败: '+(j.error||'未知')); return; }
+    show('tracksout',j.result);
+  }catch(e){ show('tracksout','请求失败: '+e); }
+}
+async function loadExports(){
+  const info=document.getElementById('apexpinfo');
+  info.textContent='读取 exports/ 清单中…';
+  try{
+    const r=await fetch('/api/exports');
+    const j=await r.json();
+    if(r.status!=200){ info.textContent='读取失败: '+(j.error||'未知'); return; }
+    const sel=document.getElementById('apexport');
+    sel.innerHTML=(j.exports||[]).map(function(e){
+      return '<option value="'+esc(e.tag)+'">'+esc(e.tag)+'（'+(e.assertions==='pass'?'✔断言通过':'✘断言'+esc(e.assertions||'无'))+
+             '，'+(e.counts?e.counts.bench_metric+' 行指标':'?')+'）</option>';
+    }).join('');
+    info.textContent=(j.exports||[]).length?
+      '断言未通过或缺失的导出，bench-apply 会在预检拒绝，不会发任何请求。':'（exports/ 下没有可入库的导出）';
+  }catch(e){ info.textContent='请求失败: '+e; }
+}
+async function doApply(){
+  const exp=document.getElementById('apexport').value;
+  const es=document.getElementById('apes').value.trim();
+  const auth=document.getElementById('apauth').value;
+  const insecure=document.getElementById('apinsec').checked;
+  const drop=document.getElementById('apdrop').checked;
+  if(!exp){ setMsg(false,'请先刷新并选择导出'); return; }
+  if(!es){ setMsg(false,'请填 ES 地址'); return; }
+  if(drop && !confirm('确认带 --drop 入库？\\n会先删除目标集群的三张 benchmark-result-* 索引再重建。')) return;
+  show('apout','入库中…（远端 bench-apply，全量预检通过才发送）');
+  try{
+    const r=await fetch('/api/apply',{method:'POST',headers:writeHeaders(),
+      body:JSON.stringify({export:exp,es:es,auth:auth,insecure:insecure,drop:drop})});
+    const j=await r.json();
+    if(r.status!=200){ show('apout','入库请求参数错误: '+(j.error||'未知')); setMsg(false,'参数错误'); return; }
+    show('apout',(j.rc!=0?('（退出码 '+j.rc+'）\\n'):'')+j.result);
+    setMsg(j.rc==0, j.rc==0?'入库完成 ✔':(j.rc==2?'预检失败，未发送任何请求':'有文档被拒收，见输出'));
+  }catch(e){ show('apout','请求失败: '+e); setMsg(false,'请求失败'); }
 }
 
 // ---- 勾选偏好记忆（localStorage）：下次打开不用重勾 ----
@@ -1793,26 +2037,172 @@ def api_compare(st, body):
             script = comparison_bundle()
         except OSError as e:
             return 400, {'error': '读不到本机对比程序或其依赖: %s' % e}
-        cmd = ('cd %s && python3 -B - --a %s --b %s --a-campaign %s --b-campaign %s'
+        cmd = ('cd %s && python3 -B - --a %s --b %s --a-campaign %s --b-campaign %s%s'
                % (shlex.quote(st.args.root), shlex.quote(car_a), shlex.quote(car_b),
                   shlex.quote(posixpath.join(st.src.root, ca)),
-                  shlex.quote(posixpath.join(st.src.root, cb))))
+                  shlex.quote(posixpath.join(st.src.root, cb)),
+                  ' --json' if body.get('json') else ''))
         rc, out = ssh_run(st.args.ssh, cmd, input_text=script, timeout=300)
     if rc != 0 and not out.strip():
         return 400, {'error': 'car-compare 返回码 %d 且无输出（远端 python3 可用？）' % rc}
-    return 200, {'result': out, 'rc': rc, 'car': '%s vs %s' % (car_a, car_b)}
+    data = None
+    if body.get('json'):
+        try:
+            data = json.loads(out.strip())
+            if not isinstance(data, dict) or 'tracks' not in data:
+                data = None          # stderr 混入导致解析失败 → 降级为文本展示
+        except ValueError:
+            data = None
+    return 200, {'result': out, 'rc': rc, 'car': '%s vs %s' % (car_a, car_b), 'data': data}
+
+
+def api_tracks(st):
+    """赛道目录：远端 run-bench.sh list（定义在不在位、语料、近期 campaign）。"""
+    cmd = ('cd %s && if [ -f run-bench.sh ]; then ./run-bench.sh list; else echo MISSING; fi'
+           % shlex.quote(st.args.root))
+    with st.lock:
+        rc, out = ssh_run(st.args.ssh, cmd, timeout=120)
+    if 'MISSING' in out:
+        return 400, {'error': '远端 %s 没有 run-bench.sh —— 仓库同步时记得带全部 *.sh' % st.args.root}
+    return 200, {'result': out, 'rc': rc}
+
+
+def api_exports(st):
+    """exports/ 清单：tag、导出断言状态、三索引行数（远端只读，供入库页选择）。"""
+    script = (
+        "import json, os\n"
+        "root = %s\n"
+        "exp = os.path.join(root, 'exports')\n"
+        "out = []\n"
+        "for tag in (sorted(os.listdir(exp)) if os.path.isdir(exp) else []):\n"
+        "    d = os.path.join(exp, tag)\n"
+        "    m = os.path.join(d, 'manifest.json')\n"
+        "    if not os.path.isdir(d) or not os.path.isfile(m):\n"
+        "        continue\n"
+        "    try:\n"
+        "        doc = json.load(open(m, encoding='utf-8'))\n"
+        "    except (ValueError, OSError):\n"
+        "        continue\n"
+        "    out.append({'tag': tag,\n"
+        "                'assertions': (doc.get('assertions') or {}).get('status'),\n"
+        "                'counts': {k: doc.get(k) for k in ('bench_env', 'bench_run', 'bench_metric')},\n"
+        "                'mtime': int(os.path.getmtime(m))})\n"
+        "print(json.dumps(out))\n" % json.dumps(st.args.root))
+    with st.lock:
+        rc, out = ssh_run(st.args.ssh, 'cd %s && python3 -B -' % shlex.quote(st.args.root),
+                          input_text=script, timeout=60)
+    if rc != 0:
+        return 400, {'error': '读 exports/ 失败（rc=%d）：\n%s' % (rc, out.strip()[:400])}
+    try:
+        exports = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, AttributeError, IndexError):
+        return 500, {'error': 'exports 清单输出不可解析：\n%s' % out.strip()[:400]}
+    if not isinstance(exports, list):
+        return 500, {'error': 'exports 清单格式异常'}
+    return 200, {'exports': exports}
+
+
+def api_trend(st, q):
+    """跨 campaign 指标趋势：只读指标库（bench-history 同一条 ssh/curl 取数路径）。
+
+    指标库没跑/没配口令时返回 available=False —— 界面显示原因，绝不把空数据
+    当"没有趋势"。分组键 = series_key | 变体 | 操作 | stat，同车多 build 天然分线。
+    """
+    car = (q.get('car') or [''])[0].strip()
+    track = (q.get('track') or [''])[0].strip()
+    family = (q.get('family') or [''])[0].strip()
+    stat = (q.get('stat') or [''])[0].strip()
+    task = (q.get('task') or [''])[0].strip()
+    if not car or not track:
+        return 400, {'error': 'car 与 track 必填'}
+    for label, val in (('car', car), ('track', track), ('family', family),
+                       ('stat', stat), ('task', task)):
+        if val and not re.fullmatch(r'[A-Za-z0-9._@+-]{1,120}', val):
+            return 400, {'error': '%s 参数非法: %r' % (label, val)}
+    auth = getattr(st.args, 'es_auth', None) or os.environ.get('RACEWAY_ES_AUTH')
+    if not auth:
+        return 200, {'available': False,
+                     'error': '未配置指标库口令（--es-auth 或环境变量 RACEWAY_ES_AUTH）'}
+    filt = [{'term': {'car_code': car}}, {'term': {'track': track}}, {'term': {'trusted': True}}]
+    if family:
+        filt.append({'term': {'family': family}})
+    if stat:
+        filt.append({'term': {'stat': stat}})
+    if task:
+        filt.append({'term': {'task': task}})
+    body = {'size': 2000, 'query': {'bool': {'filter': filt}},
+            '_source': ['run_start', 'campaign', 'series_key', 'task', 'family', 'stat',
+                        'value', 'unit', 'direction', 'track_variant'],
+            'sort': [{'run_start': 'asc'}]}
+    try:
+        resp = H.es_query(st.args.ssh, body, auth=auth,
+                          es_url=getattr(st.args, 'es_url', None) or H.DEFAULT_ES_URL,
+                          path='benchmark-result-metric/_search', timeout=60)
+    except H.HistoryUnavailable as e:
+        return 200, {'available': False, 'error': str(e)}
+    groups, unit, direction, total = {}, None, None, 0
+    for hit in resp.get('hits', {}).get('hits', []):
+        s = hit.get('_source') or {}
+        val = s.get('value')
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        key = '%s | %s | %s | %s' % (s.get('series_key') or car,
+                                     s.get('track_variant') or s.get('track') or '',
+                                     s.get('task') or '?', s.get('stat') or '?')
+        groups.setdefault(key, []).append({'t': s.get('run_start'), 'v': val,
+                                           'campaign': s.get('campaign')})
+        total += 1
+        unit = unit or s.get('unit')
+        direction = direction or s.get('direction')
+    return 200, {'available': True, 'n': total, 'unit': unit, 'direction': direction,
+                 'series': [{'key': k, 'points': v} for k, v in sorted(groups.items())]}
+
+
+def api_apply(st, body):
+    """入库执行：远端跑仓库版 bench-apply.py（stdin 送本机审定版源码，不吃远端旧拷贝）。
+
+    bench-apply 自己先全量预检（不过不发任何请求）：退出码 0=成功、1=bulk 有拒收、
+    2=预检/参数失败。控制台只递参数，不发明新的入库逻辑；--drop 的二次确认在页面侧。
+    """
+    export = (body.get('export') or '').strip()
+    es = (body.get('es') or '').strip()
+    auth = (body.get('auth') or '').strip()
+    insecure = bool(body.get('insecure'))
+    drop = bool(body.get('drop'))
+    try:
+        safe_name(export, 'export tag')
+    except ValueError as e:
+        return 400, {'error': str(e)}
+    if not re.fullmatch(r'https?://[^\s/]+(?:/[^\s]*)?', es or ''):
+        return 400, {'error': '--es 必须是 HTTP(S) URL'}
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(here, 'bench-apply.py'), encoding='utf-8') as f:
+            script = f.read()
+    except OSError as e:
+        return 400, {'error': '读不到本机 bench-apply.py: %s' % e}
+    cmd = ('cd %s && python3 -B - --dir %s --es %s%s%s%s'
+           % (shlex.quote(st.args.root),
+              shlex.quote(posixpath.join(st.args.root, 'exports', export)),
+              shlex.quote(es),
+              (' --auth ' + shlex.quote(auth)) if auth else '',
+              ' --insecure' if insecure else '',
+              ' --drop' if drop else ''))
+    with st.lock:
+        rc, out = ssh_run(st.args.ssh, cmd, input_text=script, timeout=900)
+    return 200, {'result': out, 'rc': rc}
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, ctype, body):
+    def _send(self, code, ctype, body, cache='no-store'):
         data = body.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
-        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Cache-Control', cache)
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.end_headers()
@@ -1880,6 +2270,22 @@ class Handler(BaseHTTPRequestHandler):
             code, payload = api_logtail(st, (q.get('cid') or [''])[0],
                                         (q.get('n') or ['50'])[0])
             self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
+        elif path == '/api/exports':
+            code, payload = api_exports(st)
+            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
+        elif path == '/api/trend':
+            code, payload = api_trend(st, q)
+            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
+        elif path == '/echarts.min.js':
+            local = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'echarts.min.js')
+            if os.path.isfile(local):
+                with open(local, encoding='utf-8') as f:
+                    self._send(200, 'application/javascript; charset=utf-8', f.read(),
+                               cache='public, max-age=86400')
+            else:
+                self._send(404, 'text/plain',
+                           'echarts.min.js 未随仓库分发（与 bench-compose.py 同目录放置后刷新）'
+                           '—— 趋势图不可用，表格不受影响')
         else:
             self._send(404, 'text/plain', 'not found')
 
@@ -1909,6 +2315,10 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = api_compare(st, body)
             elif self.path == '/api/doctor':
                 code, payload = api_doctor(st)
+            elif self.path == '/api/tracks':
+                code, payload = api_tracks(st)
+            elif self.path == '/api/apply':
+                code, payload = api_apply(st, body)
             else:
                 code, payload = 404, {'error': 'not found'}
         except SystemExit as e:
@@ -1944,7 +2354,7 @@ def cmd_serve(args):
     srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     srv.state = state
     url = 'http://127.0.0.1:%d' % args.port
-    print('raceway 控制台: %s  （① 启动排程 · ② 运行进度 · ③ 历史与结果）' % url)
+    print('raceway 控制台: %s  （① 启动排程 · ② 运行进度 · ③ 历史与结果 · ④ 趋势 · ⑤ 赛道与入库）' % url)
     print('  远端 %s · raceway 根 %s · 车源 %s' % (args.ssh or '本地', args.root, args.cars_file))
     if not args.no_open:
         threading.Timer(0.8, webbrowser.open, [url]).start()
