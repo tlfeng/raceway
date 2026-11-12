@@ -21,6 +21,12 @@
     {
       "name": "wait-until-merges-finish",
       "operation": { "operation-type": "index-stats", "index": "_all", "condition": { "path": "_all.total.merges.current", "expected-value": 0 }, "retry-until-success": true, "include-in-reporting": false }
+    },
+    {
+      "name": "wait-for-single-segment",
+      "operation": { "operation-type": "index-stats", "index": "vectors",
+        "condition": { "path": "_all.total.segments.count", "expected-value": {{expected_segments | default(3)}} },
+        "retries": 120, "retry-wait-period": 5, "retry-on-error": true, "include-in-reporting": false }
     }
   ]
 },

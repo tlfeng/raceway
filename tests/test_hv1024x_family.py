@@ -53,6 +53,13 @@ def render(tmpl, params):
     else:
         s = re.sub(r'\{%\s*if\s+source_reuse\s+is\s+defined\s+and\s+source_reuse\s*%\}.*?\{%\s*endif\s*%\}',
                    '', s, flags=re.S)
+    # encrypted_store 条件块（20261112 整改：加密存储可选开关，默认关）
+    if params.get('encrypted_store'):
+        s = re.sub(r'\{%\s*if\s+encrypted_store\s+is\s+defined\s+and\s+encrypted_store\s*%\}(.*?)\{%\s*endif\s*%\}',
+                   lambda m: m.group(1), s, flags=re.S)
+    else:
+        s = re.sub(r'\{%\s*if\s+encrypted_store\s+is\s+defined\s+and\s+encrypted_store\s*%\}.*?\{%\s*endif\s*%\}',
+                   '', s, flags=re.S)
     s = re.sub(r'\{\{\s*vector_index_type\s*\|\s*default\(\'hnsw\'\)\s*\}\}',
                params.get('vector_index_type', 'hnsw'), s)
     s = re.sub(r'\{\{\s*index_codec\s*\}\}', params.get('index_codec', ''), s)
