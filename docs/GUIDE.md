@@ -76,7 +76,7 @@ runner 取得 `RESULTS_ROOT/.runner.lock` 的 `flock` 后，从本次 campaign �
 | `RALLY_PYTHON` | 赛道任务清单渲染用的 Python，默认 `python3`；须能 import esrally。Rally 安装在 venv 时指向该 venv 的 Python，不能只靠发压 wrapper 激活环境 |
 | `TIMEOUT_<赛道>_W` / `_Q` | 写段 / 查段超时（秒） |
 | `HV_CORPUS` / `HV_QUERIES_BZ2` | hv1024 系语料与官方查询集路径；起跑前用来软链语料、生成 `queries.json` |
-| `TRACK_HNSW_BASE` / `TRACK_HNSW_S3` | 机器本地的 96 维 HNSW 赛道（定义不在库内，runner 现生成） |
+| `TRACK_HNSW_BASE` | hnsw 语料与查询集目录（`documents-2m.json` / `queries.json`，不进 git）；赛道定义已定版 `tracks/hnsw/` |
 | `MON_DIR` | 远端监控脚本与 CSV 目录；runner 启停、收集时统一透传为 `RACEWAY_MON_DIR` |
 | `ENGINE_MARK` | 监控归因标记：cmdline 含此串的进程视为被测引擎。**换部署根必须同步改**（见 §15 第 10 条） |
 

@@ -61,9 +61,9 @@ scp -r *.sh *.py *.conf vm-bench.env tracks/ kibana/ 压测机:/opt/raceway/   #
 | 1024 维四臂（量化/压缩） | `./run-bench.sh hv1024x-int8 3` | `hv1024x` / `-int8` / `-bbq` / `-codec-zstd-sr` 四臂；压缩臂仅 Easysearch |
 | OpenSearch 1024 维向量 | `ENGINE_NAME=opensearch ENGINE_VERSION=3.3.2 ./run-bench.sh hv1024x-os 3` | `-os` / `-os-bbq` / `-os-disk`；搜索预算按引擎记录，不将 `ef_search` 等同于 ES `num_candidates` |
 | geonames upsert / update | `./run-bench.sh upsert 3` | 自然 ID、bulk_size=500；revision 变化的真实更新，与纯 update 对照 |
-| 96 维 200 万向量 | `./run-bench.sh hnsw 3` | 定义在机器上（`TRACK_HNSW_BASE`） |
+| 96 维 200 万向量 | `./run-bench.sh hnsw 3` | 定义已定版 `tracks/hnsw`；语料 `TRACK_HNSW_BASE` |
 | nested 文档 | `./run-bench.sh nested 3` | 官方基座 |
-| 维度扫描（多档位） | `SCHEDULE_FILE=… CARS_FILE=… DS_HOURS=12 ./run-bench.sh ds` | 定义待回灌，见 [tracks/README.md](tracks/README.md) |
+| 维度扫描（多档位） | `SCHEDULE_FILE=… CARS_FILE=… DS_HOURS=12 ./run-bench.sh ds` | 定义已定版 `tracks/ds-*`；语料 `CORPORA_DS` |
 | 冒烟 / 补跑一场 | `./run-bench.sh geo 1` | 续跑需显式复用 `CAMP_ID` 和相同计划；成功尝试自动跳过，`FRESH=1` 分配新尝试，保留历史 |
 
 每场时长与多配置对比的写法见 [docs/GUIDE.md §1](docs/GUIDE.md)。

@@ -151,7 +151,7 @@ track_dir() { # <赛道/变体 id> → 目录
       # 量化档走 --track-params（vector_index_type）。
       echo "$ROOT/tracks/hv1024x";;
     geo) echo "$ROOT/tracks/geonames";;
-    hnsw) echo "$TRACK_HNSW_S3";;
+    hnsw) echo "$ROOT/tracks/hnsw";;
     hv1024) echo "$ROOT/tracks/hv1024";;
     nested) echo "$ROOT/tracks/nested";;
     *) echo "$ROOT/tracks/$1";;
@@ -182,7 +182,7 @@ track_quant() { # <id> → index_options.type（空 = 不量化）
     *) echo "";; esac; }
 # hnsw 3 分片变体只在**真要跑 hnsw 族**时才生成：无条件生成时，机器上缺 hnsw 基座
 # 定义会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
-tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要生成 hnsw 3 分片变体
+tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要准备 hnsw 语料/查询集软链（定义已定版 tracks/hnsw）
   local tk
   for tk in "$@"; do
     case "$tk" in *hnsw*) return 0;; esac
@@ -196,17 +196,11 @@ track_availability_table() {
   for _t in geo geonames-upsert hnsw hv1024 nested \
             hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr \
             hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk; do
-    case "$_t" in
-      hnsw) _d="${TRACK_HNSW_BASE:-}";;                    # 3 分片变体起跑时生成，判基座在不在
-      *)    _d=$(track_dir "$_t" 2>/dev/null || echo "");;   # 变体与基座同目录（压缩/量化走 params）
-    esac
+    _d=$(track_dir "$_t" 2>/dev/null || echo "");   # 变体与基座同目录（压缩/量化走 params）
     if [ -n "$_d" ] && [ -f "$_d/track.json" ]; then
       printf '  %s %-24s %s\n' "✔" "$_t" "$_d"
     else
-      [ -n "$_d" ] || { case "$_t" in
-        hnsw) _d="（vm-bench.env 里没设 TRACK_HNSW_BASE）";;
-        *)    _d="（路径解析失败）";;
-      esac; }
+      [ -n "$_d" ] || _d="（路径解析失败）"
       printf '  %s %-24s %s\n' "⚠" "$_t" "$_d"
       echo "      ↳ 定义不在位：仓库没同步全（同步得带 tracks/），或这条还没回灌进 git（见 tracks/README.md）"
     fi
@@ -235,13 +229,13 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   # 不传就落到模板默认值（geonames 5、nested 1、hv1024 3），与其余赛道的 3 分片口径
   # 不一致，跨赛道/跨变体的数字就不可比了。
   #
-  # 其余赛道（hnsw/ds-*）分片已烘进 index.json，不传。
+  # 其余赛道（ds-*）分片仍烘在 index.json 里，不传；hnsw 已随回灌 params 化（默认 3，与原 3 分片口径一致）。
   # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名与 legacy 别名
   #    走的是同一条规则，只是名字不同。
   local b; b=$(track_base "$1")
   local p=""
   case "$b" in
-    geo|nested|hv1024|geonames-upsert) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
+    geo|nested|hv1024|geonames-upsert|hnsw) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
   esac
   # 压缩档与 source_reuse：索引级设置，走 --track-params（标量，无逗号，rally 2.12 解析可靠），
   # 由 index.json 的条件块写入 settings（{% if index_codec is defined %} /

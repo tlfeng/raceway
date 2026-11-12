@@ -285,18 +285,30 @@ class TestTrackParams(unittest.TestCase):
                              'source_reuse 关的变体不该传该参数: %s → %s' % (i, b[i]))
 
     def test_baked_tracks_get_nothing(self):
-        """分片已烘进 index.json 的赛道不传分片参数（存储参数另算）。"""
-        ids = ['hnsw', 'ds-j1024', 'ds-g1920']
+        """分片已烘进 index.json 的赛道不传分片参数（存储参数另算）。
+
+        hnsw 已随 20261112 回灌 params 化（默认 3）→ 不在本名单里了。
+        """
+        ids = ['ds-j1024', 'ds-g1920']
         b = bash_derive('track_params', ids)
         for i in ids:
             self.assertIn(i, b, 'bash function did not run: %s' % i)
             self.assertEqual(b[i], '', '不该传分片参数: %s' % i)
 
+    def test_hnsw_shard_params_after_backfill(self):
+        """hnsw 回灌定版后分片 params 化（默认 3，与原 3 分片口径一致）→ 与 geo 族同待遇。"""
+        b = bash_derive('track_params', ['hnsw'])
+        self.assertEqual(b['hnsw'], self.PARAMS)
+
     def test_baked_base_still_carries_storage_params(self):
-        """基座分片已烘进 index.json 的压缩变体：分片不传，存储参数照传。"""
-        b = bash_derive('track_params', ['hnsw-codec-zstd', 'hnsw-codec-def'])
-        self.assertEqual(b['hnsw-codec-zstd'], 'index_codec:ZSTD')
-        self.assertEqual(b['hnsw-codec-def'], 'index_codec:default')
+        """分片烘进 index.json 的基座（ds-*）压缩变体：分片不传，存储参数照传。
+
+        hnsw 已 params 化，压缩变体会带分片参数 —— 由 test_hnsw_shard_params_after_backfill
+        与本例共同覆盖两条分支。
+        """
+        b = bash_derive('track_params', ['ds-j1024-codec-zstd', 'ds-j1024-codec-def'])
+        self.assertEqual(b['ds-j1024-codec-zstd'], 'index_codec:ZSTD')
+        self.assertEqual(b['ds-j1024-codec-def'], 'index_codec:default')
 
     def test_hv1024_gets_shard_params(self):
         """hv1024 的定版 index.json 已参数化分片 → 必须传，否则落到模板默认 3。
