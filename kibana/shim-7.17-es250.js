@@ -242,7 +242,27 @@ function fakeNodesVersion(body) {
   return n > 0 ? JSON.stringify(j) : null;
 }
 
-http.createServer((req, res) => {
+// 仅翻译 HTTP 成功且结构合法的 PIT 响应。错误/失败不得伪造成 200 成功。
+function translatePitResponse(statusCode, body, closing) {
+  if (statusCode < 200 || statusCode >= 300) return null;
+  let parsed;
+  try { parsed = JSON.parse(body); } catch (e) { return null; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || 'error' in parsed) return null;
+  if (closing) {
+    if ('succeeded' in parsed) return null; // 上游 ES 形态的成功/失败原样保留
+    if (!Array.isArray(parsed.pits) || parsed.pits.length === 0) return null;
+    const valid = parsed.pits.every((pit) => pit && typeof pit === 'object'
+      && typeof pit.pit_id === 'string' && pit.pit_id.length > 0
+      && typeof pit.successful === 'boolean');
+    if (!valid || !parsed.pits.every((pit) => pit.successful)) return null;
+    return JSON.stringify({ ...parsed, succeeded: true, num_freed: parsed.pits.length });
+  }
+  if (typeof parsed.pit_id !== 'string' || !parsed.pit_id || 'id' in parsed) return null;
+  return JSON.stringify({ ...parsed, id: parsed.pit_id });
+}
+
+function startServer() {
+  return http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
@@ -372,35 +392,18 @@ http.createServer((req, res) => {
             }
           }
 
-          if (isClosePit) {
-            try {
-              const parsed = JSON.parse(outBody.toString('utf8'));
-              if (parsed && !('succeeded' in parsed)) {
-                parsed.succeeded = true;
-                parsed.num_freed = Array.isArray(parsed.pits) ? parsed.pits.length : 1;
-                outBody = Buffer.from(JSON.stringify(parsed));
-                outHeaders['content-type'] = 'application/json; charset=UTF-8';
-                outHeaders['content-length'] = String(outBody.length);
-                delete outHeaders['content-encoding'];
-                send('pit_close_succeeded', 200);
-                return;
-              }
-            } catch (e) { /* fall through */ }
-          }
-
-          if (isOpenPit) {
-            try {
-              const parsed = JSON.parse(outBody.toString('utf8'));
-              if (parsed && parsed.pit_id && !parsed.id) {
-                parsed.id = parsed.pit_id;
-                outBody = Buffer.from(JSON.stringify(parsed));
-                outHeaders['content-type'] = 'application/json; charset=UTF-8';
-                outHeaders['content-length'] = String(outBody.length);
-                delete outHeaders['content-encoding'];
-                send('pit_id_to_id', 200);
-                return;
-              }
-            } catch (e) { /* fall through */ }
+          if (isClosePit || isOpenPit) {
+            const patched = translatePitResponse(proxyRes.statusCode, outBody.toString('utf8'), isClosePit);
+            if (patched !== null) {
+              outBody = Buffer.from(patched);
+              outHeaders['content-type'] = 'application/json; charset=UTF-8';
+              outHeaders['content-length'] = String(outBody.length);
+              delete outHeaders['content-encoding'];
+              send(isClosePit ? 'pit_close_succeeded' : 'pit_id_to_id');
+            } else {
+              send(); // 上游 status/body 原样，包括 401/403/404/500 与 malformed JSON
+            }
+            return;
           }
 
           if (isXpack) {
@@ -504,5 +507,8 @@ http.createServer((req, res) => {
   });
 }).listen(LISTEN_PORT, '127.0.0.1', () => {
   log({ ts: new Date().toISOString(), event: 'proxy_started', port: LISTEN_PORT, fixNodesInfo: FIX_NODES_INFO, target: `${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}`, fakeVersion: FAKE_VERSION });
-  console.log(`shim proxy on 127.0.0.1:${LISTEN_PORT} -> ${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT} (fixNodesInfo=${FIX_NODES_INFO}, fake=${FAKE_VERSION})`);
-});
+  });
+}
+
+module.exports = { translatePitResponse, fixRequestBody, startServer };
+if (require.main === module) startServer();

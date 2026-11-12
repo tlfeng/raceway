@@ -1,0 +1,16 @@
+{% import "rally.helpers" as rally with context %}
+{
+  "version": 2,
+  "description": "Dimension-sweep (1536-dim float, dot_product) HNSW benchmark, 1M docs, separated write/query with segment gate",
+  "indices": [ { "name": "vectors", "body": "index.json" } ],
+  "corpora": [
+    {
+      "name": "dense-vector-1536",
+      "documents": [
+        { "source-file": "documents-1536.json", "document-count": 1000000, "uncompressed-bytes": 21129162130 }
+      ]
+    }
+  ],
+  "operations": [ {{ rally.collect(parts="operations/*.json") }} ],
+  "challenges": [ {{ rally.collect(parts="challenges/*.json") }} ]
+}

@@ -3,11 +3,14 @@
 索引名:     vectors
 引擎:       OpenSearch ≥3.6（k-NN 插件，lucene engine）
 映射:       knn_vector 1024 维 · cosinesimil · lucene hnsw + compression_level 32x（Lucene BBQ）
-            ⚠ 冒烟项：32x 与显式 method 若互斥，去掉 method 块（m/efC 用 OS 默认），报告注明
+            固定 method hnsw/lucene/m=32/efC=100；目标引擎若不支持该组合须拒跑，不回落默认图参数
 settings:   3 分片 0 副本 · index.knn=true · _source excludes ["emb"]
 对应 ES:    dense_vector + index_options.type=bbq_hnsw（ES818/ES93HnswBinaryQuantizedVectorsFormat）
             实现不同：ES 为自研 fork codec，OS 走 Lucene 10.2 官方 Lucene102BinaryQuantized
 语料:       documents-1024.json（软链 documents-jina-float.json，1M × 1024 维 float，22739096214 字节）
 待部署补:   queries.json / queries-recall.jsonl / truth.jsonl（从 tracks/hv1024x 拷贝或软链）
-查询体:     OpenSearch k-NN DSL（{"query":{"knn":{"emb":{...}}}}，见 track.py）
+查询体:     OpenSearch k-NN DSL（query.knn.emb），body.size=k
+搜索预算:   operation ef-search=100/1000 → method_parameters.ef_search，k=10/100
+            Lucene HNSW 使用 max(k, ef_search) 的搜索宽度；量化重排沿用该引擎策略
+比较要求:   任务名末尾数字表示 ef_search，不等价于 ES num_candidates；需核对实测 recall
 设计文档:   PLAN-opensearch-hv1024-三向量对比测试.md

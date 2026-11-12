@@ -1,45 +1,62 @@
+    {% set p_bulk_size = bulk_size | default(500) %}
     {
       "name": "index-append-ids",
       "operation-type": "bulk",
-      "bulk-size": {{bulk_size | default(5000)}},
+      "param-source": "upsert-source",
+      "action": "index",
+      "revision": 0,
+      "bulk-size": {{p_bulk_size}},
       "ingest-percentage": {{ingest_percentage | default(100)}},
-      "conflicts": "sequential",
-      "conflict-probability": 0
+      "upsert-seed": {{upsert_seed | default(42)}}{% if corpus_file is defined %},
+      "corpus-file": {{corpus_file | tojson}}{% endif %}
     },
     {
       "name": "index-update-native",
       "operation-type": "bulk",
-      "bulk-size": {{bulk_size | default(5000)}},
+      "param-source": "upsert-source",
+      "action": "update",
+      "revision": 1,
+      "bulk-size": {{p_bulk_size}},
       "ingest-percentage": {{ingest_percentage | default(100)}},
-      "conflicts": "sequential",
-      "on-conflict": "update",
-      "conflict-probability": {{conflict_probability | default(100)}},
-      "recency": {{recency | default(0)}}
+      "upsert-seed": {{upsert_seed | default(42)}}{% if corpus_file is defined %},
+      "corpus-file": {{corpus_file | tojson}}{% endif %}
     },
     {
       "name": "upsert-insert",
       "operation-type": "bulk",
       "param-source": "upsert-source",
-      "bulk-size": {{upsert_bulk_size | default(500)}},
+      "action": "upsert",
+      "revision": 0,
+      "bulk-size": {{p_bulk_size}},
       "ingest-percentage": {{ingest_percentage | default(100)}},
-      "new-doc-ratio": 0
+      "new-doc-ratio": 0,
+      "upsert-seed": {{upsert_seed | default(42)}}{% if corpus_file is defined %},
+      "corpus-file": {{corpus_file | tojson}}{% endif %}
     },
     {
       "name": "upsert-update",
       "operation-type": "bulk",
       "param-source": "upsert-source",
-      "bulk-size": {{upsert_bulk_size | default(500)}},
+      "action": "upsert",
+      "revision": 1,
+      "bulk-size": {{p_bulk_size}},
       "ingest-percentage": {{ingest_percentage | default(100)}},
-      "new-doc-ratio": 0
+      "new-doc-ratio": 0,
+      "upsert-seed": {{upsert_seed | default(42)}}{% if corpus_file is defined %},
+      "corpus-file": {{corpus_file | tojson}}{% endif %}
     },
     {
       "name": "upsert-mixed",
       "operation-type": "bulk",
       "param-source": "upsert-source",
-      "bulk-size": {{upsert_bulk_size | default(500)}},
+      "action": "upsert",
+      "revision": 2,
+      "bulk-size": {{p_bulk_size}},
       "ingest-percentage": {{ingest_percentage | default(100)}},
       "new-doc-ratio": {{new_doc_ratio | default(25)}},
-      "new-id-offset": {{new_id_offset | default(1000000000)}}
+      "new-id-offset": {{new_id_offset | default(1000000000)}},
+      "upsert-seed": {{upsert_seed | default(42)}}{% if corpus_file is defined %},
+      "corpus-file": {{corpus_file | tojson}}{% endif %}
     },
     {
       "name": "index-stats",

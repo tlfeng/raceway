@@ -70,16 +70,17 @@ class TestVerdict(unittest.TestCase):
         rows = [row(phase='w', status='SKIP'), row(phase='q', status='SKIP')]
         self.assertEqual(H._verdict_of(rows), H.VERDICT_SKIP)
 
-    def test_degraded_is_covered_but_flagged(self):
+    def test_degraded_is_not_covered_but_flagged(self):
         rows = [row(phase='w', quality='degraded'), row(phase='q')]
         self.assertEqual(H._verdict_of(rows), H.VERDICT_DEGRADED)
         cov = H.build_coverage(rows)
-        self.assertTrue(cov.get('jdk25', 'ds-j1024', 1).covered_for('jdk25@3015'))
+        self.assertFalse(cov.get('jdk25', 'ds-j1024', 1).covered_for('jdk25@3015'))
 
-    def test_write_only_track_expects_single_phase(self):
-        """write-only 赛道只有一个相位也算完整。"""
+    def test_write_only_phase_is_incomplete(self):
+        """已存在的 write-only 只证明写段落档，不能证明本场不需要查询。"""
         rows = [row(phase='w', challenge='write-only')]
-        self.assertEqual(H._verdict_of(rows), H.VERDICT_VALID)
+        self.assertEqual(H._verdict_of(rows), H.VERDICT_HALF)
+        self.assertFalse(H.build_coverage(rows).get('jdk25', 'ds-j1024', 1).covered_for('jdk25@3015'))
 
     def test_full_challenge_single_row_is_complete(self):
         """单挑战（full）：一场一行 phase=wq 就是完整场次，不算半场。"""
@@ -111,9 +112,11 @@ class TestBuildIsolation(unittest.TestCase):
         self.assertFalse(self.cell.covered_for('jdk25@3009'))
         self.assertEqual(self.cell.verdict_for('jdk25@3009'), H.VERDICT_SKIP)
 
-    def test_overall_verdict_is_worst_across_builds(self):
-        """整格判定是跨 build 取最坏（仅用于展示）。"""
-        self.assertEqual(self.cell.verdict, H.VERDICT_SKIP)
+    def test_overall_verdict_shows_available_complete_measurement(self):
+        """整格展示至少一次完整测量，不允许其它 build 的 SKIP 抹掉成功。"""
+        self.assertEqual(self.cell.verdict, H.VERDICT_VALID)
+        self.assertFalse(self.cell.covered_for('jdk25@3009'))
+        self.assertTrue(self.cell.covered_for('jdk25@3015'))
 
     def test_per_build_breakdown(self):
         pb = self.cell.per_build()

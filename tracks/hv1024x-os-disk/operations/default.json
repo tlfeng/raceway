@@ -3,12 +3,14 @@
   "operation-type": "search",
   "param-source": "knn-param-source",
   "k": 10,
-  "num-candidates": 100
+  "ef-search": 100,
+  "oversample-factor": 2.0
 },
 {
   "name": "knn-search-100-1000",
   "operation-type": "search",
   "param-source": "knn-param-source",
   "k": 100,
-  "num-candidates": 1000
+  "ef-search": 1000,
+  "oversample-factor": 2.0
 }

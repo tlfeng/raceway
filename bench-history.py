@@ -19,12 +19,11 @@
 1. **build 隔离**：jdk25@3009 跑过 ≠ jdk25@3015 跑过。跨 build 混线会让结论被
    误读（make_dashboard 就是为此按 series_key 分线的）。覆盖判定必须带 build，
    否则"已跑过"会把不同引擎版本的数据当成同一格。
-2. **相位判定**：拆分协议一场次两行（phase=w / q，两个相位都 VALID 才算跑过，
-   只有写赛的是**半场**）；单挑战协议一场次一行（phase=wq）。两种协议的历史数据
-   混库时按各自 challenge 的期望相位集判定（_expected_phases）。
-   老 campaign 的 write-only 赛道只有一个相位，按 challenge 判定期望相位。
+2. **相位判定**：覆盖必须来自同 campaign、真实 fid/attempt 的一次完整测量；
+   不跨测量拼写赛/查赛。当前可排赛道均要求写+查，write-only 只说明写段存在，
+   不证明整场完整；单挑战 full 则同时证明写查两段。
 3. **只读**：不写 ES、不碰集群、不碰被测引擎。指标库没跑（压测窗口内这是常态）
-   时抛 HistoryUnavailable，由调用方降级 —— 不猜、不伪造、不拿空数据当"没跑过"。
+   时返回 available=False，由调用方降级 —— 不拿空数据当“没跑过”。
 
 凭据
 ----
@@ -48,6 +47,7 @@ from dataclasses import dataclass, field, asdict
 
 import importlib
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,7 +56,8 @@ try:
 except ImportError:                                                    # 从别处 import 本文件时
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     identity_mod = importlib.import_module('identity')
-car_of = identity_mod.car_of      # 文档里的车代号（user_tags.car）
+car_of = identity_mod.car_of      # car_code 与源头 car 标签共用身份规则
+runner_track_id = identity_mod.runner_track_id
 
 INDEX = 'benchmark-result-race'
 DEFAULT_ES_URL = 'https://127.0.0.1:9237'
@@ -64,18 +65,14 @@ DEFAULT_ES_URL = 'https://127.0.0.1:9237'
 # 一次读走的行数上限（不够就再翻页）
 PAGE_SIZE = 2000
 
-# benchmark-result-race 里要取的字段（只取覆盖判定用得到的，省带宽也省内存）
-# track_raw = 变体目录名 → **变体身份**（基座 geo 与 geo-codec-def 的实测
-#   codec 相同，靠 codec 分不出，只能靠目录名）
-# codec / source_reuse = 压缩与复用的两个独立维度
-# challenge 是**多值**（这次测量由哪些 challenge 段组成）→ 相位完整性靠它反推
-# trusted = 不可信标记；旧库的行仍能读：下面几个字段取不到时按旧名回落。
-_SOURCE_FIELDS = ['campaign', 'car_code', 'engine', 'engine_build',
+# 覆盖与测量身份所需字段。track_variant 是 runner 的真实赛道 id，不由 codec 猜。
+# fid/attempt 隔离尝试；合并 race 行的 race_id 是缺少源头 fid 时的独立测量键。
+_SOURCE_FIELDS = ['campaign', 'car_code', 'engine', 'version', 'engine_build',
                   'track', 'track_variant', 'track_raw', 'round',
-                  '@timestamp', 'dims', 'pkg', 'attempt',
-                  'challenge', 'codec', 'source_reuse',
-                  'series_key', 'jdk_vendor', 'jdk_version', 'trusted',
-                  'status', 'quality', 'phase', 'user_tags', 'fid']
+                  '@timestamp', 'dims', 'pkg', 'race_id', 'fid', 'attempt', 'source',
+                  'challenge', 'codec', 'source_reuse', 'knn_index_type',
+                  'series_key', 'comparison_key', 'jdk_vendor', 'jdk_version', 'trusted',
+                  'status', 'quality', 'phase', 'user_tags']
 
 
 def row_build_key(r):
@@ -85,7 +82,7 @@ def row_build_key(r):
     合成 —— 与旧的 car_build 字段等价。车代号取顶层 car_code，旧库的行仍从
     user_tags.car 取。
     """
-    car = r.get('car_code') or car_of(r)
+    car = car_of(r)
     b = r.get('engine_build')
     return ('%s@%s' % (car, b)) if (car and b) else (car or '')
 
@@ -94,11 +91,11 @@ FAIL_STATUSES = (
     'ENGINE-FAIL', 'JDK-SWAP-FAIL', 'JDK-FIX-FAIL', 'JDK-ASSERT-FAIL',
     'COLD-START-FAIL', 'CLUSTER-NOT-READY', 'HEAP-ASSERT-FAIL',
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
-    'SEG-ASSERT-FAIL', 'RACE-FAIL',
+    'SEG-ASSERT-FAIL', 'ENV-FAIL', 'RACE-FAIL',
 )
 SKIP_STATUSES = ('SKIP', 'DEADLINE-SKIP')
 
-# 判定严重度（越大越坏）；一场次取所有行里最坏的那个
+# 独立测量的判定；Cell 优先展示可用的完整测量，不跨测量拼接阶段。
 VERDICT_VALID = 'VALID'
 VERDICT_DEGRADED = 'DEGRADED'
 VERDICT_HALF = 'HALF'      # 只有一个相位跑完
@@ -231,34 +228,15 @@ def variant_of(track, codec, sr):
 
 
 def variant_id_of(row):
-    """一行 benchmark-result-race → 变体 id（覆盖判定的 key 维度）。
+    """覆盖键取真实 runner 赛道 id，不能从相同的实测 codec 猜基座/def 变体。
 
-    **旧契约行**（带 track_variant / track_raw）仍以它们为准 —— 基座与 def 变体的
-    实测 codec 相同（引擎默认 LZ4），靠 codec 反推分不出；**新契约行**（两者皆无）
-    才由 codec / source_reuse **派生**（variant_of）——codec 列有三层兜底
-    （sidecar 实测 → user_tags 声明 → 变体名规则，见 bench-export.codec_dims）；
-    基座场次 codec 为空 → 派生回基座名。
+    track_variant 是新契约的权威身份；无此列时仅保留明确的源头 track_raw/track。
+    geo 与入库展示名 geonames 在所有路径上统一回 runner 的 geo。
     """
-    v = row.get('track_variant') or ''
-    if v:
-        return v
-    raw = row.get('track_raw')
-    if raw is not None:
-        # 旧契约行：track_raw 是变体目录名的权威载体
-        return raw if '-codec-' in raw else (row.get('track') or raw)
-    # 新契约行：变体身份由**处理变量列**派生 —— 压缩（codec / source_reuse）
-    # 与向量量化（knn_index_type）两个维度。
-    track = row.get('track') or ''
-    q = QUANT_BY_INDEX_TYPE.get(row.get('knn_index_type') or '')
-    base = ('%s-%s' % (track, q)) if (q and track) else track
-    codec = row.get('codec')
-    if codec:
-        sr = row.get('source_reuse')
-        sr_s = {True: 'true', False: 'false'}.get(sr, sr if isinstance(sr, str) else None)
-        v = variant_of(base, codec, sr_s)
-        if v:
-            return v
-    return base or raw or ''
+    raw = row.get('track_variant') or row.get('track_raw')
+    if raw and raw != 'track':
+        return runner_track_id(canonical_id(raw))
+    return runner_track_id(canonical_id(row.get('track') or ''))
 
 
 def split_codec(codec, sr=None):
@@ -278,7 +256,8 @@ def split_codec(codec, sr=None):
 
 
 # ------------------------------------------------------------------ 查指标库
-def es_query(ssh, body, auth=None, es_url=DEFAULT_ES_URL, path=None, timeout=90):
+def es_query(ssh, body, auth=None, es_url=DEFAULT_ES_URL, path=None, timeout=90,
+             method='POST'):
     """查指标库，返回解析后的 JSON。
 
     ssh 模式：在服务器上 curl，口令经 stdin 的 curl 配置传入（不出现在 argv）。
@@ -288,12 +267,14 @@ def es_query(ssh, body, auth=None, es_url=DEFAULT_ES_URL, path=None, timeout=90)
     url = '%s/%s' % (es_url.rstrip('/'), path or (INDEX + '/_search'))
 
     if ssh:
-        cmd = ("curl -sk --config - -H 'Content-Type: application/json' -d %s %s"
-               % (shlex.quote(payload), shlex.quote(url)))
+        cmd = ("curl -fsSk --max-time %d --config - -X %s "
+               "-H 'Content-Type: application/json' -d %s %s"
+               % (int(timeout), shlex.quote(method), shlex.quote(payload), shlex.quote(url)))
         stdin = ''
         if auth:
-            # curl 配置里的双引号/反斜杠要转义，否则口令里的特殊字符会截断配置
-            safe = auth.replace('\\', '\\\\').replace('"', '\\"')
+            # curl 配置中的控制字符不能改变配置结构；机密只经 stdin 传递。
+            safe = (auth.replace('\\', '\\\\').replace('"', '\\"')
+                    .replace('\r', '\\r').replace('\n', '\\n').replace('\t', '\\t'))
             stdin = 'user = "%s"\n' % safe
         full = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15']
         full += ssh.split()
@@ -304,11 +285,11 @@ def es_query(ssh, body, auth=None, es_url=DEFAULT_ES_URL, path=None, timeout=90)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise HistoryUnavailable('ssh 查询指标库失败: %s' % e)
         if p.returncode != 0:
-            raise HistoryUnavailable('ssh 返回码 %d: %s'
-                                     % (p.returncode, (p.stderr or '').strip()[:200]))
+            raise HistoryUnavailable('ssh/curl 查询指标库返回码 %d'
+                                     % p.returncode)
         raw = p.stdout
     else:
-        req = urllib.request.Request(url, data=payload.encode('utf-8'),
+        req = urllib.request.Request(url, data=payload.encode('utf-8'), method=method,
                                      headers={'Content-Type': 'application/json'})
         if auth:
             tok = base64.b64encode(auth.encode('utf-8')).decode('ascii')
@@ -323,44 +304,103 @@ def es_query(ssh, body, auth=None, es_url=DEFAULT_ES_URL, path=None, timeout=90)
             raise HistoryUnavailable('连不上指标库 %s: %s' % (url, e))
 
     try:
-        return json.loads(raw)
-    except ValueError:
-        raise HistoryUnavailable('指标库返回非 JSON（服务没起？）: %s' % raw[:200])
+        resp = json.loads(raw)
+    except (ValueError, TypeError):
+        raise HistoryUnavailable('指标库返回非 JSON')
+    if method == 'DELETE':
+        if not isinstance(resp, dict) or resp.get('error') or resp.get('succeeded') is not True:
+            raise HistoryUnavailable('指标库 scroll 清理失败')
+    else:
+        _validate_response(resp)
+    return resp
+
+
+def _validate_response(resp):
+    """传输成功不等于查询成功：错误、超时及部分 shard 结果都不能当完整历史。"""
+    if not isinstance(resp, dict) or resp.get('error'):
+        raise HistoryUnavailable('指标库返回错误或无效响应结构')
+    status = resp.get('status')
+    if status is not None and (not isinstance(status, int) or status >= 400):
+        raise HistoryUnavailable('指标库返回 HTTP 错误状态')
+    if resp.get('timed_out') is not False:
+        raise HistoryUnavailable('指标库查询超时或缺少 timed_out 结果')
+    shards = resp.get('_shards')
+    if not isinstance(shards, dict):
+        raise HistoryUnavailable('指标库缺少 shard 完整性信息')
+    counts = [shards.get(k) for k in ('total', 'successful', 'failed')]
+    if any(type(x) is not int or x < 0 for x in counts):
+        raise HistoryUnavailable('指标库 shard 完整性信息无效')
+    total, successful, failed = counts
+    if failed or successful != total:
+        raise HistoryUnavailable('指标库只返回部分 shard 结果')
+
+
+def _search_page(resp):
+    _validate_response(resp)
+    hits = resp.get('hits')
+    if not isinstance(hits, dict) or not isinstance(hits.get('hits'), list):
+        raise HistoryUnavailable('指标库缺少 hits 结果')
+    total = hits.get('total')
+    if (not isinstance(total, dict) or total.get('relation') != 'eq'
+            or type(total.get('value')) is not int or total['value'] < 0):
+        raise HistoryUnavailable('指标库未返回精确 total（必须 track_total_hits=true）')
+    for hit in hits['hits']:
+        if (not isinstance(hit, dict) or not isinstance(hit.get('_source'), dict)
+                or not isinstance(hit.get('_id'), str) or not hit['_id']):
+            raise HistoryUnavailable('指标库命中文档缺少 _id/_source')
+        source = hit['_source']
+        if (any(not isinstance(source.get(k), str) or not source[k]
+                for k in ('car_code', 'track', 'track_variant', 'campaign', 'race_id'))
+                or type(source.get('round')) is not int or source['round'] < 1
+                or type(source.get('trusted')) is not bool
+                or not isinstance(source.get('challenge'), list)
+                or any(not isinstance(c, str) or not c for c in source['challenge'])):
+            raise HistoryUnavailable('指标库文档不符合身份/覆盖字段契约')
+    return hits['hits'], total['value']
 
 
 def fetch_rows(ssh=None, auth=None, es_url=DEFAULT_ES_URL, index=INDEX,
                timeout=90, max_rows=20000):
-    """读 benchmark-result-race 全部行（精简字段）。返回 (rows, total)。
-
-    行数超过单页就用 scroll 继续翻，翻不动就抛 HistoryUnavailable ——
-    宁可报错，也不能只拿到前半截就当成"全部历史"。
-    """
-    body = {'size': PAGE_SIZE, 'query': {'match_all': {}}, '_source': _SOURCE_FIELDS}
-    rows = []
-    resp = es_query(ssh, body, auth=auth, es_url=es_url,
-                    path='%s/_search' % index, timeout=timeout)
-    hits = (resp.get('hits') or {})
-    total = (hits.get('total') or {}).get('value', len(hits.get('hits') or []))
-    for h in hits.get('hits') or []:
-        rows.append(h.get('_source') or {})
-
-    scroll_id = resp.get('_scroll_id')
-    while len(rows) < total and scroll_id:
-        resp = es_query(ssh, {'scroll': '2m', 'scroll_id': scroll_id},
-                        auth=auth, es_url=es_url, path='_search/scroll', timeout=timeout)
-        hits = (resp.get('hits') or {})
-        got = hits.get('hits') or []
-        if not got:
-            break
-        for h in got:
-            rows.append(h.get('_source') or {})
-        scroll_id = resp.get('_scroll_id')
-
-    if len(rows) < total:
-        raise HistoryUnavailable('指标库只读到 %d/%d 行（翻页中断）' % (len(rows), total))
-    if len(rows) > max_rows:
-        raise HistoryUnavailable('指标库有 %d 行，超过上限 %d' % (len(rows), max_rows))
-    return rows, total
+    """用真实 scroll 完整读取；总数、分片、文档去重任一不符就降级，绝不截断。"""
+    body = {'size': PAGE_SIZE, 'query': {'match_all': {}}, '_source': _SOURCE_FIELDS,
+            'sort': ['_doc'], 'track_total_hits': True}
+    rows, seen = [], set()
+    scroll_id = None
+    try:
+        resp = es_query(ssh, body, auth=auth, es_url=es_url,
+                        path='%s/_search?scroll=2m' % index, timeout=timeout)
+        scroll_id = resp.get('_scroll_id') if isinstance(resp, dict) else None
+        got, total = _search_page(resp)
+        if total > max_rows:
+            raise HistoryUnavailable('指标库有 %d 行，超过上限 %d' % (total, max_rows))
+        while True:
+            if scroll_id is not None and (not isinstance(scroll_id, str) or not scroll_id):
+                raise HistoryUnavailable('指标库 scroll_id 无效')
+            for hit in got:
+                key = (hit.get('_index', index), hit['_id'])
+                if key in seen:
+                    raise HistoryUnavailable('指标库分页出现重复文档')
+                seen.add(key)
+                rows.append(hit['_source'])
+            if len(rows) > total:
+                raise HistoryUnavailable('指标库行数超过声明 total')
+            if len(rows) == total:
+                return rows, total
+            if not got or not scroll_id:
+                raise HistoryUnavailable('指标库只读到 %d/%d 行（翻页中断）' % (len(rows), total))
+            resp = es_query(ssh, {'scroll': '2m', 'scroll_id': scroll_id},
+                            auth=auth, es_url=es_url, path='_search/scroll', timeout=timeout)
+            got, page_total = _search_page(resp)
+            if page_total != total:
+                raise HistoryUnavailable('指标库分页 total 变化')
+            scroll_id = resp.get('_scroll_id') or scroll_id
+    finally:
+        if isinstance(scroll_id, str) and scroll_id:
+            try:
+                es_query(ssh, {'scroll_id': [scroll_id]}, auth=auth, es_url=es_url,
+                         path='_search/scroll', timeout=timeout, method='DELETE')
+            except HistoryUnavailable:
+                pass      # 清理失败不改变已核实的读取结果；scroll 自身有 2m TTL
 
 
 # ------------------------------------------------------------------ 覆盖模型
@@ -373,64 +413,88 @@ def _challenges_of(row):
 
 
 def _phases_of(row):
-    """这次测量**实际包含**哪些赛段（由 challenge 集合反推）。
-
-    v3 的 race 行不再有 phase 列 —— 一行就是一次测量，多段已合并，
-    包含哪些段由 challenge 集合说。
-    """
-    ph = set()
-    for c in _challenges_of(row):
-        if c == 'write-only':
-            ph.add('w')
-        elif c == 'query-only':
-            ph.add('q')
-        else:
-            ph.add('wq')
-    return ph
+    """已存在的阶段只证明对应阶段，不从 write-only 推断整场完整。"""
+    phases = set()
+    for challenge in _challenges_of(row):
+        if challenge in ('write-only', 'index-only'):
+            phases.add('w')
+        elif challenge == 'query-only':
+            phases.add('q')
+        elif challenge in ('full', 'nested-search-challenge', 'default'):
+            phases.update(('w', 'q'))
+    phase = row.get('phase')
+    if phase == 'wq':
+        phases.update(('w', 'q'))
+    elif phase in ('w', 'q'):
+        phases.add(phase)
+    return phases
 
 
 def _expected_phases(row):
-    """一场次该有哪些相位。write-only 赛道只有写赛。"""
-    chs = _challenges_of(row)
-    if not chs:
-        return {'w', 'q'}
-    if chs & {'full', 'nested-search-challenge', 'default'}:
-        return {'wq'}
-    if chs == {'write-only'}:
-        return {'w'}
+    """当前 runner 的可排赛道一律要求写查两段，与已落档的 challenge 无关。"""
     return {'w', 'q'}
 
 
-def _verdict_of(rows):
-    """把一场次（若干行）合并成一个判定。
+def _measurement_key(row, ordinal):
+    """只允许同 campaign 的真实 fid/attempt 配相位；缺身份的行不得互相补齐。"""
+    campaign = row.get('campaign') or ''
+    fid = row.get('fid') or ''
+    # 源头 sidecar 路径含真实 fid；不能从 car/track/round 重新合成尝试身份。
+    if not fid:
+        sources = row.get('source') or []
+        if isinstance(sources, str):
+            sources = [sources]
+        for source in sources:
+            if isinstance(source, str) and source.startswith('sidecar:'):
+                match = re.fullmatch(r'sidecar:(.+)-(?:wq|w|q)', source)
+                if match:
+                    fid = match.group(1)
+                    break
+    if campaign and fid:
+        match = re.search(r'-try(\d+)$', fid)
+        suffix_attempt = int(match.group(1)) if match else 1
+        try:
+            attempt = int(row.get('attempt') or suffix_attempt)
+        except (TypeError, ValueError):
+            return ('unidentified', ordinal)
+        if attempt < 1 or (match and attempt != suffix_attempt):
+            return ('unidentified', ordinal)
+        return (campaign, 'fid', re.sub(r'-try\d+$', '', fid), attempt)
+    if campaign and row.get('race_id'):
+        return (campaign, 'race_id', row['race_id'])
+    return ('unidentified', ordinal)
 
-    库里的行全都过了写入侧闸门（非 VALID / host-noise 的场次根本不写库），
-    所以 **status 已退役**，FAIL / SKIP / UNKNOWN 只在读旧库时还可能出现。
-    相位也不再是列 —— 一次测量合并成一行，包含哪些赛段由 challenge 集合说。
-    """
-    statuses = [(r.get('status') or '') for r in rows]
+
+def _measurement_verdict(rows):
+    statuses = [r.get('status') or '' for r in rows]
     if any(s in FAIL_STATUSES for s in statuses):
         return VERDICT_FAIL
     if any(s in SKIP_STATUSES for s in statuses):
         return VERDICT_SKIP
-    # v3 的行没有 status 列（过了写入侧闸门的测量都在库里）——
-    # 只有**读到过**状态值才据此判定，空值不算"读到了但不 VALID"。
-    seen_status = [s for s in statuses if s]
-    if seen_status and not any(s == 'VALID' for s in seen_status):
+    if any(s and s != 'VALID' for s in statuses):
         return VERDICT_UNKNOWN
-    phases = set()
-    expected = set()
-    for r in rows:
-        phases |= _phases_of(r)
-        if r.get('phase'):          # 旧库的行还有 phase 列
-            phases.add(r['phase'])
-        expected |= _expected_phases(r)
-    if expected and not expected.issubset(phases):
+    phases = set().union(*(_phases_of(r) for r in rows))
+    if not {'w', 'q'}.issubset(phases):
         return VERDICT_HALF
-    if any(r.get('trusted') is False or (r.get('quality') or '') == 'degraded'
-           for r in rows):
+    if any(r.get('trusted') is False or r.get('quality') == 'degraded' for r in rows):
         return VERDICT_DEGRADED
     return VERDICT_VALID
+
+
+def _verdict_of(rows):
+    """先逐测量判完整性，再聚合；任一完整可信测量即可覆盖，失败不抹掉成功。"""
+    groups = {}
+    for ordinal, row in enumerate(rows):
+        key = (row_build_key(row), row.get('series_key') or '',
+               _measurement_key(row, ordinal))
+        groups.setdefault(key, []).append(row)
+    verdicts = [_measurement_verdict(group) for group in groups.values()]
+    # 不同测量从不拼相位。显示最可用的一次，只有 VALID 才能自动剔除。
+    for verdict in (VERDICT_VALID, VERDICT_DEGRADED, VERDICT_HALF,
+                    VERDICT_FAIL, VERDICT_SKIP):
+        if verdict in verdicts:
+            return verdict
+    return VERDICT_UNKNOWN
 
 
 @dataclass
@@ -494,7 +558,7 @@ class Cell:
         return [r for r in self.rows if row_build_key(r) == car_build]
 
     def verdict_for(self, car_build):
-        """该 build 上的判定（最坏）。"""
+        """该 build 至少有一次独立完整测量的判定。"""
         rows = self.rows_for(car_build)
         if not rows:
             return VERDICT_UNKNOWN
@@ -502,17 +566,17 @@ class Cell:
 
     def covered_for(self, car_build):
         """该 build 上能不能算"已经跑过、结论可用"。"""
-        return self.verdict_for(car_build) in (VERDICT_VALID, VERDICT_DEGRADED)
+        return self.verdict_for(car_build) == VERDICT_VALID
 
     @property
     def verdict(self):
-        """整格的判定（跨 build 取最坏，仅用于展示，不代表覆盖判定）。"""
+        """整格最可用的一次独立测量（仅展示；自动剔除仍必须按 build）。"""
         return _verdict_of(self.rows)
 
     @property
     def covered(self):
         """整格是否至少有一个 build 跑成过。覆盖判定请用 covered_for()。"""
-        return self.verdict in (VERDICT_VALID, VERDICT_DEGRADED)
+        return self.verdict == VERDICT_VALID
 
     @property
     def campaigns(self):
@@ -520,7 +584,7 @@ class Cell:
 
     @property
     def phases(self):
-        return sorted({(r.get('phase') or '?') for r in self.rows})
+        return sorted(set().union(*(_phases_of(r) for r in self.rows)))
 
     @property
     def last_ts(self):
@@ -551,7 +615,7 @@ class Cell:
             out[b] = {
                 'verdict': _verdict_of(rows),
                 'runs': len(rows),
-                'phases': sorted({(r.get('phase') or '?') for r in rows}),
+                'phases': sorted(set().union(*(_phases_of(r) for r in rows))),
                 'campaigns': sorted({(r.get('campaign') or '') for r in rows}),
                 'quality': sorted({(r.get('quality') or '') for r in rows}),
             }
@@ -586,7 +650,7 @@ class Coverage:
     error: str = ''
 
     def get(self, car, track, rnd):
-        return self.cells.get((car, track, rnd))
+        return self.cells.get((car, runner_track_id(canonical_id(track)), rnd))
 
     def summary(self):
         by_verdict = {}
@@ -630,9 +694,8 @@ def build_coverage(rows, total=None):
             rnd = 0
         if not car or not track:
             continue
-        # 变体身份按 track_raw（目录名）判定；压缩/sr 是另外两个维度
+        # 变体身份来自 runner id；实测 codec 是另一维，不用于猜目录。
         vid = variant_id_of(r)
-        comp, sr = split_codec(r.get('codec'), r.get('source_reuse'))
         key = (car, vid, rnd)
         cell = cov.cells.get(key)
         if cell is None:
@@ -640,7 +703,7 @@ def build_coverage(rows, total=None):
             cov.cells[key] = cell
         cell.add(r)
         camps.add(r.get('campaign') or '')
-        tracks.add(track)
+        tracks.add(vid)
         cars.add(car)
     cov.campaigns = sorted(c for c in camps if c)
     cov.tracks = sorted(tracks)

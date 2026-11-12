@@ -194,7 +194,7 @@
     },
     {
       "name": "native-update",
-      "description": "Baseline using Rally's built-in update path for comparison: indexes all documents with Rally-generated sequential ids, then re-runs the bulk with on-conflict=update so every action becomes a plain partial-doc update (no doc_as_upsert involved).",
+      "description": "Baseline using the same natural geonameid corpus and bulk/client settings: indexes every document, then updates every existing id once without doc_as_upsert. Both hot paths rewrite revision 0 to 1 with detect_noop=false.",
       "schedule": [
         {
           "operation": {

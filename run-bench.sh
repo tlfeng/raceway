@@ -41,7 +41,10 @@
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
-source ./vm-bench-lib.sh
+source ./vm-bench-lib.sh || exit 1
+SOURCE_DIR=${RACEWAY_SOURCE_DIR:-$LIB_DIR}
+cd "$SOURCE_DIR" || exit 1
+ORIGINAL_ARGS=("$@")
 # 版本错配守卫：lib 与 runner 必须成对同步。缺 track_params 时分片口径会静默变空
 # → 索引落到赛道模板的默认分片数（geonames 模板默认 5），与其余赛道的 3 不一致，
 # 而且不会报错 —— 在这里挡住，别等到数字不可比才发现。
@@ -74,7 +77,7 @@ raceway · 压测编排入口（用法页）
 
 赛道（名字 → 赛道定义在哪）
   geo                    geonames 官方基座           tracks/geonames
-  hnsw                   96 维 200 万向量            机器本地（vm-bench.env TRACK_HNSW_BASE）
+  hnsw                   96 维 200 万向量            tracks/hnsw（语料 TRACK_HNSW_BASE）
   hv1024                 1024 维 100 万向量          tracks/hv1024
   nested                 nested 文档                 tracks/nested
   hv1024x                1024 维四臂 · hnsw 基座      tracks/hv1024x
@@ -99,6 +102,7 @@ raceway · 压测编排入口（用法页）
 前置条件（少一样都会在起跑前被拦下，并说清缺什么）
   1. cp vm-bench.env.example vm-bench.env 并填写 —— 缺它连 list 都跑不动
   2. ./doctor.sh —— 六组只读体检，✘ 的先修完再起跑
+     RALLY_PYTHON 必须指向 RALLY 使用的 Python 环境（wrapper 的 venv 不会回传）。
   3. 仓库改动同步到压测机时**要带上 tracks/**（赛道定义在 git 里，漏了就跑不起来）：
        scp -r *.sh *.py *.conf tracks/ kibana/ vm-bench.env <压测机>:/opt/raceway/
 EOF
@@ -126,10 +130,16 @@ suggest_track() { # <错的名字> → 猜一个 id（空 = 猜不出来）
   return 0
 }
 
-WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]（--help 看完整用法）}"
-[ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
+# 接受 --dry-run 的任意位置；预览与真实执行共用同一套参数校验。
+_pos=()
+for _arg in "$@"; do
+  if [ "$_arg" = --dry-run ]; then DRY=1; else _pos+=("$_arg"); fi
+done
+set -- "${_pos[@]}"
 WHAT="${1:?用法: $0 <$WHAT_ARGS> [rounds] [配置文件]（--help 看完整用法）}"
 ROUNDS="${2:-3}"
+[[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "rounds 必须是正整数"
+[ $# -le 3 ] || die "参数过多"
 DRY=${DRY:-0}
 
 # ---- 顶层环境旋钮（单配置模式；写了配置文件则以配置文件为准） --------------------
@@ -176,6 +186,7 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 SCHEDULE_FILE=${SCHEDULE_FILE:-}
 CARS_FILE=${CARS_FILE:-${ARMS_FILE:-}}   # 旧名 ARMS_FILE 仍认（兼容旧排程命令）
 DS_HOURS=${DS_HOURS:-0}
+[[ "$DS_HOURS" =~ ^[0-9]+$ ]] || die "DS_HOURS 必须是非负整数"
 CUR_RECALL=${RECALL:-0}     # 单跑模式是否打 recall 探针（RECALL=1）；排程模式由排程行的 recall 列决定
 
 # ---- 配置文件（第 3 参数或 CONF=）：每行一个配置，轮内右旋配对交错 --------------
@@ -184,7 +195,7 @@ CONF_FILE=${3:-${CONF:-}}
 CONFIGS=()
 if [ -n "$CONF_FILE" ]; then
   [ -s "$CONF_FILE" ] || die "配置文件不存在或为空: $CONF_FILE"
-  while IFS= read -r _ln; do
+  while IFS= read -r _ln || [ -n "$_ln" ]; do
     _ln=$(printf '%s' "$_ln" | sed 's/^[[:space:]]*#.*//; s/[[:space:]]*$//')
     [ -n "$_ln" ] || continue
     CONFIGS+=("$_ln")
@@ -255,6 +266,10 @@ EZ_DIR="$IBS_BASE/easysearch"
 ES_DIR="$IBS_BASE/elasticsearch"
 
 resolve_engine() { # 依据 ENGINE_NAME/VERSION/BUILD/JDK_DIR/CAR_LABEL/JDK_WANT 解析派生值并校验
+  safe_abs_path "${IBS_BASE:-/infini}" || die "IBS_BASE 必须是安全绝对路径"
+  case "$ENGINE_VERSION:$ENGINE_BUILD" in *[!A-Za-z0-9._:-]*) die "引擎版本/build 包含非法字符";; esac
+  [ -z "$JDK_DIR" ] || safe_abs_path "$JDK_DIR" || die "JDK_DIR 必须是安全绝对路径"
+  case "$JDK_WANT" in *[!A-Za-z0-9._+\|-]*) die "JDK_WANT 包含非法字符";; esac
   ENGINE_NAME=$(printf '%s' "$ENGINE_NAME" | tr 'A-Z' 'a-z')
   case "$ENGINE_NAME" in
     easysearch)
@@ -292,7 +307,10 @@ apply_config() { # <line> —— 应用一行配置（空行=单配置模式，�
   ENGINE_NAME=easysearch; ENGINE_VERSION=2.5.0; ENGINE_BUILD=""
   JDK_DIR=""; JDK_WANT=""; CAR_LABEL=""
   local tok k v
-  for tok in $line; do
+  local -a tokens
+  [[ "$line" != *$'\t'* && "$line" != *$'\n'* && "$line" != *$'\r'* ]] || die "配置行不能含制表符/换行"
+  read -r -a tokens <<< "$line"
+  for tok in "${tokens[@]}"; do
     k=${tok%%=*}; v=${tok#*=}
     [ "$k" != "$tok" ] || die "配置行格式错误（缺 =）: '$tok'"
     case "$k" in
@@ -351,7 +369,7 @@ order_for_round() { # <round> → 输出索引序列
 car_config() { # <车名>
   local want="$1" name line
   [ -f "${CARS_FILE:-}" ] || return 0
-  while read -r name line; do
+  while read -r name line || [ -n "${name:-}" ]; do
     [ -n "${name:-}" ] || continue
     case "$name" in '#'*) continue;; esac
     if [ "$name" = "$want" ]; then printf '%s' "$line"; return 0; fi
@@ -415,6 +433,49 @@ check_track_engine_compat() {
   return 0
 }
 
+# 预览与真实执行先生成同一份只读计划；配置完整展开，避免单配置哨兵被末次车污染。
+canonical_config() {
+  printf 'ENGINE_NAME=%s ENGINE_VERSION=%s ENGINE_BUILD=%s JDK_DIR=%s CAR_LABEL=%s JDK_WANT=%s' \
+    "$ENGINE_NAME" "$ENGINE_VERSION" "$ENGINE_BUILD" "$JDK_DIR" "$CAR_LABEL" "$JDK_WANT"
+}
+PLAN_FIDS=(); PLAN_CONFIGS=(); PLAN_TRACKS=(); PLAN_ROUNDS=(); PLAN_RECALL=(); PLAN_EST=()
+declare -A _plan_seen=()
+plan_add() { # <config> <track> <round> <recall> <est>
+  local cfg="$1" tk="$2" rnd="$3" recall="$4" est="$5" fid
+  [[ "$tk" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$rnd" =~ ^[1-9][0-9]*$ && "$est" =~ ^[0-9]+$ ]] || die "排程字段非法: $tk $rnd $est"
+  case "$recall" in recall|norecall) ;; *) die "recall 列必须为 recall/norecall";; esac
+  apply_config "$cfg"
+  track_dir "$tk" >/dev/null || die "未知赛道: $tk"
+  fid="$CAR_LABEL-$tk-r$rnd"
+  [ -z "${_plan_seen[$fid]:-}" ] || die "排程场次重复: $fid"
+  _plan_seen[$fid]=1
+  PLAN_FIDS+=("$fid"); PLAN_CONFIGS+=("$(canonical_config)"); PLAN_TRACKS+=("$tk")
+  PLAN_ROUNDS+=("$rnd"); PLAN_RECALL+=("$recall"); PLAN_EST+=("$est")
+}
+if [ -n "$SCHEDULE_FILE" ]; then
+  [ -s "$SCHEDULE_FILE" ] || die "排程不存在或为空: $SCHEDULE_FILE"
+  while read -r car tk rnd recall est extra; do
+    [ -n "$car" ] || continue
+    [ -z "${extra:-}" ] && [ -n "${est:-}" ] || die "排程须有五列: $car"
+    _cfg=$(car_config "$car")
+    [ -n "$_cfg" ] || die "排程里的车未在 $CARS_FILE 定义: $car"
+    plan_add "$_cfg" "$tk" "$rnd" "$recall" "$est"
+  done < <(schedule_lines)
+  [ "${#PLAN_FIDS[@]}" -gt 0 ] || die "排程没有有效场次"
+  check_track_engine_compat
+else
+  for i in "${!CONFIGS[@]}"; do
+    apply_config "${CONFIGS[$i]}"
+    CONFIGS[$i]=$(canonical_config)
+  done
+  for tk in "${TRACKS[@]}"; do
+    for r in $(seq 1 "$ROUNDS"); do
+      for idx in $(order_for_round "$r"); do
+        plan_add "${CONFIGS[$idx]}" "$tk" "$r" "$([ "$CUR_RECALL" = 1 ] && echo recall || echo norecall)" 0
+      done
+    done
+  done
+fi
 
 if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   echo "== DRY RUN 排程（不执行任何操作） =="
@@ -459,26 +520,44 @@ if [ "$DRY" = 1 ] || [ "${WHAT:-}" = "--dry-run" ]; then
   exit 0
 fi
 
-# campaign 名前缀默认 jdk3，可用 CAMP_PREFIX 覆盖（车名进 campaign 维度，
-# 否则按批次过滤时看板上会认错车）。
-# CAMP_ID 显式指定 = 复用同一 campaign 目录 → STATE.txt 断点续跑（排程模式用）
+# campaign 实例互斥：flock 原子获取，PID/pgrep 仅作身份展示，不承担互斥。
 CAMP_ID="${CAMP_ID:-${CAMP_PREFIX:-jdk3}-$(date +%Y%m%d-%H%M%S)}"
+[[ "$CAMP_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "CAMP_ID 非法"
+mkdir -p "$RESULTS_ROOT" || die "不能创建结果目录"
+RESULTS_ROOT=$(cd "$RESULTS_ROOT" && pwd -P) || die "不能解析结果目录"
+LOCK_FILE="$RESULTS_ROOT/.runner.lock"
+if [ "${RACEWAY_SNAPSHOT_ROOT:-}" != "$LIB_DIR" ]; then
+  exec 9> "$LOCK_FILE" || die "不能打开 runner 锁"
+  flock -n 9 || die "已有 runner 持有实例锁: $LOCK_FILE"
+  CAMP_DIR="$RESULTS_ROOT/$CAMP_ID"
+  mkdir -p "$CAMP_DIR/runtime" || die "不能创建 campaign"
+  _snapshot=$(mktemp -d "$CAMP_DIR/runtime/run-XXXXXXXX") || die "不能创建运行快照"
+  for _f in run-bench.sh vm-bench-lib.sh precheck.sh load-monitor.sh reset-env.sh "$SOURCE_DIR"/*.py; do
+    _f=${_f##*/}
+    cp "$SOURCE_DIR/$_f" "$_snapshot/$_f" || die "运行快照缺 $_f"
+    chmod a-w "$_snapshot/$_f" || die "快照只读设置失败"
+  done
+  export CAMP_ID RESULTS_ROOT RACEWAY_SOURCE_DIR="$SOURCE_DIR" RACEWAY_ENV_FILE="$ENV_FILE" RACEWAY_SNAPSHOT_ROOT="$_snapshot"
+  exec bash "$_snapshot/run-bench.sh" "${ORIGINAL_ARGS[@]}"
+  die "进入快照失败"
+fi
+[ "$(readlink /proc/$$/fd/9)" = "$LOCK_FILE" ] && flock -n 9 || die "快照未继承实例锁"
 CAMP_DIR="$RESULTS_ROOT/$CAMP_ID"
-mkdir -p "$CAMP_DIR/results" "$CAMP_DIR/logs"
+mkdir -p "$CAMP_DIR/results" "$CAMP_DIR/logs" || die "不能创建产物目录"
 PROG="$CAMP_DIR/PROGRESS.txt"; RACES="$CAMP_DIR/RACES.md"
 STATE="$CAMP_DIR/STATE.txt"
 PROGSTEP() { echo "[$(date '+%F %T')] $*" | tee -a "$PROG"; }
 
-# 中止收尾：进度台判"已结束"只认 PROGRESS.txt 的 "campaign 结束: N/M 场有效" 行。
-# EXIT trap 在没写过自然结束行时补一条（N/M 取当前计数，不编数）—— 否则被
-# TERM/INT/HUP 或 die 掉的 campaign 永远显示"运行中"。
-# KILL -9 拦不住，那条路由 stop-campaign.sh → close-campaign.sh 兜底。
-# RUNNER.pid 给 close-campaign.sh 判活；退出即删，免得 pid 复用误判。
-echo $$ > "$CAMP_DIR/RUNNER.pid"
-CAMPAIGN_CLOSED=0; ABORT_REASON=''
+# PID 文件保持纯 PID；meta 的四列为 pid/start_ticks/boot_id/快照脚本绝对路径。
+printf '%s\n' "$$" > "$CAMP_DIR/RUNNER.pid.tmp" && mv "$CAMP_DIR/RUNNER.pid.tmp" "$CAMP_DIR/RUNNER.pid" || die "PID 写入失败"
+printf '%s\t%s\t%s\t%s\n' "$$" "$(proc_start $$)" "$(cat /proc/sys/kernel/random/boot_id)" "$LIB_DIR/run-bench.sh" > "$CAMP_DIR/RUNNER.meta.tmp" &&
+  mv "$CAMP_DIR/RUNNER.meta.tmp" "$CAMP_DIR/RUNNER.meta" || die "runner 身份写入失败"
+printf '%s\n' "$LIB_DIR" > "$CAMP_DIR/SCRIPT_SNAPSHOT"
+CAMPAIGN_CLOSED=0; ABORT_REASON=''; ACTIVE_MONITOR=''; MONITOR_OK=1
 _close_on_exit() {
   local rc=$?
-  rm -f "$CAMP_DIR/RUNNER.pid"
+  if [ -n "$ACTIVE_MONITOR" ]; then monitor_stop "$ACTIVE_MONITOR" || true; fi
+  rm -f "$CAMP_DIR/RUNNER.pid" "$CAMP_DIR/RUNNER.meta"
   [ "$CAMPAIGN_CLOSED" = 1 ] && return 0
   [ -f "$PROG" ] || return 0
   echo "[$(date '+%F %T')] campaign 结束: ${okcnt:-0}/${total:-0} 场有效（中止: ${ABORT_REASON:-退出码 $rc}；续跑 CAMP_ID=${CAMP_ID}）" >> "$PROG"
@@ -493,7 +572,7 @@ EZ_DIR="$IBS_BASE/easysearch"
 ES_DIR="$IBS_BASE/elasticsearch"
 OS_DIR="$IBS_BASE/opensearch"
 
-eng_dir_of()   { case "$1" in elasticsearch) echo "$ES_DIR";; easysearch) echo "$EZ_DIR";; opensearch) echo "$OS_DIR";; *) return 1;; esac; }
+eng_dir_of()   { engine_root "$1"; }
 svc2_of()      { case "$1" in elasticsearch) echo elasticsearch;; easysearch) echo easysearch;; opensearch) echo opensearch;; *) return 1;; esac; }
 ip_node_names_of(){ case "$1" in elasticsearch) echo "${VM_NODES_ES[@]}";; opensearch) echo "${VM_NODES_OS[@]}";; *) echo "${VM_NODES_EZ[@]}";; esac; }
 
@@ -540,7 +619,7 @@ ibs_deploy_engine() { # <engine>
   esac
   PROGSTEP "  ibs 部署 $eng ($FULL_VER) 开始（约 5-8 分钟，节点 $NODE_RANGE）..."
   ( cd "$IBS_ROOT" && python3 -m ops.deploy $tflag $vflag -n "$NODE_RANGE" --yes ) \
-    > "$CAMP_DIR/logs/ibs-deploy-$eng.log" 2>&1
+    > "$CAMP_DIR/logs/ibs-deploy-$eng.log" 2>&1 9>&-
   rc=$?
   if [ $rc -eq 0 ]; then
     ibs_sync_ip "$eng"
@@ -555,7 +634,7 @@ ibs_wipe2() { # <engine> —— 冷重启（停服→清 data/logs→重启→ES
   local eng="$1" rc
   PROGSTEP "  ibs wipe $(svc2_of "$eng")（$NNODES 节点并行）..."
   ( cd "$IBS_ROOT" && python3 -m ops.clean wipe "$(svc2_of "$eng")" --yes ) \
-    > "$CAMP_DIR/logs/ibs-wipe-$eng.log" 2>&1
+    > "$CAMP_DIR/logs/ibs-wipe-$eng.log" 2>&1 9>&-
   rc=$?
   if [ $rc -eq 0 ]; then PROGSTEP "  ibs wipe 完成"
   else PROGSTEP "  ibs wipe FAILED rc=$rc（见 logs/ibs-wipe-$eng.log）"; fi
@@ -568,7 +647,7 @@ ibs_ready_wait() { # <engine> <timeout_sec> <logfile>
   local deadline=$((SECONDS + tmo))
   : > "$logf"
   while [ $SECONDS -lt $deadline ]; do
-    if ( cd "$IBS_ROOT" && python3 -m ops.status gate "$(svc2_of "$eng")" --json ) >> "$logf" 2>&1; then
+    if ( cd "$IBS_ROOT" && python3 -m ops.status gate "$(svc2_of "$eng")" --json ) >> "$logf" 2>&1 9>&-; then
       return 0
     fi
     sleep 10
@@ -583,15 +662,11 @@ ibs_ready_wait() { # <engine> <timeout_sec> <logfile>
 #   bbqdisk 赛道（每场 ~35G）会把磁盘压到卡点（<20G）以下 → 本场直接 SKIP，
 #   重试也救不回来（残留还在）。20261112 当天因此连挂多场。
 purge_stale_index_data() {
-  local ip out
-  for ip in "${VM_IPS[@]}"; do
-    out=$(vm "$ip" 'for d in /infini/easysearch /infini/elasticsearch; do
-            [ -d "$d/data" ] || continue
-            sz=$(du -sg "$d/data" 2>/dev/null | cut -f1)
-            rm -rf "$d/data" && mkdir -p "$d/data" && chown $(stat -c "%U" "$d"):$(stat -c "%U" "$d") "$d/data"
-            echo "$(basename $d)=${sz}G"
-          done' 2>/dev/null)
-    [ -n "$out" ] && PROGSTEP "  清理上一场残留索引数据 ${ip}: $out"
+  local ip eng
+  for eng in "${ENGINES[@]}"; do
+    for ip in "${VM_IPS[@]}"; do
+      wipe_engine_data_on_vm "$ip" "$eng" || return 1
+    done
   done
 }
 
@@ -615,7 +690,7 @@ ensure_engine() { # <engine>
   # uninstall/集群卡点按 ip.txt 主机名前缀解析角色节点，切换引擎时先对齐到目标，否则报"没有角色节点"
   ibs_sync_ip "$eng"
   ( cd "$IBS_ROOT" && python3 -m ops.clean uninstall "$svc" --yes ) \
-    > "$CAMP_DIR/logs/ibs-uninstall-$eng.log" 2>&1
+    > "$CAMP_DIR/logs/ibs-uninstall-$eng.log" 2>&1 9>&-
   ibs_deploy_engine "$eng"
 }
 
@@ -709,17 +784,18 @@ cpu_affinity_assert() { # <engine>
 }
 
 # ---------- track -------------------------------------------------------------
-prepare_hnsw_s3() {
+prepare_hnsw() {
+  # hnsw 定义已定版 tracks/hnsw/（20261112 回灌，分片 params 化默认 3）；
+  # 这里只补 git 收不了的产物：语料/查询集软链（TRACK_HNSW_BASE 指向二者所在目录）。
   # ⚠️ .offset 断点文件绝不带入（rally 会从旧断点续传，write 计量失真）
-  [ -d "$TRACK_HNSW_S3" ] && rm -f "$TRACK_HNSW_S3/documents-2m.json.offset"
-  [ -f "$TRACK_HNSW_BASE/track.json" ] || die "hnsw 基准 track 不存在: $TRACK_HNSW_BASE"
-  mkdir -p "$TRACK_HNSW_S3"
-  (cd "$TRACK_HNSW_BASE" && tar cf - --exclude='documents-2m.json*' .) | tar xf - --strip-components=1 -C "$TRACK_HNSW_S3"
-  ln -sf "$TRACK_HNSW_BASE/documents-2m.json" "$TRACK_HNSW_S3/documents-2m.json"
-  rm -f "$TRACK_HNSW_S3/documents-2m.json.offset"
-  sed -i 's/"number_of_shards": *2/"number_of_shards": 3/' "$TRACK_HNSW_S3/index.json"
-  grep -q '"number_of_shards": 3' "$TRACK_HNSW_S3/index.json" || die "hnsw 3 分片改写失败"
-  log "hnsw 3 分片变体已生成: $TRACK_HNSW_S3"
+  local d; d=$(track_dir hnsw)
+  [ -f "$d/track.json" ] || die "hnsw 赛道定义不在位: $d（仓库同步得带 tracks/）"
+  [ -f "$TRACK_HNSW_BASE/documents-2m.json" ] || die "hnsw 语料不存在: $TRACK_HNSW_BASE/documents-2m.json（查 vm-bench.env TRACK_HNSW_BASE）"
+  [ -f "$TRACK_HNSW_BASE/queries.json" ] || die "hnsw 查询集不存在: $TRACK_HNSW_BASE/queries.json（查 vm-bench.env TRACK_HNSW_BASE）"
+  ln -sf "$TRACK_HNSW_BASE/documents-2m.json" "$d/documents-2m.json"
+  ln -sf "$TRACK_HNSW_BASE/queries.json" "$d/queries.json"
+  rm -f "$d/documents-2m.json.offset"
+  log "hnsw 语料/查询集已就位: $d（软链自 $TRACK_HNSW_BASE）"
 }
 
 # ---------- 赛道准备（定义定版在 tracks/，这里只补 git 收不了的产物）----------
@@ -766,17 +842,30 @@ prepare_track_corpus() { # <赛道目录>
 # ⚠️ 已有 queries.json 就**直接复用**（不重生成）：truth.jsonl / queries-recall.jsonl
 # 这两份 recall 真值是按同一批查询算的 → 换一份 queries 就对不上，recall 数字作废。
 prepare_queries() { # <赛道目录>
-  local d="$1" q="$d/queries.json" n=2000
+  local d="$1" n=2000
+  local q="$d/queries.json"
   grep -q 'queries.json' "$d/track.py" 2>/dev/null || return 0
   if [ ! -s "$q" ]; then
     [ -n "${HV_QUERIES_BZ2:-}" ] && [ -f "${HV_QUERIES_BZ2}" ] \
       || die "$(basename "$d"): 缺 queries.json，且未设 HV_QUERIES_BZ2=官方 queries.json.bz2 路径"
-    bzcat "$HV_QUERIES_BZ2" | head -n "$n" > "$q.tmp" && mv "$q.tmp" "$q" \
-      || { rm -f "$q.tmp"; die "$(basename "$d"): 查询集生成失败"; }
+    python3 - "$HV_QUERIES_BZ2" "$q" "$n" <<'PY' || die "$(basename "$d"): 查询集生成失败"
+import bz2, itertools, os, sys
+src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with bz2.open(src, 'rt', encoding='utf-8') as f, open(dst + '.tmp', 'w', encoding='utf-8') as out:
+    rows = list(itertools.islice(f, n))
+    if len(rows) != n:
+        raise ValueError('查询数量不足')
+    out.writelines(rows)
+os.replace(dst + '.tmp', dst)
+PY
     log "  查询集已生成（$n 条）: $q"
   fi
   local qd; qd=$(python3 -c "import json;print(len(json.loads(open('$q').readline())))" 2>/dev/null || echo 0)
-  [ "$qd" = "1024" ] || die "$(basename "$d"): 查询向量维度 $qd ≠ 1024"
+  # 维度断言只对 hv1024 系（查询集是本仓库生成器按 1024 维口径产的）；
+  # hnsw 的 queries.json 是随语料自带的 96 维查询集（prepare_hnsw 已保证在位），不适用这个断言。
+  case "$(basename "$d")" in
+    hv1024*) [ "$qd" = "1024" ] || die "$(basename "$d"): 查询向量维度 $qd ≠ 1024";;
+  esac
 }
 
 prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处理
@@ -801,8 +890,9 @@ prepare_tracks() { # 本场用到的赛道：物化语料/查询集 + 断点处�
 }
 
 # ds-*（维度扫描）赛道：语料软链修链 + 维度/条数/字节/查询维数自检。
-# ds-* 的定义还没进 git（语料与真值在 $ROOT/corpora-ds/），软链断了就按同名在
-# corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，记录落进 campaign 台账。
+# ds-* 定义已定版进 git（20261112 回灌）；语料与真值在 $ROOT/corpora-ds/，不进 git，
+# 软链断了就按同名在 corpora-ds 里找回来。语料自检是"这批数据的语料可信"的唯一凭据，
+# 记录落进 campaign 台账。
 prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道直接跳过）
   local CORPORA_DS="${CORPORA_DS:-$ROOT/corpora-ds}"
   local tk d dims f base cand want_n want_b srcf corpus real_b qdims got
@@ -853,7 +943,7 @@ prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道�
   # ④ esrally info 自检（挑战名/操作名能解析）
   for tk in "$@"; do
     case "$tk" in ds-*) ;; *) continue;; esac
-    local out; out=$("$RALLY" info --track-path="$ROOT/tracks/$tk" 2>&1) || {
+    local out; out=$("$RALLY" info --track-path="$ROOT/tracks/$tk" 2>&1 9>&-) || {
       echo "$out" | tail -15
       die "$tk: esrally info 失败"
     }
@@ -879,33 +969,55 @@ track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
  esac; }
 track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geonames-upsert) echo "${TIMEOUT_UPSERT_Q:-$TIMEOUT_GEO_Q}";; geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024|hv1024x*) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
 
-monitor_start() { # <fid> <eng> —— 被动周期采样（5s，只记录，不做卡点、不触发重试）
+monitor_start() { # <fid-phase> <eng>，任一节点未启动则整场 ENV 不可信
   local fid="$1" eng="$2" ip dir
-  dir=$(eng_dir_of "$eng")
+  dir=$(eng_dir_of "$eng") || return 1
+  safe_abs_path "$MON_DIR" || return 1
+  ACTIVE_MONITOR="$fid"; MONITOR_OK=1
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "mkdir -p $MON_DIR && ENGINE_MARK='$dir' $MON_DIR/load-monitor.sh start $fid" >/dev/null 2>&1 \
-      || log "  警告: $ip 监控启动失败（不影响 race）"
+    vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") ENGINE_MARK=$(shell_quote "$dir") '$MON_DIR/load-monitor.sh' start $(shell_quote "$fid")" >/dev/null 2>&1 \
+      || { log "  $ip 监控启动失败"; MONITOR_OK=0; }
   done
+  [ "$MONITOR_OK" = 1 ]
 }
 
-monitor_stop() { # <fid> —— 收 CSV + summary，落 monitors/（分相位时间序列，供 ingest 与占用分析）
-  local fid="$1" ip k mondir="$CAMP_DIR/monitors"
-  mkdir -p "$mondir"
+monitor_stop() { # <fid-phase> —— 每节点保留身份与 NO-DATA，绝不将缺失当干净
+  local fid="$1" ip k f csv summary ok=1 mondir="$CAMP_DIR/monitors"
+  mkdir -p "$mondir" || return 1
   for k in "${!VM_IPS[@]}"; do
-    ip="${VM_IPS[$k]}"
-    vm "$ip" "$MON_DIR/load-monitor.sh stop $fid" >/dev/null 2>&1
-    vm "$ip" "cat $MON_DIR/mon-$fid.csv" > "$mondir/$fid-${VM_NAMES[$k]}.csv" 2>/dev/null
-    { echo "node=${VM_NAMES[$k]} ip=$ip"
-      vm "$ip" "VERDICT_STEAL_MAX='$VERDICT_STEAL_MAX' VERDICT_FOREIGN_MAX='$VERDICT_FOREIGN_MAX' $MON_DIR/load-monitor.sh summary $MON_DIR/mon-$fid.csv" 2>/dev/null; } \
-      > "$mondir/$fid-${VM_NAMES[$k]}-summary.txt" 2>/dev/null
-    vm "$ip" "rm -f $MON_DIR/mon-$fid.csv" >/dev/null 2>&1
+    ip="${VM_IPS[$k]}"; f="$mondir/$fid-${VM_NAMES[$k]}"
+    if ! vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") '$MON_DIR/load-monitor.sh' stop $(shell_quote "$fid")" >/dev/null 2>&1; then ok=0; fi
+    if ! vm "$ip" "cat '$MON_DIR/mon-$fid.csv'" > "$f.csv.tmp" 2>/dev/null; then ok=0; fi
+    mv "$f.csv.tmp" "$f.csv" || ok=0
+    summary=$(vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") VERDICT_STEAL_MAX=$(shell_quote "$VERDICT_STEAL_MAX") VERDICT_FOREIGN_MAX=$(shell_quote "$VERDICT_FOREIGN_MAX") '$MON_DIR/load-monitor.sh' summary '$MON_DIR/mon-$fid.csv'" 2>/dev/null) || { ok=0; summary='ENV-VERDICT: NO-DATA'; }
+    { printf 'node=%s ip=%s phase=%s\n' "${VM_NAMES[$k]}" "$ip" "${fid##*-}"; printf '%s\n' "$summary"; } > "$f-summary.txt.tmp" &&
+      mv "$f-summary.txt.tmp" "$f-summary.txt" || ok=0
+    vm "$ip" "rm -f '$MON_DIR/mon-$fid.csv'" >/dev/null 2>&1 || ok=0
   done
-  # PROGRESS 里的监控摘要：只报三节点最坏的 steal_max（逐节点明细在
-  # monitors/*-summary.txt）
-  local worst
-  worst=$(grep -ho 'steal_max=[0-9.]*' "$mondir/$fid"-*-summary.txt 2>/dev/null \
-          | cut -d= -f2 | sort -g | tail -1)
-  PROGSTEP "  监控摘要 $fid: steal_max=${worst:-无数据}%(三节点最坏)"
+  ACTIVE_MONITOR=''
+  [ "$ok" = 1 ] || MONITOR_OK=0
+  [ "$MONITOR_OK" = 1 ]
+}
+env_verdict_ok() { # <fid-phase> —— 节点数/身份/正样本数/OK 四项全部满足
+  python3 - "$CAMP_DIR/monitors" "$1" "${VM_NAMES[@]}" <<'PY'
+import pathlib, re, sys
+root, fid, *nodes = sys.argv[1:]
+if not nodes or len(set(nodes)) != len(nodes):
+    sys.exit(1)
+for node in nodes:
+    p = pathlib.Path(root) / (fid + '-' + node + '-summary.txt')
+    try:
+        text = p.read_text(encoding='utf-8')
+    except OSError:
+        sys.exit(1)
+    verdicts = re.findall(r'^ENV-VERDICT: (\S+)', text, re.M)
+    samples = re.findall(r'\bsamples=([0-9]+)\b', text)
+    if verdicts != ['OK'] or len(samples) != 1 or int(samples[0]) <= 0:
+        sys.exit(1)
+    if not text.startswith('node=' + node + ' '):
+        sys.exit(1)
+sys.exit(0)
+PY
 }
 
 env_summary_csv() { # campaign 收尾：把各场 summary 拍平成一张 CSV（benchmark-result-env/benchmark-result-metric 可直接吃）
@@ -926,7 +1038,9 @@ for p in sorted(glob.glob(os.path.join(d, "*-summary.txt"))):
     else:
         fid, _, node = fid_node.partition("-")
     ph = ""                                   # 相位后缀 -w/-m/-q（历史 campaign 无后缀）
-    if fid[-2:] in ("-w", "-m", "-q"):
+    if fid.endswith('-wq'):
+        ph, fid = 'wq', fid[:-3]
+    elif fid[-2:] in ("-w", "-m", "-q"):
         ph, fid = fid[-1], fid[:-2]
     kv = dict(re.findall(r"(\w+)=(\S+)", txt))
     kv.update(re.findall(r"(\w+)=([0-9.]+%?)", txt))
@@ -946,6 +1060,48 @@ PY
 }
 
 # ---------- 单场压测 ----------------------------------------------------------
+expected_tasks() { # <track dir> <params> <output>；用 Rally 自身的只读模板渲染，不下载、不连集群
+  "${RALLY_PYTHON:-python3}" - "$1" "$2" "$3" <<'PY' 9>&-
+import json, pathlib, sys
+from esrally.track.loader import render_template_from_file
+from esrally.utils.opts import to_dict
+root, params, output = sys.argv[1:]
+spec = json.loads(render_template_from_file(str(pathlib.Path(root) / 'track.json'), to_dict(params) if params else {}))
+operations = {o['name']: o for o in spec.get('operations', []) if isinstance(o, dict) and 'name' in o}
+challenges = spec.get('challenges') or [spec.get('challenge')]
+full = next(c for c in challenges if c and c.get('name') == 'full')
+expected = {'write': [], 'query': [], 'terminal': []}
+flat = []
+def visit(tasks):
+    for task in tasks:
+        if 'parallel' in task:
+            visit(task['parallel']['tasks'])
+            continue
+        raw = task['operation']
+        op = operations.get(raw, {'operation-type': raw}) if isinstance(raw, str) else raw
+        if not isinstance(op, dict) or not isinstance(op.get('operation-type'), str):
+            raise ValueError('任务 operation 定义非法')
+        kind = op.get('operation-type')
+        name = task.get('name') or (raw if isinstance(raw, str) else op.get('name') or kind)
+        flat.append((name, kind))
+        group = 'write' if kind == 'bulk' else 'query' if kind == 'search' else None
+        if group:
+            expected[group].append(name)
+visit(full['schedule'])
+if not expected['query'] and pathlib.Path(root).name == 'geonames-upsert':
+    # upsert 协议没有 search：只允许其显式 final-stats 末任务作为生命周期完成证据。
+    if not flat or flat[-1] != ('final-stats', 'index-stats'):
+        raise ValueError('upsert 缺 final-stats 结束任务')
+    expected['terminal'] = ['final-stats']
+if not expected['write'] or not (expected['query'] or expected['terminal']):
+    raise ValueError('full 必须声明写任务及查询任务（upsert 为 final-stats）')
+if len(set(expected['write'] + expected['query'])) != len(expected['write'] + expected['query']):
+    raise ValueError('任务名重复')
+path = pathlib.Path(output)
+with path.open('x', encoding='utf-8') as f:
+    json.dump(expected, f, ensure_ascii=False, allow_nan=False)
+PY
+}
 capture_race_json() { # <fid> <w|q> <rally 日志> —— 按日志里的 race id 精确落档 race.json
   # md 报告只是展示行；race.json 是 rally race store 的机读全量：op_metrics 每项含
   # throughput{min/mean/median/max} + latency/service_time 全分位 + error_rate + duration，
@@ -954,9 +1110,10 @@ capture_race_json() { # <fid> <w|q> <rally 日志> —— 按日志里的 race i
   local rid src
   rid=$(grep -oE 'Race id is \[[0-9a-fA-F-]+\]' "$3" 2>/dev/null | head -1 | grep -oE '[0-9a-fA-F-]{8,}')
   src="$HOME/.rally/benchmarks/races/$rid/race.json"
+  [ -n "$rid" ] && [ ! -e "$CAMP_DIR/results/$1-$2-race.json" ] || { PROGSTEP "拒绝覆盖或无 race id: $1-$2"; return 1; }
   if [ -n "$rid" ] && [ -s "$src" ]; then
     LAST_RACE_ID="$rid"
-    cp "$src" "$CAMP_DIR/results/$1-$2-race.json"
+    cp "$src" "$CAMP_DIR/results/$1-$2-race.json" || return 1
     PROGSTEP "  race.json 落档 $1-$2（raceId $rid）"
   else
     PROGSTEP "  race.json 未落档 $1-$2（raceId=${rid:-日志未解析}）"
@@ -968,6 +1125,7 @@ env_fingerprint_raw() { # campaign 起跑一次 —— 静态环境指纹落 raw
   { echo "hostname=$(hostname)"; echo "kernel=$(uname -r)"; echo "nproc=$(nproc)"
     echo "cpu_model=$(lscpu | awk -F: '/^Model name/{gsub(/^ +/,"",$2);print $2;exit}')"
     echo "mem_gb=$(free -g | awk '/^Mem:/{print $2}')"; } > "$FP_DIR/host.txt" 2>&1
+  : > "$FP_DIR/virsh.txt"
   local i ip nm vc mb pin
   for i in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$i]}"; nm="${VM_NAMES[$i]}"
@@ -1000,28 +1158,38 @@ race_metric_ok() { # <fid> <w|q> —— 断言 race.json 真有非 null 的吞�
     log "  警告: race.json 未落档 $1-$2，指标断言按失败计"
     return 1
   fi
-  python3 - "$f" "$2" <<'PY' || return 1
-import json, sys
-d = json.load(open(sys.argv[1], encoding="utf-8"))
+  python3 - "$f" "$2" "$CAMP_DIR/results/$1-expected-tasks.json" <<'PY' || return 1
+import json, math, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    d = json.load(f)
+with open(sys.argv[3], encoding='utf-8') as f:
+    expected = json.load(f)
 phase = sys.argv[2]
-om = (d.get("results") or {}).get("op_metrics") or []
-if not om:
-    sys.exit(1)
-def has_median(m):
-    return (m.get("throughput") or {}).get("median") is not None
-if phase == "w":
-    bulk = [m for m in om if "docs/s" in ((m.get("throughput") or {}).get("unit") or "")] or om
-    sys.exit(0 if all(has_median(m) for m in bulk) and any(has_median(m) for m in bulk) else 1)
-if phase == "wq":
-    # 单挑战一场里写段+查段都有：写段按 w 规则（docs/s 吞吐全有 median），
-    # 整场按 q 规则（过半 op 有吞吐）
-    bulk = [m for m in om if "docs/s" in ((m.get("throughput") or {}).get("unit") or "")] or om
-    w_ok = bool(bulk) and all(has_median(m) for m in bulk)
-    good = sum(1 for m in om if has_median(m))
-    sys.exit(0 if (w_ok and good * 2 >= len(om)) else 1)
-# 查询赛：个别 task（refresh/sleep 类）本就无吞吐，要求过半有
-good = sum(1 for m in om if has_median(m))
-sys.exit(0 if good * 2 >= len(om) else 1)
+om = (d.get('results') or {}).get('op_metrics') or []
+by_task = {}
+for m in om:
+    task = m.get('task')
+    if task in by_task:
+        sys.exit(1)
+    by_task[task] = m
+def finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+def task_ok(name, group):
+    m = by_task.get(name)
+    if not m:
+        return False
+    tp = m.get('throughput') or {}
+    v = tp.get('median')
+    error = m.get('error_rate')
+    unit = tp.get('unit')
+    return (finite(v) and v > 0 and finite(error) and error == 0
+            and (unit == 'docs/s' if group == 'write' else bool(unit)))
+groups = (['write', 'query'] if expected.get('query') else ['write', 'terminal']) if phase == 'wq' else ['write' if phase == 'w' else 'query']
+for group in groups:
+    names = expected.get(group) or []
+    if not names or not all(task_ok(name, group) for name in names):
+        sys.exit(1)
+sys.exit(0)
 PY
 }
 
@@ -1081,7 +1249,7 @@ recall_probe() { # <fid> <track_dir> <track_key>
     if python3 "$script" --host "$host" --user "$ADMIN_USER" --password "$ADMIN_PW" \
          --index "$idx" --queries "$tdir/queries-recall.jsonl" --truth "$tdir/truth.jsonl" \
          --k "$k" --candidates "$cand" --limit "${RECALL_LIMIT:-2000}" --tag "$fid" \
-         > "$out" 2> "$CAMP_DIR/logs/recall-$fid-k$k.log"; then
+         > "$out" 2> "$CAMP_DIR/logs/recall-$fid-k$k.log" 9>&-; then
       log "  recall k=$k: $(grep -o '"avg_recall":[^,]*' "$out" | head -1)"
     else
       log "  警告: recall 探针失败 k=$k（见 logs/recall-$fid-k$k.log）"
@@ -1199,18 +1367,20 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
 
   PROGSTEP "===== [$seq] $fid 开始 ====="
 
-  # 0) 清上一场遗留的索引数据（两个引擎都清）。
-  #    precheck 跑在引擎切换之前：若上一场的索引还留在盘上（bbqdisk 每场 ~35G），
-  #    磁盘卡点（<20G）会把本场直接 SKIP —— 20261112 当天连挂数场的真根因。
-  #    此刻没有任何引擎在跑（上一场已结束、切换尚未开始），清空最安全；
-  #    后续 ibs wipe 会重建 data 目录并冷启动。
-  purge_stale_index_data
+  # 先停净所有引擎，再清数据；连接/归属/端口验证失败均不得执行删除。
+  if ! "$LIB_DIR/reset-env.sh" all --no-wipe > "$CAMP_DIR/logs/reset-$fid.log" 2>&1; then
+    echo "| $fid | STOP-FAIL | precheck=NOT-RUN | - |" >> "$RACES"
+    PROGSTEP "[$seq] $fid STOP-FAIL"; return 1
+  fi
+  if ! purge_stale_index_data; then
+    echo "| $fid | CLEAN-FAIL | precheck=NOT-RUN | - |" >> "$RACES"
+    PROGSTEP "[$seq] $fid CLEAN-FAIL"; return 1
+  fi
 
-  # 1) 清场（只停集群）+ 赛前负载检测（each 模式逐场；once 模式只在 campaign 起跑前查一次）
-  ./reset-env.sh all --no-wipe >/dev/null 2>&1
+  # 1) 赛前负载检测（each 每场；once 仅 campaign 起跑前一次）
   local precheck="$PCTAG"
   if [ "$PRECHECK_MODE" = each ]; then
-    if ! ./precheck.sh quiet > "$CAMP_DIR/logs/precheck-$fid.log" 2>&1; then
+    if ! "$LIB_DIR/precheck.sh" quiet > "$CAMP_DIR/logs/precheck-$fid.log" 2>&1; then
       precheck="FAIL"
       echo "| $fid | SKIP | precheck=FAIL | - |" >> "$RACES"
       PROGSTEP "[$seq] $fid SKIP: 赛前负载检测未通过（logs/precheck-$fid.log）"; return 1
@@ -1254,8 +1424,16 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   derive_full_challenge "$track" || {
     echo "| $fid | RACE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
     PROGSTEP "[$seq] $fid full challenge 派生失败"; return 1; }
+  if ! expected_tasks "$track" "$tp" "$CAMP_DIR/results/$fid-expected-tasks.json"; then
+    echo "| $fid | TASKS-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+    PROGSTEP "[$seq] $fid 预期任务清单生成失败"; return 1
+  fi
   local TMO=$(( $(track_tmo_w "$tk") + $(track_tmo_q "$tk") ))
-  monitor_start "$fid-wq" "$eng"   # 单挑战全程一份宿主侧采样（5s，只记录不判定）
+  if ! monitor_start "$fid-wq" "$eng"; then
+    monitor_stop "$fid-wq" || true
+    echo "| $fid | ENV-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+    PROGSTEP "[$seq] $fid ENV-FAIL（监控未在全部节点启动）"; return 1
+  fi
   PROGSTEP "[$seq] $fid full race 开始（timeout ${TMO}s）"
   local rc=0
   local ctag=""; [ -n "${EXPECT_CPU_CORES:-}" ] && ctag=",cores:${EXPECT_CPU_CORES}"
@@ -1269,7 +1447,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     --target-hosts="$HOSTS" --track-path="$track" --challenge=full \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
     --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
-    --report-format=markdown --report-file="$rep" > "$rlog" 2>&1 || rc=$?
+    --report-format=markdown --report-file="$rep" > "$rlog" 2>&1 9>&- || rc=$?
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid full race FAILED rc=$rc（尾部: $(tail -2 "$rlog" | head -1)）"
   capture_race_json "$fid" wq "$rlog"
   sidecar_capture "$fid" wq "$tk" "$rnd" "$att" "$track" "$tp"
@@ -1281,10 +1459,11 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     recall_probe "$fid" "$track" "$tk"
   fi
 
-  # 6) 判定（监控只记录环境事实、不参与成败；成败看 race 结果与指标真实性）
+  # 6) 判定：写/查任务完整且有限、全部节点 ENV=OK 才有效。
   local t1=$(date +%s)
   local status="VALID" metok=1
-  race_metric_ok "$fid" wq || { metok=0; PROGSTEP "[$seq] $fid 指标断言未过（写段吞吐全 null 或查询吞吐过半 null）"; }
+  race_metric_ok "$fid" wq || { metok=0; PROGSTEP "[$seq] $fid 指标断言未过（任务缺失、吞吐无效或请求错误）"; }
+  if [ "$MONITOR_OK" != 1 ] || ! env_verdict_ok "$fid-wq"; then status="ENV-FAIL"; fi
   [ $metok -eq 0 ] && status="METRIC-NULL-FAIL"
   [ $rc -ne 0 ]    && status="RACE-FAIL"
 
@@ -1294,37 +1473,117 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   return 0
 }
 
+field_valid() { # <基础 fid>，精确字符串归并整个尝试链，不用未转义正则
+  python3 - "$RACES" "$1" <<'PY'
+import pathlib, re, sys
+try:
+    text = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+except OSError:
+    sys.exit(1)
+base = sys.argv[2]
+for line in text.splitlines():
+    cols = [c.strip() for c in line.split('|')]
+    if len(cols) < 4 or cols[2] != 'VALID':
+        continue
+    if cols[1] == base or re.fullmatch(re.escape(base) + r'-try(?:[2-9]|[1-9][0-9]+)', cols[1]):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+next_attempt() { # <基础 fid>，同时扫描预留记录、判定与产物；中止也消耗编号
+  python3 - "$CAMP_DIR" "$1" <<'PY'
+import pathlib, re, sys
+root, base = pathlib.Path(sys.argv[1]), sys.argv[2]
+pat = re.compile(re.escape(base) + r'(?:-try([0-9]+))?(?=[|.\s-]|$)')
+maximum = 0
+for sub in ('results', 'logs', 'attempts'):
+    for p in (root / sub).glob('*'):
+        m = pat.match(p.name)
+        if m:
+            maximum = max(maximum, int(m[1] or 1))
+races = root / 'RACES.md'
+if races.exists():
+    for line in races.read_text(encoding='utf-8').splitlines():
+        cols = line.split('|')
+        if len(cols) > 2:
+            m = pat.fullmatch(cols[1].strip())
+            if m:
+                maximum = max(maximum, int(m[1] or 1))
+print(maximum + 1)
+PY
+}
 run_field_with_retry() { # <conf_idx> <track> <round> <seq>
   local idx="$1" tk="$2" rnd="$3" seq="$4"
   local lbl="${CONF_LABELS[$idx]}"
-  local fid="${lbl}-${tk}-r${rnd}"
-  # 断点续跑：同 fid 已有 VALID 场则跳过（FRESH=1 强制全重跑）
-  if [ "${FRESH:-0}" != 1 ] && grep -q "^| $fid | VALID |" "$RACES" 2>/dev/null; then
-    PROGSTEP "[$seq] $fid 跳过（RACES.md 已有 VALID；FRESH=1 可强制重跑）"
+  local fid="${lbl}-${tk}-r${rnd}" attempt_fid
+  if [ "${FRESH:-0}" != 1 ] && field_valid "$fid"; then
+    PROGSTEP "[$seq] $fid 跳过（RACES.md 已有 VALID；FRESH=1 可显式重跑）"
     return 0
   fi
-  local max_try="${RETRY_MAX:-3}" att=1
-  while [ "$att" -le "$max_try" ]; do
-    if [ "$att" -gt 1 ]; then
-      PROGSTEP "[$seq] $lbl-$tk-r$rnd 第 $att/$max_try 次尝试（前次失败，60s 后自动重试）"
+  local max_try="${RETRY_MAX:-3}" att count
+  [[ "$max_try" =~ ^[1-9][0-9]*$ ]] || die "RETRY_MAX 必须是正整数"
+  att=$(next_attempt "$fid") || die "无法分配尝试编号"
+  mkdir -p "$CAMP_DIR/attempts" || die "无法创建尝试目录"
+  for ((count=1; count<=max_try; count++)); do
+    if [ "$count" -gt 1 ]; then
+      PROGSTEP "[$seq] $fid 第 $count/$max_try 次尝试（60s 后重试）"
       sleep 60
     fi
-    if run_field "$idx" "$tk" "$rnd" "$seq" "$att"; then
-      return 0
-    fi
+    attempt_fid="$fid"; [ "$att" -gt 1 ] && attempt_fid="$fid-try$att"
+    (set -o noclobber; printf '%s\n' "$(date +%s)" > "$CAMP_DIR/attempts/$attempt_fid") || die "尝试身份冲突，拒绝覆盖: $attempt_fid"
+    if run_field "$idx" "$tk" "$rnd" "$seq" "$att"; then return 0; fi
     att=$((att+1))
   done
-  PROGSTEP "[$seq] $lbl-$tk-r$rnd 已达最大重试次数（$max_try），放弃本场"
+  PROGSTEP "[$seq] $fid 已达本次最大重试次数（$max_try），放弃本场"
   return 1
 }
 
+# 计划、口径摘要和首次窗底均在任何远端操作前落盘；不同计划必须开新 campaign。
+persist_plan() {
+  local i digest old now tmp="$CAMP_DIR/PLAN.tsv.tmp.$$"
+  {
+    printf 'fid\tconfig\ttrack\tround\trecall\test\n'
+    for i in "${!PLAN_FIDS[@]}"; do
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${PLAN_FIDS[$i]}" "${PLAN_CONFIGS[$i]}" "${PLAN_TRACKS[$i]}" "${PLAN_ROUNDS[$i]}" "${PLAN_RECALL[$i]}" "${PLAN_EST[$i]}"
+    done
+  } > "$tmp" || die "计划写入失败"
+  digest=$({ cat "$tmp"; printf '%s\n' "DS_HOURS=$DS_HOURS SHARDS=$SHARDS REPLICAS=$REPLICAS HEAP=$HEAP PRECHECK_MODE=$PRECHECK_MODE CORES=${EXPECT_CPU_CORES:-} ENV=$ENV_ID STEAL=$VERDICT_STEAL_MAX FOREIGN=$VERDICT_FOREIGN_MAX"; } | sha256sum | cut -d' ' -f1) || die "计划摘要失败"
+  if [ -f "$CAMP_DIR/PLAN.sha256" ]; then
+    old=$(cat "$CAMP_DIR/PLAN.sha256")
+    [ "$old" = "$digest" ] && cmp -s "$tmp" "$CAMP_DIR/PLAN.tsv" || { rm -f "$tmp"; die "计划/配置/口径摘要变化，拒绝续跑；请使用新 CAMP_ID"; }
+    rm -f "$tmp"
+  else
+    [ ! -s "$RACES" ] && [ ! -s "$STATE" ] || die "已有结果缺计划摘要，拒绝猜测续跑"
+    mv "$tmp" "$CAMP_DIR/PLAN.tsv" || die "计划提交失败"
+    printf '%s\n' "$digest" > "$CAMP_DIR/PLAN.sha256.tmp" && mv "$CAMP_DIR/PLAN.sha256.tmp" "$CAMP_DIR/PLAN.sha256" || die "摘要提交失败"
+  fi
+  if [ -f "$CAMP_DIR/DEADLINE" ]; then
+    DEADLINE=$(cat "$CAMP_DIR/DEADLINE")
+    [[ "$DEADLINE" =~ ^[0-9]+$ ]] || die "DEADLINE 损坏"
+  else
+    DEADLINE=0
+    [ "$DS_HOURS" -eq 0 ] || DEADLINE=$(( $(date +%s) + DS_HOURS*3600 - 1200 ))
+    printf '%s\n' "$DEADLINE" > "$CAMP_DIR/DEADLINE.tmp" && mv "$CAMP_DIR/DEADLINE.tmp" "$CAMP_DIR/DEADLINE" || die "窗底提交失败"
+  fi
+  if [ -n "${COMPOSE_DIGEST:-}" ]; then
+    [[ "$COMPOSE_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]] || die "COMPOSE_DIGEST 非法"
+    [ ! -f "$CAMP_DIR/COMPOSE_DIGEST" ] || [ "$(cat "$CAMP_DIR/COMPOSE_DIGEST")" = "$COMPOSE_DIGEST" ] || die "compose 摘要变化"
+    printf '%s\n' "$COMPOSE_DIGEST" > "$CAMP_DIR/COMPOSE_DIGEST.tmp" && mv "$CAMP_DIR/COMPOSE_DIGEST.tmp" "$CAMP_DIR/COMPOSE_DIGEST" || die "compose 摘要写入失败"
+  fi
+}
+state_write() { # <OK|FAIL|SKIP> <稳定基础fid>，单写者锁下原子替换
+  local status="$1" fid="$2" tmp="$STATE.tmp.$$"
+  { [ ! -f "$STATE" ] || awk -v key="$fid" '$2!=key' "$STATE"; printf '%s %s\n' "$status" "$fid"; } > "$tmp" && mv "$tmp" "$STATE" || die "STATE 写入失败"
+}
+
 # ---------- 主流程 ------------------------------------------------------------
+persist_plan
 ibs_selfcheck
 
 apply_config "${CONFIGS[0]:-}"      # 排程模式下为空（配置在推进时逐条注册）
 load_topology "$ENGINE_NAME"
 PROGSTEP "campaign $CAMP_ID 启动: configs=[${CONF_LABELS[*]}] tracks=${TRACKS[*]} rounds=$ROUNDS（轮内右旋配对交错）topology=$NNODES 节点（ip.txt 行 $NODE_RANGE）"
-if [ -n "${SCHEDULE_FILE:-}" ] && [ -s "$RACES" ]; then
+if [ -s "$RACES" ]; then
   # 断点续跑：复用同一 CAMP_ID 时保留既有判定表（追加），否则已完成场会被重跑
   PROGSTEP "断点续跑：沿用已有判定表 $RACES（已 VALID 的场自动跳过）"
 else
@@ -1335,8 +1594,10 @@ fi
 
 # once 模式：场间不再检测负载，起跑前这一次是全 campaign 唯一的静默卡点
 if [ "$PRECHECK_MODE" = once ]; then
+  "$LIB_DIR/reset-env.sh" all --no-wipe > "$CAMP_DIR/logs/reset-campaign.log" 2>&1 || die "起跑前停服未确认，拒绝清理"
+  purge_stale_index_data || die "起跑前清理失败"
   PROGSTEP "起跑前静默负载卡点（once 模式，本 campaign 唯一一次）"
-  ./precheck.sh quiet > "$CAMP_DIR/logs/precheck-campaign.log" 2>&1 \
+  "$LIB_DIR/precheck.sh" quiet > "$CAMP_DIR/logs/precheck-campaign.log" 2>&1 \
     || { tail -20 "$CAMP_DIR/logs/precheck-campaign.log"; die "起跑前负载卡点未通过，campaign 终止"; }
 fi
 PROGSTEP "口径: heap=$HEAP precheck=$PRECHECK_MODE cores_expect=${EXPECT_CPU_CORES:-全部（不绑核）}"
@@ -1376,11 +1637,11 @@ if [ -n "${SCHEDULE_FILE:-}" ]; then
   check_track_engine_compat
 fi
 
-# hnsw 3 分片变体只在**真要跑 hnsw 族**时才生成（判据见 vm-bench-lib.sh 的 tracks_need_hnsw_prep）：
-# 无条件生成时，机器上缺 hnsw 基座定义会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
+# hnsw 语料/查询集软链只在**真要跑 hnsw 族**时才准备（判据见 vm-bench-lib.sh 的 tracks_need_hnsw_prep）：
+# 无条件准备时，机器上缺语料会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
 if tracks_need_hnsw_prep "${TRACKS[@]}"; then
-  prepare_hnsw_s3
-  [ -d "$TRACK_HNSW_S3" ] || die "hnsw 3 分片变体准备失败"
+  prepare_hnsw
+  [ -e "$(track_dir hnsw)/documents-2m.json" ] || die "hnsw 语料准备失败"
 fi
 
 # 赛道准备：定义已定版在仓库 tracks/，这里只补 git 不入库的产物（语料软链 / 查询集 / 断点）
@@ -1407,74 +1668,43 @@ case " ${TRACKS[*]} " in *ds-*)
 ;; esac
 
 total=0; okcnt=0; seqn=0
-if [ -n "${SCHEDULE_FILE:-}" ]; then
-  # ---- 排程模式：逐行 (车, 赛道, 轮次, recall, est分钟)，高维优先 + 窗底守卫 ----
-  DEADLINE=0
-  if [ "${DS_HOURS:-0}" -gt 0 ]; then
-    DEADLINE=$(( $(date +%s) + DS_HOURS*3600 - 1200 ))   # 窗底留 20min 余量
-    PROGSTEP "窗底守卫: ${DS_HOURS}h（截止 $(date -d "@$DEADLINE" '+%F %T') 之前放不下的场次 DEADLINE-SKIP）"
-  fi
-  [ -f "$STATE" ] || : > "$STATE"
-  PROGSTEP "排程模式: $SCHEDULE_FILE（车定义 $CARS_FILE）"
-  # ⚠️ 排程输入必须挂到**独立 FD**：循环体里的子命令（ssh / ibs / rally / tar …）全部
-  # 继承 stdin，会把排程管道读空（后面的排程行被吃干净 → 循环提前 EOF 收尾）。
-  # 修法：排程从 FD 3 读，循环体用 read -u 3；子命令的 stdin 与排程彻底隔离。
-  exec 3< <(schedule_lines)
-  while read -r -u 3 car tk rnd do_recall est; do
-    [ -n "$car" ] || continue
-    seqn=$((seqn+1))
-    # 断点续跑：STATE 里已有 OK 的场次直接跳过
-    if grep -qx "OK $seqn" "$STATE" 2>/dev/null; then
-      PROGSTEP "[$seqn] $car-$tk-r$rnd 跳过（STATE 已有 OK $seqn）"
-      continue
-    fi
-    # 窗底守卫：这一场放不下就跳过，继续后面更便宜的场（保证高价值数据先落袋）
-    if [ "$DEADLINE" -gt 0 ]; then
-      _now=$(date +%s)
-      if [ $(( _now + ${est:-0}*60 )) -gt "$DEADLINE" ]; then
-        PROGSTEP "[$seqn] $car-$tk-r$rnd DEADLINE-SKIP（est=${est}min，距窗底放不下）"
-        echo "SKIP $seqn" >> "$STATE"
-        continue
-      fi
-    fi
-    # 车 → 配置行
-    _cfg=$(car_config "$car")
-    [ -n "$_cfg" ] || die "排程里的车未在 $CARS_FILE 定义: $car"
-    _ci=${#CONFIGS[@]}
-    CONFIGS+=("$_cfg")
-    apply_config "$_cfg"
-    CONF_LABELS+=("$CAR_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
-    CUR_RECALL=0; [ "$do_recall" = "recall" ] && CUR_RECALL=1
-    PROGSTEP "[$seqn] 排程: $car → $tk r$rnd（车标签 $CAR_LABEL，recall=$do_recall，est=${est}min）"
-    if run_field_with_retry "$_ci" "$tk" "$rnd" "$seqn"; then
-      okcnt=$((okcnt+1)); echo "OK $seqn" >> "$STATE"
-    else
-      echo "FAIL $seqn" >> "$STATE"
-    fi
-    total=$((total+1))
-  done
-  exec 3<&-
-else
-  for tk in "${TRACKS[@]}"; do
-    for r in $(seq 1 "$ROUNDS"); do
-      for idx in $(order_for_round "$r"); do
-        seqn=$((seqn+1))
-        # 变体 × 引擎兼容：不适配的组合**留痕跳过**（与 DEADLINE-SKIP 同语义：
-        # 不计入 total，不白跑一场再失败）。排程模式是逐行写死的，那里直接 die。
-        _allow=$(track_engines "$tk")
-        if [ -n "$_allow" ]; then
-          _eng=$(car_engine "${CONFIGS[$idx]:-}")
-          if [ -n "$_eng" ] && [ "$_eng" != "$_allow" ]; then
-            PROGSTEP "[$seqn] ${CONF_LABELS[$idx]:-?}-$tk-r$r 跳过（引擎 $_eng 不支持该变体，该变体只支持 $_allow）"
-            continue
-          fi
-        fi
-        if run_field_with_retry "$idx" "$tk" "$r" "$seqn"; then okcnt=$((okcnt+1)); fi
-        total=$((total+1))
-      done
-    done
-  done
+[ -f "$STATE" ] || : > "$STATE"
+if [ "$DEADLINE" -gt 0 ]; then
+  PROGSTEP "窗底守卫: ${DS_HOURS}h（固定截止 $(date -d "@$DEADLINE" '+%F %T')）"
 fi
+# 执行已验证并持久化的内存计划，不在运行中重新读可变排程；子命令无法吞掉后续行。
+CONFIGS=(); CONF_LABELS=(); CONF_PKGS=()
+for _pi in "${!PLAN_FIDS[@]}"; do
+  seqn=$((_pi+1)); fid="${PLAN_FIDS[$_pi]}"; tk="${PLAN_TRACKS[$_pi]}"; rnd="${PLAN_ROUNDS[$_pi]}"; est="${PLAN_EST[$_pi]}"
+  _base_fid="$fid"
+  apply_config "${PLAN_CONFIGS[$_pi]}"
+  _allow=$(track_engines "$tk")
+  if [ -n "$_allow" ] && [ "$ENGINE_NAME" != "$_allow" ]; then
+    PROGSTEP "[$seqn] $fid 跳过（引擎 $ENGINE_NAME 不支持该变体，该变体只支持 $_allow）"
+    state_write SKIP "$fid"; continue
+  fi
+  if [ "${FRESH:-0}" != 1 ] && field_valid "$fid"; then
+    PROGSTEP "[$seqn] $fid 跳过（RACES.md 已有 VALID）"
+    state_write OK "$fid"; okcnt=$((okcnt+1)); total=$((total+1)); continue
+  fi
+  if grep -Fxq "OK $fid" "$STATE" && [ "${FRESH:-0}" != 1 ]; then
+    die "STATE OK 缺对应 VALID 判定，拒绝盲目跳过: $fid"
+  fi
+  if [ "$DEADLINE" -gt 0 ] && [ $(( $(date +%s) + est*60 )) -gt "$DEADLINE" ]; then
+    PROGSTEP "[$seqn] $fid DEADLINE-SKIP（est=${est}min，距固定窗底放不下）"
+    state_write SKIP "$fid"; continue
+  fi
+  _ci=${#CONFIGS[@]}; CONFIGS+=("${PLAN_CONFIGS[$_pi]}")
+  CONF_LABELS+=("$CAR_LABEL"); CONF_PKGS+=("$ENGINE_PKG")
+  CUR_RECALL=0; [ "${PLAN_RECALL[$_pi]}" = recall ] && CUR_RECALL=1
+  if [ -n "$SCHEDULE_FILE" ]; then PROGSTEP "[$seqn] 排程: $CAR_LABEL → $tk r$rnd（车标签 $CAR_LABEL，recall=${PLAN_RECALL[$_pi]}，est=${est}min）"; fi
+  if run_field_with_retry "$_ci" "$tk" "$rnd" "$seqn"; then
+    okcnt=$((okcnt+1)); state_write OK "$_base_fid"
+  else
+    state_write FAIL "$_base_fid"
+  fi
+  total=$((total+1))
+done
 
 env_summary_csv   # monitors/*-summary.txt → ENV-SUMMARY.csv（benchmark-result-env/benchmark-result-metric 可直接吃）
 PROGSTEP "campaign 结束: $okcnt/$total 场有效。报告: $CAMP_DIR/results/；汇总: $RACES"
@@ -1484,6 +1714,8 @@ if [ -n "${NOTIFY_URL:-}" ]; then
     -d "{\"campaign\":\"$CAMP_ID\",\"valid\":$okcnt,\"total\":$total,\"races\":\"$RACES\"}" "$NOTIFY_URL" \
     >/dev/null 2>&1 && PROGSTEP "通知已发送: $NOTIFY_URL" || PROGSTEP "通知发送失败（不影响结果）"
 fi
-for ip in "${VM_IPS[@]}"; do vm "$ip" "rm -rf $EZ_DIR/jdk.old" 2>/dev/null; done
-./reset-env.sh all >/dev/null 2>&1 || true
-PROGSTEP "已停集群并清理数据（安装与 jdk.bundled* 归档保留；下次不带 JDK_DIR 跑会自动回切自带 JDK）"
+_cleanup_rc=0
+"$LIB_DIR/reset-env.sh" all > "$CAMP_DIR/logs/reset-final.log" 2>&1 || _cleanup_rc=$?
+if [ "$_cleanup_rc" -eq 0 ]; then PROGSTEP "已确认停集群并清理数据（安装与 JDK 归档保留）"
+else PROGSTEP "收尾清理失败 rc=$_cleanup_rc（logs/reset-final.log），不能声称环境已还原"; fi
+[ "$_cleanup_rc" -eq 0 ] && [ "$okcnt" -eq "$total" ]

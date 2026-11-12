@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""codec-compare.py —— geonames 存储压缩对比（5 组合车）汇总（在压测机上跑）
+"""codec-compare.py —— geonames 存储压缩对比（完整有效测量）。
 
   ssh root@<压测机> 'python3 - <campaign 目录> [--detail]' < scripts/codec-compare.py
 
@@ -8,167 +8,153 @@
   ① 写入吞吐：口径A=rally Median Throughput（warmup 后样本中位），口径B=语料条数÷duration（全程平均）
   ② 落盘体积：主指标取赛末 sidecar 探针（logs/fp/<fid>-*/nodes-stats.txt）的三节点 store 之和；
      race.json 的 store_size 只是写赛结束时的快照，压缩差异没充分显现（见 post_merge_store）
-  ③ 查询延迟：q-race.json 的 op_metrics[].latency 分位（codec 改变了 stored fields 的解码成本）
+  ③ 查询延迟：op_metrics[].service_time 分位，统一为 ms，不将开环积压当作引擎耗时
 
 codec 一列读的是 sidecar 里 `GET /geonames/_settings` 的**实测**值，不是赛道文件名烘的期望值
 （引擎静默忽略未知设置时，期望 ≠ 生效；ES 就不认 index.source_reuse）。
 """
-import glob
+import argparse
 import json
 import os
-import re
 import statistics
 import sys
 
+from result_selection import finite, read_json, select_measurements, valid_fids
+
 DOCS = 11396503
-CAR_LABEL = {
-    "jdk25-gdef": "ez-def (2.5.0@GraalVM25)",
-    "jdk25-gzstd": "ez-zstd-sr (2.5.0@GraalVM25)",
-    "kona25-gzstd": "ez-kona-zstd-sr (2.5.0@Kona25)",
-    "es819-gdef": "es8-def (8.19.23)",
-    "es819-gbc": "es8-bc (8.19.23)",
-}
-CAR_ORDER = ["jdk25-gdef", "jdk25-gzstd", "kona25-gzstd", "es819-gdef", "es819-gbc"]
+CAR_LABEL = {}
+CAR_ORDER = []
 
 
 def j(p):
     try:
-        return json.load(open(p, encoding="utf-8"))
+        return read_json(p)
     except (ValueError, OSError):
         return None
 
 
 def median(v):
-    v = [x for x in v if isinstance(x, (int, float))]
+    v = [x for x in v if finite(x)]
     return statistics.median(v) if v else None
 
 
 def rng_pct(v):
-    v = [x for x in v if isinstance(x, (int, float))]
+    v = [x for x in v if finite(x)]
     return (max(v) / min(v) - 1) * 100 if len(v) > 1 and min(v) else 0.0
 
 
 def measured_codec(camp, fid):
     """sidecar 里实测的 index.codec / index.source_reuse（读不到返回 None）"""
-    for ph in ("w", "q"):
+    for ph in ("wq", "q", "w"):
         s = j(os.path.join(camp, "results", "%s-%s-sidecar.json" % (fid, ph)))
         if not s:
             continue
         st = ((s.get("run_params") or {}).get("index_settings_measured") or {}).get("geonames")
         if st:
             c = st.get("index.codec", "default")
-            sr = (st.get("index.source_reuse") or "").lower()
+            sr = str(st.get("index.source_reuse", "false")).lower()
             return c + ("+source_reuse" if sr == "true" else "")
     return None
 
 
-def post_merge_store(camp, fid):
+def post_merge_store(camp, fid, expected_nodes=None):
     """真·压缩后体积：赛末 sidecar 原始探针 logs/fp/<fid>-<q|wq>/nodes-stats.txt 的三节点
     store 之和（拆分协议落 -q、单挑战协议落 -wq，merge 都发生在探针之前）。
     race.json 的 store_size 是写赛结束时的快照，多段状态下 codec 差异没充分显现
     → 压缩对比必须以赛末（merge 之后）的节点统计为准。"""
     out = {"store_gb": None, "segments": None, "docs": None}
-    for ph in ("wq", "q", "w"):
+    for ph in ("wq", "q"):
         p = os.path.join(camp, "logs", "fp", "%s-%s" % (fid, ph), "nodes-stats.txt")
         d = j(p)
-        if not d or "nodes" not in d:
+        if not d or not isinstance(d.get("nodes"), dict) or not d["nodes"]:
             continue
-        store = sum((n.get("indices", {}).get("store", {}) or {}).get("size_in_bytes", 0)
-                    for n in d["nodes"].values())
-        out["store_gb"] = store / 2**30
-        out["segments"] = sum((n.get("indices", {}).get("segments", {}) or {}).get("count", 0)
-                              for n in d["nodes"].values())
-        out["docs"] = sum((n.get("indices", {}).get("docs", {}) or {}).get("count", 0)
-                          for n in d["nodes"].values())
+        nodes = list(d["nodes"].values())
+        counters = d.get("_nodes") or {}
+        if (type(expected_nodes) is not int or expected_nodes <= 0 or len(nodes) != expected_nodes
+                or counters.get("total") != expected_nodes or counters.get("successful") != expected_nodes
+                or counters.get("failed") != 0):
+            continue
+        def value(node, family, key):
+            result = ((node.get("indices") or {}).get(family) or {}).get(key)
+            return result if finite(result) and result >= 0 else None
+        stores = [value(n, "store", "size_in_bytes") for n in nodes]
+        segments = [value(n, "segments", "count") for n in nodes]
+        docs = [value(n, "docs", "count") for n in nodes]
+        out["store_gb"] = sum(stores) / 2**30 if all(v is not None for v in stores) else None
+        out["segments"] = sum(segments) if all(v is not None for v in segments) else None
+        out["docs"] = sum(docs) if all(v is not None for v in docs) else None
         break
     return out
 
 
-def valid_fids(camp):
-    """RACES.md 里状态 VALID 的场次名集合。
-    重试场的**写赛**常常也是成功的（QUERY-FAIL 之前写赛已落档），
-    只看 results/*.json 会把它们当成独立样本 → n 虚高、且把作废场混进中位数。"""
-    p = os.path.join(camp, "RACES.md")
-    ok = set()
-    if not os.path.isfile(p):
-        return None
-    for line in open(p, encoding="utf-8", errors="replace"):
-        parts = [x.strip() for x in line.strip().strip("|").split("|")]
-        if len(parts) >= 2 and parts[0] not in ("场次", "---") and not set(parts[0]) <= set("-"):
-            if parts[1] == "VALID":   # runner 只写 VALID；ENV-WARN 从不入表（历史残留已清）
-                ok.add(parts[0])
-    return ok or None
-
-
 def collect(camp):
-    keep = valid_fids(camp)
     fields = {}
-    # 单挑战（full）与拆分（w+q）两种协议的落档都认：wq 一份文件里写查都有
-    for p in sorted(glob.glob(os.path.join(camp, "results", "*-g*-w-race.json"))
-                    + glob.glob(os.path.join(camp, "results", "*-g*-wq-race.json"))):
-        fid = os.path.basename(p)[:-len("-w-race.json")]
-        single = p.endswith("-wq-race.json")
-        if single:
-            fid = os.path.basename(p)[:-len("-wq-race.json")]
-        if keep is not None and fid not in keep:
+    signatures = {}
+    for row in select_measurements(camp):
+        variant = row["track"]
+        if not (variant in ("geo", "geonames", "gdef", "gzstd", "gbc") or variant.startswith("geo-codec-")):
             continue
-        key = "-".join(fid.split("-")[:2])          # car + 变体（r 轮号在后头）
-        if key not in CAR_LABEL:
-            continue
-        d = j(p)
-        if not d or d.get("challenge") not in ("write-only", "full"):
-            continue
+        phase = "wq" if "wq" in row["races"] else "w"
+        d = row["races"][phase]
         om = (d.get("results") or {}).get("op_metrics") or []
-        if not om:
+        writes = [m for m in om if m.get("task") == "index-append"]
+        if len(writes) != 1:
             continue
+        write = writes[0]
+        duration = write.get("duration")
+        dur = duration / 1000 if finite(duration) and duration > 0 else None
+        if dur is None:
+            continue
+        key = row["series_key"] + "|" + variant
+        prior = signatures.setdefault(key, row["signature"])
+        if prior != row["signature"]:
+            raise ValueError("%s 实测条件不一致，不能合池" % key)
+        pm = post_merge_store(camp, row["fid"], int((d.get("user-tags") or {})["nnodes"]))
         res = d.get("results") or {}
-        dur = (om[0].get("duration") or 0) / 1000.0
-        pm = post_merge_store(camp, fid)
-        e = fields.setdefault(key, {"w": [], "q": [], "fid0": fid})
+        e = fields.setdefault(key, {"w": [], "q": [], "fid0": row["fid"], "signature": row["signature"]})
         e["w"].append({
-            "round": (d.get("user-tags") or {}).get("round"),
-            "a": (om[0].get("throughput") or {}).get("median"),
-            "b": DOCS / dur if dur else None,
-            "dur": dur,
-            "store": pm["store_gb"] if pm["store_gb"] else (res.get("store_size") or 0) / 2**30,
-            "store_race": (res.get("store_size") or 0) / 2**30,
-            "segs": pm["segments"] if pm["segments"] is not None else res.get("segment_count"),
-            "merge": (res.get("merge_time") or 0) / 1000.0,
-            "merge_throttle": (res.get("merge_throttle_time") or 0) / 1000.0,
-            "refresh": (res.get("refresh_time") or 0) / 1000.0,
-            "ygc": (res.get("young_gc_time") or 0) / 1000.0,
-            "ogc": (res.get("old_gc_time") or 0) / 1000.0,
-            "err": om[0].get("error_rate"),
-            "codec": measured_codec(camp, fid),
+            "round": row["round"], "a": (write.get("throughput") or {}).get("median"),
+            "b": DOCS / dur, "dur": dur, "store": pm["store_gb"],
+            "store_race": res.get("store_size"), "segs": pm["segments"],
+            "merge": res.get("merge_time", 0) / 1000,
+            "merge_throttle": res.get("merge_throttle_time", 0) / 1000,
+            "refresh": res.get("refresh_time", 0) / 1000,
+            "ygc": res.get("young_gc_time", 0) / 1000,
+            "ogc": res.get("old_gc_time", 0) / 1000,
+            "err": write.get("error_rate"), "codec": measured_codec(camp, row["fid"]),
         })
-        if single:
-            q_ops = [m for m in om if not str(m.get("task") or "").startswith("index")]
-        else:
-            qp = os.path.join(camp, "results", "%s-q-race.json" % fid)
-            q_ops = (((j(qp) or {}).get("results") or {}).get("op_metrics") or []
-                     if os.path.isfile(qp) else [])
-        rnd = (d.get("user-tags") or {}).get("round")
-        for m in q_ops:
-            e["q"].append({"op": m.get("task"), "round": rnd,
-                           "p50": (m.get("latency") or {}).get("50_0"),
-                           "p99": (m.get("latency") or {}).get("99_0"),
-                           "rtp": (m.get("throughput") or {}).get("median")})
+        q = row["races"].get("q") or d
+        for metric in (q.get("results") or {}).get("op_metrics") or []:
+            if metric.get("task", "").startswith(("index", "upsert", "refresh", "force-merge", "wait-")):
+                continue
+            service = metric.get("service_time") or {}
+            factor = {"ms": 1, "s": 1000}.get(service.get("unit", "ms"))
+            e["q"].append({"op": metric.get("task"), "round": row["round"],
+                           "p50": service["50_0"] * factor if factor and finite(service.get("50_0")) else None,
+                           "p99": service["99_0"] * factor if factor and finite(service.get("99_0")) else None,
+                           "rtp": (metric.get("throughput") or {}).get("median")})
     return fields
 
 
 def main():
-    args = [a for a in sys.argv[1:]]
-    detail = "--detail" in args
-    camps = [a for a in args if not a.startswith("--")]
-    if not camps:
-        print(__doc__)
-        return 1
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("campaigns", nargs="+")
+    ap.add_argument("--detail", action="store_true")
+    ap.add_argument("--baseline", help="体积差的精确基线身份（series_key|track_variant）")
+    args = ap.parse_args()
+    camps, detail = list(dict.fromkeys(args.campaigns)), args.detail
     fields = {}
-    for c in camps:
-        for k, v in collect(c).items():
-            fields.setdefault(k, {"w": [], "q": [], "fid0": v["fid0"]})
-            fields[k]["w"] += v["w"]
-            fields[k]["q"] += v["q"]
+    try:
+        for c in camps:
+            for k, v in collect(c).items():
+                target = fields.setdefault(k, {"w": [], "q": [], "fid0": v["fid0"], "signature": v["signature"]})
+                if target["signature"] != v["signature"]:
+                    raise ValueError("%s 跨 campaign 实测条件不一致" % k)
+                target["w"] += v["w"]
+                target["q"] += v["q"]
+    except (OSError, ValueError) as e:
+        print("压缩对比失败: %s" % e, file=sys.stderr)
+        return 1
     if not fields:
         print("没有可解析的 codec 场次")
         return 1
@@ -176,20 +162,23 @@ def main():
     print("=== ① 写入 + ② 落盘体积 ===")
     print("%-32s %s %2s %9s %7s %9s %8s %8s %8s %8s %8s %8s %8s" % (
         "组合车", "实测codec", "n", "口径B中位", "极差%", "口径A中位", "A-B%", "store GB(赛末)",
-        "vs ez-def", "段数", "merge s", "GC y/o s", "err"))
+        "vs baseline", "段数", "merge s", "GC y/o s", "err"))
     base_store = None
     order = [k for k in CAR_ORDER if k in fields] + [k for k in sorted(fields) if k not in CAR_ORDER]
-    if "jdk25-gdef" in fields:
-        base_store = median([x["store"] for x in fields["jdk25-gdef"]["w"]])
+    if args.baseline:
+        if args.baseline not in fields:
+            print("不存在的基线身份: %s" % args.baseline, file=sys.stderr)
+            return 1
+        base_store = median([x["store"] for x in fields[args.baseline]["w"]])
     for k in order:
         w = fields[k]["w"]
-        print("%-32s %-16s %2d %9.0f %7.1f %9s %8s %8.2f %8s %8s %8s %10s %8s" % (
+        print("%-32s %-16s %2d %9.0f %7.1f %9s %8s %8s %8s %8s %8s %10s %8s" % (
             CAR_LABEL.get(k, k), w[0]["codec"] or "?", len(w),
             median([x["b"] for x in w]) or 0, rng_pct([x["b"] for x in w]),
             ("%.0f" % median([x["a"] for x in w])) if median([x["a"] for x in w]) else "NULL",
             ("%.1f" % ((median([x["a"] for x in w]) / median([x["b"] for x in w]) - 1) * 100))
             if median([x["a"] for x in w]) and median([x["b"] for x in w]) else "-",
-            median([x["store"] for x in w]) or 0,
+            ("%.2f" % median([x["store"] for x in w])) if median([x["store"] for x in w]) is not None else "-",
             ("%+.1f%%" % ((median([x["store"] for x in w]) / base_store - 1) * 100))
             if base_store and median([x["store"] for x in w]) else "-",
             "/".join(str(x["segs"]) for x in w),
@@ -202,9 +191,9 @@ def main():
         print("%-20s %-3s %9s %6s %8s %5s %8s" % ("场", "轮", "口径B", "任务s", "store GB", "段", "merge s"))
         for k in order:
             for x in fields[k]["w"]:
-                print("%-20s %-3s %9.0f %6.1f %8.2f %5s %8.1f" % (
-                    CAR_LABEL.get(k, k)[:20], "r%s" % x["round"], x["b"] or 0, x["dur"], x["store"],
-                    x["segs"], x["merge"]))
+                print("%-20s %-3s %9.0f %6.1f %8s %5s %8.1f" % (
+                    CAR_LABEL.get(k, k)[:20], "r%s" % x["round"], x["b"] or 0, x["dur"],
+                    ("%.2f" % x["store"]) if x["store"] is not None else "-", x["segs"], x["merge"]))
 
     ops = sorted({m["op"] for k in order for m in fields[k]["q"] if m["op"]}, key=str)
     if ops:

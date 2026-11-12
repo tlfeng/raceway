@@ -26,7 +26,7 @@
 |---|---|---|
 | 语料 | `documents-1024.json` → 符号链接至上述 1M 文件 | 子集化（10M → 1M） |
 | index.json | `vectors`，**3 主分片** 0 副本，`_source` 关闭，`dynamic:false`；`docid` keyword + `emb` dense_vector（float/1024/dot_product/HNSW m=32/ef_construction=100） | 官方为 10M 条不同分片布局 |
-| operations | `knn-search-10-100`（k=10/ef=100）、`knn-search-100-1000`（k=100/ef=1000），param-source 从 `queries.json` 轮询 | 同官方家族模板（`dense_vector`/`so_vector` 同款骨架） |
+| operations | `knn-search-10-100`（k=10/num_candidates=100）、`knn-search-100-1000`（k=100/num_candidates=1000），最终请求 body.size=k；param-source 从 `queries.json` 轮询 | num_candidates 是每分片候选数，不是通用 ef_search |
 | challenges | `write-only`：bulk 500×8 客户端 → force-merge 每分片 1 段；`query-only`：两档各 warmup 100 / 1000 迭代，单客户端 | 读写分离 + 单段卡点为自定义（官方为混合挑战） |
 | queries.json | 官方 `queries.json.bz2` 解压后**前 2,000 条** | 条数与 96 维 s3 赛道对齐 |
 
@@ -40,3 +40,18 @@
 1. 下载/转码脚本在 `<语料制作目录>/hv-bench/`；赛道定义在本仓库 `tracks/hv1024/`（语料软链与 queries.json 由 run-bench 起跑前生成）。
 2. 语料文件**勿删勿改**：`documents-jina-float.json` 与 `documents-hvfloat-sub200000.json` 被正式赛道以符号链接引用；重新生成只需重跑上表 1→2（需外网可达官方 CDN）。
 3. 本数据集与官方赛道的关系口径：「官方 esrally 赛道 msmarco-jina-10m-vector 公开语料的 100 万条子集，测试程序由本规范定义」。
+
+## 六、hv1024 家族查询口径
+
+所有参数源（含 exact 分支）发送 `body.size=k`，不依赖外层 Rally size 参数。
+ES/Easysearch HNSW 两档使用 `knn.num_candidates=100/1000`，OS Lucene/Faiss HNSW
+使用 `method_parameters.ef_search=100/1000`；二者不等价，不能统一简称 ef。
+Lucene HNSW 查询宽度为 max(k,ef_search)，Faiss 使用 HNSW 的 ef_search；返回 k 均为10/100。
+
+OS on_disk 赛道显式使用 **Faiss HNSW m=32/efC=100 + 32x + rescore oversample_factor=2.0**，
+本协议目标 OpenSearch ≥3.3。它不是 IVF；ES bbq_disk 则采用不同的聚类/访问策略，
+不能只凭 `knn-search-100-1000` 同名就称两者同搜索条件。性能结论必须结合相同查询集、
+相同返回 k、逐臂实测 recall；预算数字相同不保证召回或计算量相同。
+
+hv1024x 的 `_source` 保留 docid、排除 emb，与 hv1024 整体关闭 `_source` 的写入/存储口径
+不同，不跨族比较绝对写速和体积。各目录引擎支持范围及固定参数见各自 VARIANT.txt。

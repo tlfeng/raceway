@@ -6,16 +6,57 @@
 set -uo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=vm-bench.env
-source "$LIB_DIR/vm-bench.env"
+# 快照中的库仍从原实例读取环境；close/stop 允许未部署环境的本地归档目录。
+ENV_FILE="${RACEWAY_ENV_FILE:-$LIB_DIR/vm-bench.env}"
+if [ -f "$ENV_FILE" ]; then
+  source "$ENV_FILE" || return 1
+elif [ "${RACEWAY_ENV_OPTIONAL:-0}" != 1 ]; then
+  printf '缺环境配置: %s\n' "$ENV_FILE" >&2; return 1
+fi
 
 TS() { date '+%F %T'; }
 log()  { echo "[$(TS)] $*"; }
 die()  { echo "[$(TS)] ERROR: $*" >&2; exit 1; }
 
-# 远程执行 / 传文件
-vm()    { ssh "${VM_SSH_OPTS[@]}" "root@$1" "$2"; }
-vmPut() { scp "${VM_SSH_OPTS[@]}" "$2" "root@$1:$3"; }   # vmPut <ip> <local> <remote>
+# 路径只允许普通绝对路径，破坏性命令不得接受根目录、点段或 shell 元字符。
+ENGINES=(easysearch elasticsearch opensearch)
+safe_abs_path() {
+  case "$1" in /|''|*[!A-Za-z0-9_./-]*|*/../*|*/..|*/./*|*/.|*//*|*/) return 1;; /*) return 0;; *) return 1;; esac
+}
+shell_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+engine_root() { # <engine> → 校验过的统一安装根
+  local eng="$1" base="${IBS_BASE:-/infini}"
+  case "$eng" in easysearch|elasticsearch|opensearch) ;; *) return 1;; esac
+  safe_abs_path "$base" || { log "不安全的 IBS_BASE: $base" >&2; return 1; }
+  printf '%s/%s\n' "$base" "$eng"
+}
+
+# PID 身份 = boot id + /proc starttime；不能只凭 PID 或命令行子串杀进程。
+proc_start() { # <pid>（僵尸不算活跃）
+  local pid="$1" line rest
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  [ "$pid" -gt 1 ] || return 1
+  line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+  rest="${line##*) }"; set -- $rest
+  [ "${1:-Z}" != Z ] && [ -n "${20:-}" ] || return 1
+  printf '%s\n' "${20}"
+}
+runner_meta_pid() { # <campaign dir> → 仅返回身份和脚本 argv 均吻合的活 runner
+  local dir="$1" pid start boot script extra arg found=0 exe
+  [ -f "$dir/RUNNER.meta" ] && [ -f "$dir/RUNNER.pid" ] || return 1
+  IFS=$'\t' read -r pid start boot script extra < "$dir/RUNNER.meta" || return 1
+  [ -z "${extra:-}" ] && [ "$(cat "$dir/RUNNER.pid")" = "$pid" ] || return 1
+  [ "$boot" = "$(cat /proc/sys/kernel/random/boot_id)" ] || return 1
+  [ "$(proc_start "$pid")" = "$start" ] || return 1
+  exe=$(readlink "/proc/$pid/exe") || return 1
+  case "${exe##*/}" in bash|sh|dash) ;; *) return 1;; esac
+  while IFS= read -r -d '' arg; do [ "$arg" = "$script" ] && found=1; done < "/proc/$pid/cmdline"
+  [ "$found" = 1 ] && [[ "$script" == "$dir"/runtime/*/run-bench.sh ]] || return 1
+  printf '%s\n' "$pid"
+}
+# 远程执行 / 传文件；排程和互斥 FD 不交给 ssh。
+vm()    { ssh "${VM_SSH_OPTS[@]}" "root@$1" "$2" </dev/null 9>&-; }
+vmPut() { scp "${VM_SSH_OPTS[@]}" "$2" "root@$1:$3" </dev/null 9>&-; }   # vmPut <ip> <local> <remote>
 
 # 对所有虚机执行命令，任一失败即 die
 vm_all() {
@@ -49,14 +90,7 @@ provision_jdk() { # <ip>
   return 0; }
 
 # 引擎名 -> 属性（引擎名 = systemd 服务名：easysearch | elasticsearch）
-eng_dir() {
-  case "$1" in
-    easysearch)    echo "$IBS_BASE/easysearch";;
-    elasticsearch) echo "$IBS_BASE/elasticsearch";;
-    opensearch)    echo "$IBS_BASE/opensearch";;
-    *) return 1;;
-  esac
-}
+eng_dir() { engine_root "$1"; }
 # 节点命名模板（ibs_sync_ip 改写 ip.txt 时按序套用；来自 env）
 node_names_of() { case "$1" in easysearch) echo "${VM_NODES_EZ[@]}";; elasticsearch) echo "${VM_NODES_ES[@]}";; opensearch) echo "${VM_NODES_OS[@]}";; *) return 1;; esac; }
 # 服务运行用户（wipe 后 chown 用）
@@ -117,7 +151,7 @@ track_dir() { # <赛道/变体 id> → 目录
       # 量化档走 --track-params（vector_index_type）。
       echo "$ROOT/tracks/hv1024x";;
     geo) echo "$ROOT/tracks/geonames";;
-    hnsw) echo "$TRACK_HNSW_S3";;
+    hnsw) echo "$ROOT/tracks/hnsw";;
     hv1024) echo "$ROOT/tracks/hv1024";;
     nested) echo "$ROOT/tracks/nested";;
     *) echo "$ROOT/tracks/$1";;
@@ -141,14 +175,14 @@ track_quant() { # <id> → index_options.type（空 = 不量化）
   # 向量量化档是**向量索引类型**（index_options.type），不是压缩档：
   # int8_hnsw = 标量量化，bbq_hnsw = 二值量化；ES 8.19.23 与 Easysearch 2.5.1 两侧都能建。
   # 与压缩档是**两个独立维度**，别混：量化走 vector_index_type，压缩走 index_codec。
-  case "$(track_canonical "$1")" in
+  case "$(track_base "$1")" in
     hv1024x-os*) echo "";;
     *-int8) echo "int8_hnsw";;
     *-bbq) echo "bbq_hnsw";;
     *) echo "";; esac; }
 # hnsw 3 分片变体只在**真要跑 hnsw 族**时才生成：无条件生成时，机器上缺 hnsw 基座
 # 定义会让 geo 这类无关赛道也起不来，die 报的却是 hnsw 的事。
-tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要生成 hnsw 3 分片变体
+tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要准备 hnsw 语料/查询集软链（定义已定版 tracks/hnsw）
   local tk
   for tk in "$@"; do
     case "$tk" in *hnsw*) return 0;; esac
@@ -162,17 +196,11 @@ track_availability_table() {
   for _t in geo geonames-upsert hnsw hv1024 nested \
             hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr \
             hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk; do
-    case "$_t" in
-      hnsw) _d="${TRACK_HNSW_BASE:-}";;                    # 3 分片变体起跑时生成，判基座在不在
-      *)    _d=$(track_dir "$_t" 2>/dev/null || echo "");;   # 变体与基座同目录（压缩/量化走 params）
-    esac
+    _d=$(track_dir "$_t" 2>/dev/null || echo "");   # 变体与基座同目录（压缩/量化走 params）
     if [ -n "$_d" ] && [ -f "$_d/track.json" ]; then
       printf '  %s %-24s %s\n' "✔" "$_t" "$_d"
     else
-      [ -n "$_d" ] || { case "$_t" in
-        hnsw) _d="（vm-bench.env 里没设 TRACK_HNSW_BASE）";;
-        *)    _d="（路径解析失败）";;
-      esac; }
+      [ -n "$_d" ] || _d="（路径解析失败）"
       printf '  %s %-24s %s\n' "⚠" "$_t" "$_d"
       echo "      ↳ 定义不在位：仓库没同步全（同步得带 tracks/），或这条还没回灌进 git（见 tracks/README.md）"
     fi
@@ -201,13 +229,13 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   # 不传就落到模板默认值（geonames 5、nested 1、hv1024 3），与其余赛道的 3 分片口径
   # 不一致，跨赛道/跨变体的数字就不可比了。
   #
-  # 其余赛道（hnsw/ds-*）分片已烘进 index.json，不传。
+  # 其余赛道（ds-*）分片仍烘在 index.json 里，不传；hnsw 已随回灌 params 化（默认 3，与原 3 分片口径一致）。
   # ⚠️ 必须按**基座**判断，不能按 id 名单判断：canonical 变体名与 legacy 别名
   #    走的是同一条规则，只是名字不同。
   local b; b=$(track_base "$1")
   local p=""
   case "$b" in
-    geo|nested|hv1024|geonames-upsert) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
+    geo|nested|hv1024|geonames-upsert|hnsw) p="number_of_shards:${SHARDS:-3},number_of_replicas:${REPLICAS:-0}";;
   esac
   # 压缩档与 source_reuse：索引级设置，走 --track-params（标量，无逗号，rally 2.12 解析可靠），
   # 由 index.json 的条件块写入 settings（{% if index_codec is defined %} /
@@ -286,26 +314,81 @@ target_hosts() {
 # ⚠️ 必须等进程真正退出才返回：紧随其后的 precheck 静默卡点把 bench 标记进程的
 # CPU（含退出中的残留 JVM）当"残留引擎"——不等净，每场第一个 precheck 大概率失败，
 # 白烧 1~2 次重试（2026-11-08 oshv 系 campaign 实测：23 行判定 14 行 SKIP）。
-stop_engine_on_vm() { # <ip> <engine>
-  local ip="$1" eng="$2" dir; dir=$(eng_dir "$eng") || return 0
-  vm "$ip" "systemctl stop $eng 2>/dev/null; sleep 1; systemctl stop $eng 2>/dev/null
-    for p in \$(pgrep -x java 2>/dev/null); do
-      case \$(readlink /proc/\$p/exe 2>/dev/null) in $dir/*) kill \$p 2>/dev/null;; esac
-    done
-    # 等退出（最多 15s，轮询期间持续补 TERM；与 ibs wipe 的等待口径一致）
+# 远端归属断言共用同一段：exe 必须位于规范安装根，path.home 参数必须精确相等。
+engine_remote_guard() { # <engine>（输出远端前置代码，不执行）
+  local dir; dir=$(engine_root "$1") || return 1
+  printf 'dir=%s\n' "$(shell_quote "$dir")"
+  cat <<'SH'
+[ -d "$dir" ] || exit 0
+[ ! -L "$dir" ] && [ "$(readlink -f "$dir")" = "$dir" ] || exit 1
+root_pids() {
+  local p exe
+  for entry in /proc/[0-9]*; do
+    p=${entry##*/}
+    exe=$(readlink -f "$entry/exe" 2>/dev/null) || continue
+    [ "${exe##*/}" = java ] || continue
+    case "$exe" in "$dir"/*) printf '%s\n' "$p";; esac
+  done
+}
+owned_pid() {
+  local p="$1" exe arg home=0
+  case "$p" in ''|*[!0-9]*) return 1;; esac
+  [ "$p" -gt 1 ] || return 1
+  exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || return 1
+  case "$exe" in "$dir"/*) ;; *) return 1;; esac
+  while IFS= read -r -d '' arg; do
+    case "$arg" in -D*.path.home="$dir") home=1;; esac
+  done < "/proc/$p/cmdline"
+  [ "$home" = 1 ]
+}
+pid_start() {
+  local line rest
+  line=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest="${line##*) }"; set -- $rest
+  [ "${1:-Z}" != Z ] && [ -n "${20:-}" ] || return 1
+  printf '%s' "${20}"
+}
+signal_owned() {
+  local p="$1" sig="$2" start
+  start=$(pid_start "$p") || return 0
+  owned_pid "$p" || { echo "拒绝操作归属不明 PID $p ($dir)" >&2; return 1; }
+  [ "$(pid_start "$p")" = "$start" ] || return 1
+  kill "-$sig" "$p" 2>/dev/null || [ ! -e "/proc/$p" ]
+}
+SH
+}
+stop_engine_on_vm() { # <ip> <engine>：只有确认全部退出才成功
+  local ip="$1" eng="$2" guard
+  guard=$(engine_remote_guard "$eng") || return 1
+  vm "$ip" "$guard
+    for p in \$(root_pids); do owned_pid \"\$p\" || exit 1; done
+    main=\$(systemctl show '$eng' -p MainPID --value 2>/dev/null) || exit 1
+    case \"\$main\" in 0|'') ;; *[!0-9]*) exit 1;; *) owned_pid \"\$main\" || exit 1;; esac
+    systemctl stop '$eng' 2>/dev/null || true
     for i in \$(seq 1 15); do
-      left=0
-      for p in \$(pgrep -x java 2>/dev/null); do
-        case \$(readlink /proc/\$p/exe 2>/dev/null) in \$dir/*) left=1; kill \$p 2>/dev/null;; esac
-      done
-      [ \$left = 0 ] && break
+      pids=\$(root_pids)
+      [ -z \"\$pids\" ] && exit 0
+      for p in \$pids; do signal_owned \"\$p\" TERM || exit 1; done
       sleep 1
     done
-    # 还在 → SIGKILL（删数据前必须停净，绝不带着进程进下一场）
-    for p in \$(pgrep -x java 2>/dev/null); do
-      case \$(readlink /proc/\$p/exe 2>/dev/null) in $dir/*) kill -9 \$p 2>/dev/null;; esac
+    for p in \$(root_pids); do signal_owned \"\$p\" KILL || exit 1; done
+    for i in \$(seq 1 5); do
+      [ -z \"\$(root_pids)\" ] && exit 0
+      sleep 1
     done
-    true"
+    echo '引擎未停净，拒绝继续' >&2; exit 1"
+}
+wipe_engine_data_on_vm() { # <ip> <engine>：二次验证停净，只删统一根下 data/logs
+  local ip="$1" eng="$2" guard user
+  guard=$(engine_remote_guard "$eng") || return 1
+  user=$(eng_user "$eng")
+  case "$user" in ''|*[!A-Za-z0-9_-]*) return 1;; esac
+  vm "$ip" "$guard
+    [ -z \"\$(root_pids)\" ] || { echo '仍有引擎进程，拒绝删除' >&2; exit 1; }
+    for d in data logs; do [ ! -L \"\$dir/\$d\" ] || exit 1; done
+    rm -rf -- \"\$dir/data\" \"\$dir/logs\" &&
+    mkdir -p -- \"\$dir/data\" \"\$dir/logs\" &&
+    chown -R '$user:$user' \"\$dir/data\" \"\$dir/logs\""
 }
 
 # 启动一个引擎
@@ -315,8 +398,11 @@ start_engine_on_vm() { # <ip> <engine>
 }
 
 # 断言端口空闲（返回 0=空闲）
-port_free_on_vm() { # <ip>
-  ! vm "$ip" "ss -tln | grep -q ':$HTTP_PORT '" 2>/dev/null
+port_free_on_vm() { # <ip>；SSH/ss 失败不能视为空闲
+  local ip="$1"
+  case "${HTTP_PORT:-}" in ''|*[!0-9]*) return 1;; esac
+  vm "$ip" "out=\$(ss -H -ltn) || exit 2
+    if printf '%s\\n' \"\$out\" | awk '{print \$4}' | grep -qE ':${HTTP_PORT}\$'; then exit 1; fi"
 }
 
 # 后缀式段数检查：返回某索引每主分片段数>0 的分片个数（0 = 全部每分片 1 段）
@@ -527,9 +613,21 @@ if '"force-merge"' not in w:  # 写段已自带 merge（如 nested-s3 / geonames
         ' "retry-until-success": true, "include-in-reporting": false } }',
     ]
 
-ops = split_top_level_ops(w) + merge_ops + split_top_level_ops(q)
-ops = uniquify_ops(ops)
-sched = ",\n".join(ops)
+# Jinja 条件及逗号必须原样保留；仅在等长遮罩上定位操作，再替换重名任务。
+# 不能把解析出的对象重新用逗号 join（条件关闭时会留下双逗号）。
+sched = ',\n'.join([w] + merge_ops + [q])
+masked = re.sub(r'\{%.*?%\}|\{#.*?#\}|\{\{.*?\}\}',
+                lambda m: ' ' * len(m.group(0)), sched, flags=re.S)
+spans = []
+cursor = 0
+for op in split_top_level_ops(masked):
+    start = masked.find(op, cursor)
+    end = start + len(op)
+    spans.append((start, end, sched[start:end]))
+    cursor = end
+ops = uniquify_ops([raw for _, _, raw in spans])
+for (start, end, _), op in reversed(list(zip(spans, ops))):
+    sched = sched[:start] + op + sched[end:]
 out = ('{\n  "name": "full",\n  "description": '
        '"Indexes the corpus, force-merges to one segment and runs the full query set in one race.",\n'
        '  "schedule": [\n' + sched + '\n  ]\n}\n')
@@ -561,11 +659,15 @@ PY
 
 CPU_DROPIN=zz-cpu-affinity.conf
 
-cpu_allowed_of() { # <ip> <svc> <dir> → 引擎进程 Cpus_allowed_list（如 "0-7"）；进程不存在输出空
-  local ip="$1" svc="$2" dir="$3" pid
-  pid=$(vm "$ip" "pgrep -f 'path.home=${dir%h}[h]' | head -1" 2>/dev/null)
-  [ -n "$pid" ] || { echo ""; return 0; }
-  vm "$ip" "awk '/Cpus_allowed_list/{print \$2}' /proc/$pid/status" 2>/dev/null
+cpu_allowed_of() { # <ip> <svc> <dir>；归属、连接或多进程歧义必须失败
+  local ip="$1" svc="$2" dir="$3" guard
+  [ "$dir" = "$(engine_root "$svc")" ] || return 1
+  guard=$(engine_remote_guard "$svc") || return 1
+  vm "$ip" "$guard
+    pids=\$(root_pids); set -- \$pids
+    [ \"\$#\" -eq 1 ] || { [ \"\$#\" -eq 0 ] && exit 0; exit 1; }
+    owned_pid \"\$1\" || exit 1
+    awk '/Cpus_allowed_list/{print \$2}' /proc/\$1/status"
 }
 
 cpu_list_count() { # "0-7" 或 "0-3,8" → 核数
@@ -580,10 +682,11 @@ cpu_list_count() { # "0-7" 或 "0-3,8" → 核数
 
 cpu_affinity_apply() { # <ncpu> —— 三节点引擎写 CPUAffinity drop-in
   local n="$1" ip cpus
-  [ "$n" -ge 1 ] 2>/dev/null || die "cpu_affinity_apply: 核数非法: $n"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "cpu_affinity_apply: 核数非法: $n"
+  [ "${#VM_IPS[@]}" -gt 0 ] || die "绑核拒绝空节点集合"
   cpus=$(seq -s' ' 0 $(( n - 1 )))
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "for svc in easysearch elasticsearch opensearch; do mkdir -p /etc/systemd/system/\$svc.service.d && printf '[Service]\nCPUAffinity=${cpus}\n' > /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done && systemctl daemon-reload" \
+    vm "$ip" "set -e; [ \$(nproc --all) -ge '$n' ] || exit 1; for svc in easysearch elasticsearch opensearch; do mkdir -p /etc/systemd/system/\$svc.service.d && printf '[Service]\nCPUAffinity=${cpus}\n' > /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done; systemctl daemon-reload" \
       || die "在 $ip 写 CPUAffinity drop-in 失败"
   done
   log "CPUAffinity=${cpus} 已写入三节点 drop-in（easysearch+elasticsearch+opensearch；服务下次启动生效，cpu-affinity.sh clear 还原）"
@@ -591,8 +694,9 @@ cpu_affinity_apply() { # <ncpu> —— 三节点引擎写 CPUAffinity drop-in
 
 cpu_affinity_clear() { # 移除 drop-in（服务下次启动恢复全部核）
   local ip
+  [ "${#VM_IPS[@]}" -gt 0 ] || die "清除绑核拒绝空节点集合"
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "for svc in easysearch elasticsearch opensearch; do rm -f /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done && systemctl daemon-reload" \
+    vm "$ip" "set -e; for svc in easysearch elasticsearch opensearch; do rm -f /etc/systemd/system/\$svc.service.d/${CPU_DROPIN}; done; systemctl daemon-reload" \
       || die "在 $ip 移除 CPUAffinity drop-in 失败"
   done
   log "CPUAffinity drop-in 已移除（服务下次启动恢复全部核）"

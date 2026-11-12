@@ -7,5 +7,8 @@ settings:   3 分片 0 副本 · index.knn=true · _source excludes ["emb"]
 对应 ES:    dense_vector + index_options.type=hnsw（dot_product，归一化向量下排序等价）
 语料:       documents-1024.json（软链 documents-jina-float.json，1M × 1024 维 float，22739096214 字节）
 待部署补:   queries.json / queries-recall.jsonl / truth.jsonl（从 tracks/hv1024x 拷贝或软链）
-查询体:     OpenSearch k-NN DSL（{"query":{"knn":{"emb":{...}}}}，见 track.py）
+查询体:     OpenSearch k-NN DSL（query.knn.emb），body.size=k
+搜索预算:   operation ef-search=100/1000 → method_parameters.ef_search，k=10/100
+            Lucene HNSW 使用 max(k, ef_search) 的搜索宽度；不等价于 ES num_candidates
+比较要求:   任务名末尾数字表示 ef_search，同名任务不代表跨引擎同预算；需核对实测 recall
 设计文档:   PLAN-opensearch-hv1024-三向量对比测试.md

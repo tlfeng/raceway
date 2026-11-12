@@ -13,7 +13,9 @@
       "docid": { "type": "keyword" },
       "emb": {
         "type": "knn_vector", "dimension": 1024, "space_type": "cosinesimil",
-        "mode": "on_disk"
+        "mode": "on_disk", "compression_level": "32x",
+        "method": { "name": "hnsw", "engine": "faiss",
+                    "parameters": { "m": 32, "ef_construction": 100 } }
       }
     }
   }
