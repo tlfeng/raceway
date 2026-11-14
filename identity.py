@@ -251,25 +251,3 @@ def comparison_key_of(series_key, track_variant):
     if not series_key or not variant:
         raise ValueError("comparison_key 必须同时有 series_key 与 track_variant")
     return "%s|%s" % (series_key, variant)
-
-
-def series_key_from_doc(doc):
-    """已有载荷里的文档 → 系列键（补标签路径用，无 sidecar 时用这条）。
-
-    载荷文档带 engine / version / engine_build，可直接拼；JDK 段从 series_key
-    旧值反解，或按车代号兜底表补。
-    """
-    doc = doc or {}
-    eng = doc.get("engine") or ""
-    ver = str(doc.get("version")) if doc.get("version") not in (None, "") else ""
-    build = str(doc.get("engine_build")) if doc.get("engine_build") not in (None, "") else ""
-    vendor = doc.get("jdk_vendor") or None
-    major = None
-    jv = doc.get("jdk_version")
-    if jv:
-        major = str(jv).split(".")[0]
-    if not vendor or not major:
-        fb_vm = _fallback_jdk_vm(car_of(doc))
-        vendor = vendor or fb_vm[0]
-        major = major or fb_vm[1]
-    return series_key_of(eng, ver, build, vendor, major, car=car_of(doc))

@@ -136,6 +136,29 @@ class ComparisonSafetyTest(unittest.TestCase):
         self.assertEqual(0, values[('50th percentile service time', 'term')])
         self.assertEqual(25, values[('99th percentile service time', 'term')])
 
+    def test_json_stdout_is_pure_json_even_with_asserts(self):
+        """`--json` 的 stdout 必须能被 json.loads 一次吃下。
+
+        曾经的 bug：json_payload 内部调 run_asserts，而它在 stdout 打了一整张
+        Markdown 断言表 —— 管道侧 `car-compare.py --json | jq` 直接 ValueError。
+        断言结果现在只走结构化字段 asserts.checks。
+        """
+        import shutil
+        self.measurement(car='a')
+        other = Path(self.tmp.name) / 'candidate'
+        shutil.copytree(self.camp, other)
+        th = Path(self.tmp.name) / 'th.conf'
+        th.write_text('geo,index-append,Median Throughput,>=,0\n', encoding='utf-8')
+        argv = ['car-compare.py', '--a', 'a', '--b', 'a',
+                '--a-campaign', str(self.camp), '--b-campaign', str(other),
+                '--json', '--assert', str(th)]
+        out = io.StringIO()
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(out):
+            rc = C.main()
+        payload = json.loads(out.getvalue())      # 混进任何非 JSON 文本这里就会炸
+        self.assertIn('checks', payload['asserts'])
+        self.assertEqual(rc, 1 if payload['asserts']['fails'] else 0)
+
     def test_explicit_pools_allow_same_car_across_campaigns(self):
         self.measurement(car='a')
         other = Path(self.tmp.name) / 'candidate'

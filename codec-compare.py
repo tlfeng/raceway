@@ -22,8 +22,6 @@ import sys
 from result_selection import finite, read_json, select_measurements, valid_fids
 
 DOCS = 11396503
-CAR_LABEL = {}
-CAR_ORDER = []
 
 
 def j(p):
@@ -115,7 +113,7 @@ def collect(camp):
         e["w"].append({
             "round": row["round"], "a": (write.get("throughput") or {}).get("median"),
             "b": DOCS / dur, "dur": dur, "store": pm["store_gb"],
-            "store_race": res.get("store_size"), "segs": pm["segments"],
+            "segs": pm["segments"],
             "merge": res.get("merge_time", 0) / 1000,
             "merge_throttle": res.get("merge_throttle_time", 0) / 1000,
             "refresh": res.get("refresh_time", 0) / 1000,
@@ -164,7 +162,7 @@ def main():
         "组合车", "实测codec", "n", "口径B中位", "极差%", "口径A中位", "A-B%", "store GB(赛末)",
         "vs baseline", "段数", "merge s", "GC y/o s", "err"))
     base_store = None
-    order = [k for k in CAR_ORDER if k in fields] + [k for k in sorted(fields) if k not in CAR_ORDER]
+    order = sorted(fields)
     if args.baseline:
         if args.baseline not in fields:
             print("不存在的基线身份: %s" % args.baseline, file=sys.stderr)
@@ -173,7 +171,7 @@ def main():
     for k in order:
         w = fields[k]["w"]
         print("%-32s %-16s %2d %9.0f %7.1f %9s %8s %8s %8s %8s %8s %10s %8s" % (
-            CAR_LABEL.get(k, k), w[0]["codec"] or "?", len(w),
+            k, w[0]["codec"] or "?", len(w),
             median([x["b"] for x in w]) or 0, rng_pct([x["b"] for x in w]),
             ("%.0f" % median([x["a"] for x in w])) if median([x["a"] for x in w]) else "NULL",
             ("%.1f" % ((median([x["a"] for x in w]) / median([x["b"] for x in w]) - 1) * 100))
@@ -192,13 +190,13 @@ def main():
         for k in order:
             for x in fields[k]["w"]:
                 print("%-20s %-3s %9.0f %6.1f %8s %5s %8.1f" % (
-                    CAR_LABEL.get(k, k)[:20], "r%s" % x["round"], x["b"] or 0, x["dur"],
+                    k[:20], "r%s" % x["round"], x["b"] or 0, x["dur"],
                     ("%.2f" % x["store"]) if x["store"] is not None else "-", x["segs"], x["merge"]))
 
     ops = sorted({m["op"] for k in order for m in fields[k]["q"] if m["op"]}, key=str)
     if ops:
         print("\n=== ③ 查询延迟中位（ms，三场取中位）===")
-        print("%-42s %s" % ("操作", " ".join("%10s" % CAR_LABEL.get(k, k).split(" ")[0][:10] for k in order)))
+        print("%-42s %s" % ("操作", " ".join("%10s" % k.split(" ")[0][:10] for k in order)))
         for op in ops:
             cells = []
             for k in order:
@@ -206,7 +204,7 @@ def main():
                 cells.append("%10s" % (("%.1f" % median(v)) if v and median(v) else "-"))
             print("%-42s %s" % (str(op)[:42], " ".join(cells)))
         print("\n=== ③b 查询吞吐中位（ops/s）===")
-        print("%-42s %s" % ("操作", " ".join("%10s" % CAR_LABEL.get(k, k).split(" ")[0][:10] for k in order)))
+        print("%-42s %s" % ("操作", " ".join("%10s" % k.split(" ")[0][:10] for k in order)))
         for op in ops:
             cells = []
             for k in order:

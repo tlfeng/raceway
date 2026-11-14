@@ -9,7 +9,7 @@
 产出（对齐《20261016-benchmark结果入库ES方案》§3）：
   templates.json      benchmark-result-env / benchmark-result-race / benchmark-result-metric 三张索引的 index template（strict + snake_case）
   benchmark-result-env.jsonl     一环境一行（host/vm 台账，来自 sidecar）
-  benchmark-result-race.jsonl     一场 race 一行（含实测 JDK/heap/核数、valid、口径B 速率、fingerprint）
+  benchmark-result-race.jsonl     一场 race 一行（含实测 JDK/heap/核数、valid、fingerprint）
   benchmark-result-metric.jsonl  race × task × metric × stat 一行（单位归一 + family + direction）
   manifest.json       计数与来源，供核对
   bench-apply.py      一键 bulk 导入（幂等 upsert）
@@ -30,7 +30,6 @@ import shutil
 import sys
 import importlib
 import math
-import tempfile
 
 # 压缩 / source_reuse 两个维度的推导与 legacy 拆分放在 bench-history（与编排台
 # 同一份实现），避免两处各写一套慢慢漂移。
@@ -113,7 +112,6 @@ LOWER_BETTER = ("latency", "service_time", "processing_time", "error_rate", "dur
 CANON_STATS = ("value", "mean", "p50", "p90", "p99", "p999", "p9999", "p100", "min", "max")
 CANON_UNITS = ("s", "ms", "ops/s", "docs/s", "pages/s", "MB/s", "GB", "MB", "bytes",
                "count", "ratio", "percent", "text", "")
-CANON_QUALITY = ("ok", "degraded", "unknown")
 # challenge 是**源值**封闭词表（runner 的 case "$ph" in w) write-only;; q) query-only;; *) full;;），
 # 合并成一行时是多值数组 —— 值仍然是源值，不新增词表。
 CANON_CHALLENGE = ("write-only", "query-only", "index-only", "full", "nested-search-challenge")
@@ -300,12 +298,26 @@ def runner_variant_of(d, fid, car):
 
 
 def index_type_of(side, variant):
-    """侧车的已解析类型优先；绝不把 Jinja 字面量当作类型。"""
+    """侧车的已解析类型优先；绝不把 Jinja 字面量当作类型。
+
+    三种输入三种处理（都有测试钉着）：
+      1. 正常已解析类型      → 用它，并与赛道名推导的期望值交叉校验；
+      2. 未渲染的 Jinja 模板 → 旧 campaign 的 sidecar 会抓到
+         `{{vector_index_type | default('hnsw')}}` 这类原文。按"没测到"处理，
+         回落到赛道名推导值（模板串绝不入库，也不会因此中断整批导出）；
+      3. 其它非法值          → fail closed，抛错（说明 sidecar 被写坏了，不能猜）。
+    """
     measured = (knn_params_of(side) or {}).get("index_type")
     if measured is not None:
         measured = str(measured).strip()
         if not re.fullmatch(r"[A-Za-z0-9_]+", measured):
-            raise ValueError("knn_index_type 不是已解析的类型: %r" % measured)
+            # 旧 campaign 的 sidecar 会抓到未解析的 Jinja 字面量（如
+            # "{{vector_index_type | default('hnsw')}}"）——按「未测到」处理并回落到
+            # 赛道推导值；模板串绝不入库。其余非法值仍然 fail closed。
+            if "{{" in measured or "{%" in measured:
+                measured = None
+            else:
+                raise ValueError("knn_index_type 不是已解析的类型: %r" % measured)
     base = variant.split("-codec-", 1)[0]
     expected = ("int8_hnsw" if base.endswith("-int8") else
                 "bbq_hnsw" if base.endswith("-bbq") and not base.startswith("hv1024x-os") else None)
@@ -397,6 +409,11 @@ def norm_value(v, raw_unit):
 
 
 def direction_of(family):
+    # 计数类的 family 是 merge / refresh / flush（merge_count 等），
+    # 次数越多说明写放大/刷新越频繁，方向与对应的 *_time 一致。
+    # 不能用子串匹配：LOWER_BETTER 里是 "merge_time"，而 family 只有 "merge"。
+    if family in ("merge", "refresh", "flush"):
+        return "lower-better"
     return "lower-better" if any(k in family for k in LOWER_BETTER) else "higher-better"
 
 
@@ -531,7 +548,6 @@ except ImportError:                                                    # 从别�
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     identity_mod = importlib.import_module('identity')
 series_key_of = identity_mod.series_key_of
-jdk_short_of = identity_mod.jdk_short_of
 jdk_vm_of = identity_mod.jdk_vm_of
 jdk_vendor_of = identity_mod.jdk_vendor_of
 jdk_major_of = identity_mod.jdk_major_of
@@ -1017,13 +1033,14 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
         v = res.get(key)
         if v is None:
             continue
-        if isinstance(v, dict):          # *_per_shard：取 median
+        if isinstance(v, dict):
+            # 历史产物的 results 里出现过 {"median": x, ...} 形状（per-shard）。
+            # stat 词表里没有 median_per_shard，写进去会被 validate_payload 判致命，
+            # 所以取 median 当普通值，stat 仍是 value。
             v = v.get("median")
             if v is None:
                 continue
-            stat = "median_per_shard"
-        else:
-            stat = "value"
+        stat = "value"
         nv, nu = norm_value(v, unit)
         _push({"_index": "benchmark-result-metric", "_id": "%s|%s||%s|%s" % (run_id, common.get("phase"), fam + "_" + key, stat),
                     "@timestamp": ts, "task": None, "operation": None,
@@ -1217,7 +1234,9 @@ def validate_payload(runs, metrics, envs=()):
     for r in runs:
         if (r.get("race_id") or "").startswith("SEG|"):
             problems.append("race 行主键是段级键: %s" % r.get("race_id"))
-    # 覆盖率（非致命）
+    # 覆盖率（非致命）。注意两类量纲不能混：cov() 给的是百分比，
+    # 下面三个是**计数**（多少场）—— 用同一个 50 阈值判会打印
+    # "trusted_true = 3.0%" 这种假告警，也会漏掉真该报案的场次。
     n = len(runs) or 1
     def cov(fn):
         return round(100.0 * sum(1 for r in runs if fn(r)) / n, 1)
@@ -1229,14 +1248,20 @@ def validate_payload(runs, metrics, envs=()):
         # 配置列覆盖率（实际生效值）
         "heap_mb": cov(lambda r: r.get("heap_mb") is not None),
         "cores": cov(lambda r: r.get("cores") is not None),
+    }
+    counts = {
         "trusted_true": sum(1 for r in runs if r.get("trusted") is True),
         "trusted_false": sum(1 for r in runs if r.get("trusted") is False),
-        "multi_segment": sum(1 for r in runs if isinstance(r.get("challenge"), list) and len(r["challenge"]) > 1),
+        "multi_segment": sum(1 for r in runs
+                             if isinstance(r.get("challenge"), list) and len(r["challenge"]) > 1),
     }
     for k, v in cover.items():
-        if k != "degraded_races" and v < 50.0:
+        if v < 50.0:
             warnings.append("字段覆盖率偏低: %s = %.1f%%（过滤条件用该字段会漏掉大半场次）" % (k, v))
-    return problems, warnings, {"fields": cover, "stat_histogram": stat_count,
+    if counts["trusted_false"]:
+        warnings.append("不可信场次: trusted=false %d/%d（这些行的数字不能进结论）"
+                        % (counts["trusted_false"], n))
+    return problems, warnings, {"fields": cover, "counts": counts, "stat_histogram": stat_count,
                                 "unit_histogram": unit_count, "stat_aliases": aliases}
 
 
@@ -1268,20 +1293,6 @@ def load_race_id_index(campaigns_dir):
         if rid:
             idx[rid] = (m.group(1), m.group(2))
     return idx
-
-
-def track_from_fid(fid):
-    """真 fid（{车}-{赛道}-r{轮}[-tryN]）→ 赛道名。
-
-    fid 的赛道段是**唯一可靠**的来源：user_tags.track 在早期批次里被解析器写成了
-    键名（字面量 "track"），而 fid 是编排时定的。
-    赛道名本身含 '-'（ds-g1920 / hvtp200k-3s），所以用贪婪匹配。
-    """
-    if not fid:
-        return None
-    base = _TRY_RE.sub("", fid)
-    m = re.match(r"^[^\-]+-(.+)-r\w+$", base)
-    return m.group(1) if m else None
 
 
 # 臂头行里的「臂 → (版本, build)」：PROGRESS.txt 的
@@ -1320,18 +1331,6 @@ def arm_build_of(arms, car):
     cands = [a for a in arms if car.startswith(a + "-")]
     if len(cands) == 1:
         return arms[cands[0]]
-    return None
-
-
-def variant_from_fid(fid):
-    """真 fid（{车}-{变体}-r{轮}[-tryN]）→ 变体段（不做归一）。
-
-    变体 id 不入库（track_variant 已退役，覆盖判定由 codec/source_reuse 列派生，
-    见 bench-history.variant_id_of）；本函数供溯源/调试读取 fid 中段。
-    """
-    base = _TRY_RE.sub("", fid or "")
-    m = re.match(r"^[^\-]+-(.+)-r\w+$", base)
-    return m.group(1) if m else None
     return None
 
 
@@ -1500,11 +1499,6 @@ def _main():
         protocol = ut.get("measurement_protocol") or "full"
         if protocol not in ("full", "write-only"):
             raise ValueError("未知 measurement_protocol: %r" % protocol)
-        dur = None
-        for om in ((d.get("results") or {}).get("op_metrics") or []):
-            if om.get("task") == "index-append" and om.get("duration"):
-                dur = om["duration"] / 1000.0
-        rate_b = (DOCS.get(d.get("track"), 0) / dur) if dur and DOCS.get(d.get("track")) else None
         warn = []
         eng_tag = ut.get("engine") or ""
         for _cf in (meta.get("contaminated") or []):
@@ -1762,57 +1756,52 @@ def _main():
                    "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
                    "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
                    "trusted": (not degraded_tasks)}
-        if _drop_reason:
-            dropped.append({"reason": _drop_reason, "campaign": camp, "fid": fid,
-                            "attempt": attempt, "status": status,
-                            "track": tr, "timestamp": ts})
-        else:
-            node_counts = []
-            if ut.get("nnodes") is not None:
-                node_counts.append(ut["nnodes"])
-            vm_nodes = (side.get("env") or {}).get("vm_nodes") or []
-            if vm_nodes:
-                node_counts.append(len(vm_nodes))
-            segments.append({"key": (camp, fid, attempt), "seg_key": seg_key, "phase": phase,
-                             "ts": ts, "row": seg_row, "warn": list(warn),
-                             "has_write": any(is_write_task(o.get("task") or o.get("operation")) for o in op_metrics),
-                             "has_query": any(is_query_task(o) for o in op_metrics),
-                             "required_tasks": [o for o in op_metrics if
-                                                is_write_task(o.get("task") or o.get("operation")) or is_query_task(o)],
-                             "node_counts": node_counts,
-                             "rally_id": d.get("race-id")})
-            emit_metrics(d, seg_key, ts, common, metrics, side=side, counters=counters)
-            # ---- 召回率行：挂到该场**查询** race 上 ----
-            # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
-            # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
-            # 必须和 emit_metrics 一样待在闸门的 else 里 —— 放在闸门外，
-            # 被剔场次的 recall 行照写不误，SEG| race_id 在 race 索引查无此人。
-            # 召回率行：**查询相**的场次才发。
-            # phase=="q" 是老协议（读写分跑）；phase=="wq" 是单挑战 `full` 协议
-            # （读写同一段跑）—— 查询相就在同一段里。两个都要判，
-            # 只判 q 会把 full 协议场次的 recall 行全漏了（"数据在库里但从没被查过"）。
-            if phase in ("q", "wq"):
-                _rec = recall_idx.get((camp, fid))
-                for _task, _stats in (_rec or {}).items():
-                    # recall 行的 trusted 取**它自己那个 task** 的判定，不是整场的判定。
-                    # 场级 trusted 是"任一 task 坏了就整场不可信"，而 recall 只回答
-                    # 一个 task 的召回率。两者混用会让同一 (场次, task) 出现 trusted
-                    # 不一致的行 —— 与同 task 的时延行打架，导出期断言直接拒收整批。
-                    # 探针的 task 名与 op_metrics 的 task 名同源（RECALL_TASK_BY_K），
-                    # 对不上就回落场级判定。
-                    _q = task_quality_map.get(_task)
-                    _trusted = (common.get("trusted") if _q is None
-                                else (_q != "degraded"))
-                    for _stat, _v in _stats.items():
-                        metrics.append({"_index": "benchmark-result-metric",
-                                        "_id": "%s|%s|%s|recall|%s" % (seg_key, phase, _task, _stat),
-                                        "@timestamp": ts, "task": _task, "operation": None,
-                                        "family": "recall", "metric": "recall", "stat": _stat,
-                                        "value": _v, "unit": "ratio",
-                                        "value_original": _v, "unit_original": "ratio",
-                                        "direction": "higher-better",
-                                        **{k: v for k, v in common.items() if k in METRIC_FIELDS},
-                                        "trusted": _trusted})
+        node_counts = []
+        if ut.get("nnodes") is not None:
+            node_counts.append(ut["nnodes"])
+        vm_nodes = (side.get("env") or {}).get("vm_nodes") or []
+        if vm_nodes:
+            node_counts.append(len(vm_nodes))
+        segments.append({"key": (camp, fid, attempt), "seg_key": seg_key, "phase": phase,
+                         "ts": ts, "row": seg_row, "warn": list(warn),
+                         "has_write": any(is_write_task(o.get("task") or o.get("operation")) for o in op_metrics),
+                         "has_query": any(is_query_task(o) for o in op_metrics),
+                         "required_tasks": [o for o in op_metrics if
+                                            is_write_task(o.get("task") or o.get("operation")) or is_query_task(o)],
+                         "node_counts": node_counts,
+                         "rally_id": d.get("race-id")})
+        emit_metrics(d, seg_key, ts, common, metrics, side=side, counters=counters)
+        # ---- 召回率行：挂到该场**查询** race 上 ----
+        # 探针在查询跑完后离线执行，结果按 (campaign, fid) 索引；
+        # fid 带 -tryN 变体时按前缀兜底（recall 文件用原始 fid 命名）。
+        # 必须和 emit_metrics 一样待在闸门的 else 里 —— 放在闸门外，
+        # 被剔场次的 recall 行照写不误，SEG| race_id 在 race 索引查无此人。
+        # 召回率行：**查询相**的场次才发。
+        # phase=="q" 是老协议（读写分跑）；phase=="wq" 是单挑战 `full` 协议
+        # （读写同一段跑）—— 查询相就在同一段里。两个都要判，
+        # 只判 q 会把 full 协议场次的 recall 行全漏了（"数据在库里但从没被查过"）。
+        if phase in ("q", "wq"):
+            _rec = recall_idx.get((camp, fid))
+            for _task, _stats in (_rec or {}).items():
+                # recall 行的 trusted 取**它自己那个 task** 的判定，不是整场的判定。
+                # 场级 trusted 是"任一 task 坏了就整场不可信"，而 recall 只回答
+                # 一个 task 的召回率。两者混用会让同一 (场次, task) 出现 trusted
+                # 不一致的行 —— 与同 task 的时延行打架，导出期断言直接拒收整批。
+                # 探针的 task 名与 op_metrics 的 task 名同源（RECALL_TASK_BY_K），
+                # 对不上就回落场级判定。
+                _q = task_quality_map.get(_task)
+                _trusted = (common.get("trusted") if _q is None
+                            else (_q != "degraded"))
+                for _stat, _v in _stats.items():
+                    metrics.append({"_index": "benchmark-result-metric",
+                                    "_id": "%s|%s|%s|recall|%s" % (seg_key, phase, _task, _stat),
+                                    "@timestamp": ts, "task": _task, "operation": None,
+                                    "family": "recall", "metric": "recall", "stat": _stat,
+                                    "value": _v, "unit": "ratio",
+                                    "value_original": _v, "unit_original": "ratio",
+                                    "direction": "higher-better",
+                                    **{k: v for k, v in common.items() if k in METRIC_FIELDS},
+                                    "trusted": _trusted})
         if side:
             e = side.get("env") or {}
             eid = e.get("env_id")
