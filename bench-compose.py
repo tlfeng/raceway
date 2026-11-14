@@ -504,7 +504,10 @@ try:
     elif mode == 'upload':
         expected = files()
         d = root / 'schedules'
-        d.mkdir(exist_ok=True)
+        # 先判存在再建：某些平台的 mkdir(exist_ok=True) 对已存在目录仍会抛 EEXIST
+        # （实测 macOS 的 python 3.13 构建），这里不依赖那个开关的容错语义。
+        if not d.is_dir():
+            d.mkdir(parents=True, exist_ok=True)
         if d.is_symlink():
             fail('schedules 不允许符号链接')
         fd = os.open(str(d / '.compose-upload.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -960,7 +963,6 @@ _PAGE = """<!doctype html>
 <button onclick="doRender()">生成排程</button>
 <button onclick="doPreview()">上传 + dry-run 预览</button>
 <button onclick="doStart()">互斥预检并起跑</button>
-<span id="msg"></span>
 
 <h2>排程</h2><pre id="sched">（未生成）</pre>
 <h2>输出（dry-run / 起跑 / 环境体检）</h2><pre id="out">（空）</pre>
@@ -1173,6 +1175,8 @@ async function post(path){ const m=matrix(), key=JSON.stringify(m);
   if(path==='/api/start' && PREVIEW && PREVIEW.key===key) m.digest=PREVIEW.digest;
   const r=await fetch(path,{method:'POST',headers:writeHeaders(),body:JSON.stringify(m)});
   const j=await r.json();
+  // 403 有话直说（多半是服务重启后 CSRF 变了）：别让按钮看起来像"起跑失败"
+  if(r.status===403) setMsg(false, j.error || '请求被拒绝');
   if(path==='/api/preview') PREVIEW=(r.ok && j.rc===0)?{key:key,digest:j.digest}:null;
   return {status:r.status, j:j}; }
 function show(el,text){document.getElementById(el).textContent=text;}
@@ -1663,6 +1667,8 @@ async function doTracks(){
     const r=await fetch('/api/tracks',{method:'POST',headers:writeHeaders()});
     const j=await r.json();
     if(r.status!=200){ show('tracksout','读取失败: '+(j.error||'未知')); return; }
+    // rc!=0 时 result 是 runner 的报错文本，不能当赛道清单渲染
+    if(j.rc!==0 && j.rc!==undefined){ show('tracksout','读取失败（rc='+j.rc+'）：'+(j.result||'')); return; }
     show('tracksout',j.result);
   }catch(e){ show('tracksout','请求失败: '+e); }
 }
@@ -1732,10 +1738,12 @@ class ComposeState:
 
     def __init__(self, args):
         self.args = args
+        # st.lock 只保护**快操作**（状态快照、CSRF、车表刷新）。入库/体检这类
+        # 分钟级操作走 long_lock —— 否则进度页与"停止"会被一起堵住。
         self.lock = threading.Lock()
+        self.long_lock = threading.Lock()
         text = read_cars_file(args)
         self.cars = tuple(parse_cars(text))
-        self.cars_src_text = text
         self.problems = validate_cars(self.cars)
         # 远端从 vm-bench.env 子 shell 解析 RESULTS_ROOT；本地只读页面可显式提供。
         if args.ssh:
@@ -1763,12 +1771,6 @@ class ComposeState:
             self._hist = load_history(self.args)
             self._hist_at = now
             return self._hist
-
-    def build_of(self, car_name):
-        for a in self.cars:
-            if a.name == car_name:
-                return a.build
-        return ''
 
 
 def api_snapshot(st, body):
@@ -1890,7 +1892,13 @@ def api_campaigns(st):
     """全部 campaign 的轻量摘要 + 默认该看的（最新没收尾的）。"""
     with st.lock:
         sums = Q.campaign_summaries(st.src)
-    return 200, {'campaigns': sums[:300], 'active': Q.pick_active(sums)}
+    shown = sums[:300]
+    # active 必须落在返回的这一段里：summaries 有上限，pick_active 用的是全量，
+    # 选中被截掉的那一条会让前端静默回退到第一项（显示的是另一个 campaign）。
+    active = Q.pick_active(sums)
+    if active not in {s['cid'] for s in shown}:
+        active = shown[0]['cid'] if shown else None
+    return 200, {'campaigns': shown, 'active': active, 'total': len(sums)}
 
 
 def api_queue(st, cid):
@@ -1977,7 +1985,8 @@ def api_doctor(st):
     """
     cmd = 'cd %s && if [ -f doctor.sh ]; then bash doctor.sh; else echo MISSING; fi' \
           % shlex.quote(st.args.root)
-    with st.lock:
+    # 体检最长 5 分钟且只读：走 long_lock，不挡进度页与"停止"
+    with st.long_lock:
         rc, out = ssh_run(st.args.ssh, cmd, timeout=300)
     if 'MISSING' in out:
         return 400, {'error': '远端 %s 没有 doctor.sh —— 新环境体检脚本随仓库分发，'
@@ -2102,11 +2111,36 @@ def api_exports(st):
     return 200, {'exports': exports}
 
 
+def _trend_series_keys(st, car, track, auth, es_url, limit=500):
+    """该车在该赛道的身份线（series_key）集合。
+
+    `benchmark-result-metric` 没有 car_code 字段，趋势页要按车筛选，只能先用
+    race 索引（有 car_code + series_key）定位身份线，再到指标索引取数。
+    超过 limit 说明同一车号挂了太多 build —— 报错让使用者收窄口径，不静默截断。
+    """
+    body = {'size': 2000, '_source': ['series_key'],
+            'query': {'bool': {'filter': [{'term': {'car_code': car}},
+                                          {'term': {'track': track}}]}}}
+    resp = H.es_query(st.args.ssh, body, auth=auth, es_url=es_url,
+                      path='benchmark-result-race/_search', timeout=60)
+    keys = sorted({(h.get('_source') or {}).get('series_key')
+                   for h in (resp.get('hits') or {}).get('hits') or []} - {None, ''})
+    if len(keys) > limit:
+        raise H.HistoryUnavailable('该车在该赛道有 %d 条身份线，超过上限 %d —— '
+                                   '请先按 build/JDK 收窄口径' % (len(keys), limit))
+    return keys
+
+
 def api_trend(st, q):
     """跨 campaign 指标趋势：只读指标库（bench-history 同一条 ssh/curl 取数路径）。
 
     指标库没跑/没配口令时返回 available=False —— 界面显示原因，绝不把空数据
     当"没有趋势"。分组键 = series_key | 变体 | 操作 | stat，同车多 build 天然分线。
+
+    车代号怎么落到指标行上：`benchmark-result-metric` 里**没有 car_code 字段**
+    （只有 series_key / comparison_key / track），所以先在 race 索引定位这辆车的
+    series_key 集合，再用 terms 查指标。早先直接在指标索引上 term car_code，
+    对未映射字段查询不报错、只是零命中 —— 整页永远画不出线。
     """
     car = (q.get('car') or [''])[0].strip()
     track = (q.get('track') or [''])[0].strip()
@@ -2123,7 +2157,17 @@ def api_trend(st, q):
     if not auth:
         return 200, {'available': False,
                      'error': '未配置指标库口令（--es-auth 或环境变量 RACEWAY_ES_AUTH）'}
-    filt = [{'term': {'car_code': car}}, {'term': {'track': track}}, {'term': {'trusted': True}}]
+    es_url = getattr(st.args, 'es_url', None) or H.DEFAULT_ES_URL
+    try:
+        keys = _trend_series_keys(st, car, track, auth, es_url)
+    except H.HistoryUnavailable as e:
+        return 200, {'available': False, 'error': str(e)}
+    if not keys:
+        return 200, {'available': True, 'n': 0, 'unit': None, 'direction': None,
+                     'series': [],
+                     'note': '这辆车在这条赛道上还没有入库场次（先跑一场并入库）'}
+    filt = [{'terms': {'series_key': keys}}, {'term': {'track': track}},
+            {'term': {'trusted': True}}]
     if family:
         filt.append({'term': {'family': family}})
     if stat:
@@ -2135,8 +2179,7 @@ def api_trend(st, q):
                         'value', 'unit', 'direction', 'track_variant'],
             'sort': [{'run_start': 'asc'}]}
     try:
-        resp = H.es_query(st.args.ssh, body, auth=auth,
-                          es_url=getattr(st.args, 'es_url', None) or H.DEFAULT_ES_URL,
+        resp = H.es_query(st.args.ssh, body, auth=auth, es_url=es_url,
                           path='benchmark-result-metric/_search', timeout=60)
     except H.HistoryUnavailable as e:
         return 200, {'available': False, 'error': str(e)}
@@ -2156,6 +2199,19 @@ def api_trend(st, q):
         direction = direction or s.get('direction')
     return 200, {'available': True, 'n': total, 'unit': unit, 'direction': direction,
                  'series': [{'key': k, 'points': v} for k, v in sorted(groups.items())]}
+
+
+# 远端固定 bootstrap：从 stdin 读 JSON（源码 + 参数 + 凭据）再执行。
+# 这样口令不会出现在远端 ps 的 argv 里，参数也不需要经过一层 shell 引号拼接。
+# 只有这段固定串会出现在 ssh 命令行上，它不含任何机密。
+APPLY_BOOTSTRAP = (
+    'import json, sys\n'
+    'p = json.load(sys.stdin)\n'
+    'sys.argv = ["bench-apply.py"] + p["argv"]\n'
+    'exec(compile(p["script"], "<bench-apply.py>", "exec"),\n'
+    '     {"__name__": "__main__", "__file__": "<raceway-stdin>",'
+    ' "RACEWAY_AUTH": p.get("auth")})\n'
+)
 
 
 def api_apply(st, body):
@@ -2181,15 +2237,20 @@ def api_apply(st, body):
             script = f.read()
     except OSError as e:
         return 400, {'error': '读不到本机 bench-apply.py: %s' % e}
-    cmd = ('cd %s && python3 -B - --dir %s --es %s%s%s%s'
-           % (shlex.quote(st.args.root),
-              shlex.quote(posixpath.join(st.args.root, 'exports', export)),
-              shlex.quote(es),
-              (' --auth ' + shlex.quote(auth)) if auth else '',
-              ' --insecure' if insecure else '',
-              ' --drop' if drop else ''))
-    with st.lock:
-        rc, out = ssh_run(st.args.ssh, cmd, input_text=script, timeout=900)
+    argv = ['--dir', posixpath.join(st.args.root, 'exports', export), '--es', es]
+    if insecure:
+        argv.append('--insecure')
+    if drop:
+        argv.append('--drop')
+    # 脚本与凭据都走 stdin（JSON 信封）：远端 ps 里只剩一段固定 bootstrap，
+    # 看不到口令，也不再依赖 shlex 拼参数。bench-apply.py 从 RACEWAY_AUTH 取凭据。
+    payload = json.dumps({'script': script, 'argv': argv, 'auth': auth or None})
+    cmd = 'cd %s && python3 -B -c %s' % (shlex.quote(st.args.root),
+                                        shlex.quote(APPLY_BOOTSTRAP))
+    # 长操作不占 st.lock：入库要跑几分钟，占着它就等于把进度页和"停止"一起锁死，
+    # 而那正是最需要止损的时候。st.long_lock 只保证不并发入库。
+    with st.long_lock:
+        rc, out = ssh_run(st.args.ssh, cmd, input_text=payload, timeout=900)
     return 200, {'result': out, 'rc': rc}
 
 
@@ -2208,25 +2269,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # 允许的本机回环名：ssh -L 转发后习惯用 localhost 打开，只认 127.0.0.1
+    # 会让人看到一个不可行动的 "forbidden host"。仍然是同源守卫（防 DNS rebinding），
+    # 只是把三种回环写法都放进来。
+    def _allowed_hosts(self):
+        port = self.server.server_address[1]
+        return {'127.0.0.1:%d' % port, 'localhost:%d' % port, '[::1]:%d' % port}
+
     def _local_request(self, write=False):
-        expected = '127.0.0.1:%d' % self.server.server_address[1]
-        if self.headers.get('Host') != expected:
-            return False  # 包括 DNS rebinding；页面统一由 127.0.0.1 打开。
+        """同源守卫。通过返回 None，否则返回**可行动**的中文原因。"""
+        allowed = self._allowed_hosts()
+        host = self.headers.get('Host') or ''
+        if host not in allowed:
+            return ('不认识的 Host: %r。控制台只接受本机回环地址（%s）。'
+                    ' 用 ssh -L 转发时请直接打开 http://127.0.0.1:%d。'
+                    % (host, ' / '.join(sorted(allowed)), self.server.server_address[1]))
         if write:
             origin = self.headers.get('Origin')
-            if origin is not None and origin != 'http://' + expected:
-                return False
-            if self.headers.get('Sec-Fetch-Site') not in (None, 'same-origin', 'none'):
-                return False
+            if origin is not None and origin not in {'http://' + h for h in allowed}:
+                return 'Origin %r 与本机不同源，写操作被拒绝' % origin
+            site = self.headers.get('Sec-Fetch-Site')
+            if site not in (None, 'same-origin', 'none'):
+                return 'Sec-Fetch-Site=%r：跨站写操作被拒绝' % site
             token = self.headers.get('X-Raceway-CSRF') or ''
             if (not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', token)
                     or not secrets.compare_digest(token, self.server.state.csrf_token)):
-                return False
+                return 'CSRF 令牌缺失或不匹配（控制台重启后令牌会变）—— 刷新页面重试'
+        return None
+
+    def _guard(self, write=False):
+        """守卫不通过时直接回 403 并返回 True。"""
+        why = self._local_request(write=write)
+        if not why:
+            return False
+        self._send(403, 'application/json',
+                   json.dumps({'error': why}, ensure_ascii=False))
         return True
 
     def do_GET(self):
-        if not self._local_request():
-            return self._send(403, 'application/json', '{"error":"forbidden host"}')
+        if self._guard():
+            return
         u = urlparse(self.path)
         q = parse_qs(u.query)
         st = self.server.state
@@ -2291,8 +2373,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         st = self.server.state
-        if not self._local_request(write=True):
-            return self._send(403, 'application/json', '{"error":"forbidden origin or CSRF token"}')
+        if self._guard(write=True):
+            return
         if self.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/json':
             return self._send(415, 'application/json', '{"error":"application/json required"}')
         try:

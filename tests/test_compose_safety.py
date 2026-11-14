@@ -27,7 +27,8 @@ def state():
     return types.SimpleNamespace(cars=tuple(C.parse_cars(CARS)),
                                  args=types.SimpleNamespace(root='/opt/raceway', ssh='review@never-connect',
                                                             ds_hours=0, camp_prefix=None),
-                                 lock=threading.Lock(), history=lambda: H.Coverage(available=False))
+                                 lock=threading.Lock(), long_lock=threading.Lock(),
+                                 history=lambda: H.Coverage(available=False))
 
 
 def body(**changes):
@@ -328,14 +329,21 @@ class TestServiceSafety(NoExternalCalls):
         return handler
 
     def test_host_origin_and_csrf(self):
-        good={'Host':'127.0.0.1:8802', 'Origin':'http://127.0.0.1:8802',
-              'X-Raceway-CSRF':'secret', 'Sec-Fetch-Site':'same-origin'}
-        self.assertTrue(self.handler(good)._local_request(write=True))
-        for changes in ({'Host':'evil.example:8802'}, {'Origin':'http://evil.example'},
-                        {'Origin':'null'}, {'X-Raceway-CSRF':''}, {'X-Raceway-CSRF':'非ASCII'},
-                        {'Sec-Fetch-Site':'cross-site'}):
-            self.assertFalse(self.handler(dict(good, **changes))._local_request(write=True))
-        self.assertFalse(self.handler({'Host':'127.0.0.1:8802'})._local_request(write=True))
+        """守卫返回 None=放行，返回字符串=拒绝原因（直接显示给用户，要可行动）。"""
+        good = {'Host': '127.0.0.1:8802', 'Origin': 'http://127.0.0.1:8802',
+                'X-Raceway-CSRF': 'secret', 'Sec-Fetch-Site': 'same-origin'}
+        self.assertIsNone(self.handler(good)._local_request(write=True))
+        # 三种回环写法都放行（ssh -L 转发后习惯用 localhost 打开）
+        for host in ('localhost:8802', '[::1]:8802'):
+            self.assertIsNone(self.handler(dict(good, Host=host))._local_request(write=True))
+        for changes in ({'Host': 'evil.example:8802'}, {'Origin': 'http://evil.example'},
+                        {'Origin': 'null'}, {'X-Raceway-CSRF': ''}, {'X-Raceway-CSRF': '非ASCII'},
+                        {'Sec-Fetch-Site': 'cross-site'}):
+            why = self.handler(dict(good, **changes))._local_request(write=True)
+            self.assertIsInstance(why, str)
+            self.assertTrue(why, '拒绝时必须给出原因')
+        why = self.handler({'Host': '127.0.0.1:8802'})._local_request(write=True)
+        self.assertIn('CSRF', why)
 
     def test_bind_is_local_and_bootstrap_omits_secrets(self):
         import inspect
@@ -501,28 +509,100 @@ class TestTracksExportsApply(NoExternalCalls):
             with self.subTest(b=b):
                 self.assertEqual(C.api_apply(st, b)[0], 400)
 
-    def test_apply_builds_command_with_flags_and_dir_under_exports(self):
+    def test_apply_passes_flags_via_stdin_envelope(self):
+        """参数与凭据都走 stdin 的 JSON 信封：远端 ps 里看不到口令。"""
         st = state()
         with patch.object(C, 'ssh_run', return_value=(0, '完成')) as run:
             code, _ = C.api_apply(st, {'export': 't1', 'es': 'https://127.0.0.1:9237',
                                        'auth': 'admin:pw', 'insecure': True, 'drop': True})
         self.assertEqual(code, 200)
         cmd = run.call_args.args[1]
-        self.assertIn('--drop', cmd)
-        self.assertIn('--insecure', cmd)
-        self.assertIn('--auth admin:pw', cmd)
-        self.assertIn('/exports/t1', cmd)
-        self.assertTrue(run.call_args.kwargs.get('input_text', '').startswith('#!'))
+        self.assertNotIn('admin:pw', cmd)          # 口令绝不落在命令行/argv 上
+        self.assertNotIn('--auth', cmd)
+        self.assertIn('python3 -B -c', cmd)
+        env = json.loads(run.call_args.kwargs['input_text'])
+        self.assertEqual(env['auth'], 'admin:pw')
+        self.assertEqual(env['argv'][:2], ['--dir', '/opt/raceway/exports/t1'])
+        self.assertIn('--drop', env['argv'])
+        self.assertIn('--insecure', env['argv'])
+        self.assertTrue(env['script'].startswith('#!'))
 
     def test_apply_without_auth_and_flags_omits_them(self):
         st = state()
         with patch.object(C, 'ssh_run', return_value=(0, '完成')) as run:
             code, _ = C.api_apply(st, {'export': 't1', 'es': 'http://localhost:9200'})
         self.assertEqual(code, 200)
-        cmd = run.call_args.args[1]
-        self.assertNotIn('--auth', cmd)
-        self.assertNotIn('--drop', cmd)
-        self.assertNotIn('--insecure', cmd)
+        env = json.loads(run.call_args.kwargs['input_text'])
+        self.assertIsNone(env['auth'])
+        for flag in ('--drop', '--insecure', '--auth'):
+            self.assertNotIn(flag, env['argv'])
+
+    def test_trend_resolves_car_through_race_index(self):
+        """趋势页必须先用 race 索引把车代号换成 series_key，再查指标索引。
+
+        回归点：`benchmark-result-metric` 里没有 car_code 字段，
+        直接对它 term car_code 只会零命中（页面永远空），而且不报错。
+        """
+        calls = []
+
+        def fake_query(ssh, body, auth=None, es_url=None, path=None, timeout=None):
+            calls.append((path, body))
+            if path.startswith('benchmark-result-race'):
+                return {'hits': {'hits': [{'_source': {'series_key': 'ez@2.5.0@3015@kona25'}}]}}
+            return {'hits': {'hits': [{'_source': {
+                'value': 1234.0, 'stat': 'p50', 'task': 'index-append', 'unit': 'docs/s',
+                'direction': 'higher-better', 'series_key': 'ez@2.5.0@3015@kona25',
+                'track_variant': 'geonames', 'campaign': 'c1',
+                'run_start': '2026-11-01T00:00:00Z'}}]}}
+
+        st = state()
+        st.args = types.SimpleNamespace(root='/opt/raceway', ssh=None, es_auth='u:p', es_url=None)
+        with patch.object(H, 'es_query', side_effect=fake_query):
+            code, payload = C.api_trend(st, {'car': ['ez3015'], 'track': ['geonames']})
+        self.assertEqual(code, 200)
+        self.assertEqual(payload['n'], 1)
+        self.assertEqual(len(calls), 2)
+        race_path, race_body = calls[0]
+        self.assertIn('benchmark-result-race', race_path)
+        self.assertEqual(race_body['query']['bool']['filter'][0], {'term': {'car_code': 'ez3015'}})
+        metric_path, metric_body = calls[1]
+        self.assertIn('benchmark-result-metric', metric_path)
+        filters = metric_body['query']['bool']['filter']
+        self.assertIn({'terms': {'series_key': ['ez@2.5.0@3015@kona25']}}, filters)
+        self.assertNotIn('car_code', repr(filters))   # 指标索引没有这个字段
+
+    def test_trend_reports_empty_car_without_querying_metrics(self):
+        st = state()
+        st.args = types.SimpleNamespace(root='/opt/raceway', ssh=None, es_auth='u:p', es_url=None)
+        with patch.object(H, 'es_query', return_value={'hits': {'hits': []}}) as q:
+            code, payload = C.api_trend(st, {'car': ['ez3015'], 'track': ['geonames']})
+        self.assertEqual(code, 200)
+        self.assertEqual(payload['series'], [])
+        self.assertIn('还没有入库场次', payload['note'])
+        self.assertEqual(q.call_count, 1)
+
+
+
+class ApplyEnvelopeTest(unittest.TestCase):
+    """真正起一个 python 进程跑 bench-apply.py —— 验证 stdin 信封通道本身可用。
+
+    单独成类：TestTracksExportsApply 继承 NoExternalCalls（禁 subprocess），
+    而这条测试必须起进程才能证明"脚本+参数+凭据能一起过 stdin"。
+    不起 ssh、不连 ES，进程在预检阶段就以 rc=2 退出。
+    """
+
+    def test_envelope_runs_the_real_script(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(C.__file__).with_name('bench-apply.py').read_text(encoding='utf-8')
+            env = json.dumps({'script': script,
+                              'argv': ['--dir', d, '--es', 'http://127.0.0.1:9'],
+                              'auth': 'u:p'})
+            out = subprocess.run([sys.executable, '-B', '-c', C.APPLY_BOOTSTRAP],
+                                 input=env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn('入库预检失败', out.stderr)
+        # 凭据只走 stdin：进程命令行里不该出现口令
+        self.assertNotIn('u:p', C.APPLY_BOOTSTRAP)
 
 
 if __name__ == '__main__':
