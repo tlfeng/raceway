@@ -86,12 +86,14 @@ def row_build_key(r):
     b = r.get('engine_build')
     return ('%s@%s' % (car, b)) if (car and b) else (car or '')
 
-# 判定失败的状态（与 bench-queue 的 STATUS_FAILS 对齐，只取库里真会出现的）
+# 判定失败的状态（与 bench-queue 的 STATUS_FAILS 必须逐字相同。
+# 两份表是复制关系 —— tests/test_queue.py 会读这两个文件比对，漂移即失败）
 FAIL_STATUSES = (
     'ENGINE-FAIL', 'JDK-SWAP-FAIL', 'JDK-FIX-FAIL', 'JDK-ASSERT-FAIL',
     'COLD-START-FAIL', 'CLUSTER-NOT-READY', 'HEAP-ASSERT-FAIL',
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
     'SEG-ASSERT-FAIL', 'ENV-FAIL', 'RACE-FAIL',
+    'STOP-FAIL', 'CLEAN-FAIL', 'TASKS-FAIL',
 )
 SKIP_STATUSES = ('SKIP', 'DEADLINE-SKIP')
 
@@ -122,7 +124,6 @@ class HistoryUnavailable(Exception):
 # 覆盖判定必须带变体：库里 track 字段是**基础赛道**（"geo"/"hnsw"/…），
 # 压缩与 source_reuse 是另外两个维度。若覆盖键只用 (车, 赛道, 轮次)，6 个变体的
 # 历史会混成一格 —— "ZSTD+sr 跑过"会被当成"default 也跑过"，把没跑的格误判成已覆盖。
-CODEC_TOKEN = {'default': 'def', 'ZSTD': 'zstd', 'zstd': 'zstd', 'best_compression': 'bc'}
 # ↑ 'zstd' 小写别名：入库 codec 列是归一小写（CANON_CODEC），variant_id_of 从列值
 #   派生变体 id 时要能命中；'ZSTD' 大写键保留给变体 id 反推路径（compression_of）。
 TOKEN_CODEC = {'def': 'default', 'zstd': 'ZSTD', 'bc': 'best_compression'}
@@ -215,16 +216,6 @@ def engines_of(tid):
     if source_reuse_of(tid) or compression_of(tid) == 'ZSTD':
         return 'easysearch'
     return None
-
-
-def variant_of(track, codec, sr):
-    """(基础赛道, 压缩, source_reuse) → 变体 id；没有压缩就是基础赛道本身。"""
-    if not codec:
-        return track
-    token = CODEC_TOKEN.get(codec)
-    if not token:
-        return track
-    return '%s-codec-%s%s' % (track, token, '-sr' if sr == 'true' else '')
 
 
 def variant_id_of(row):
@@ -428,11 +419,6 @@ def _phases_of(row):
     elif phase in ('w', 'q'):
         phases.add(phase)
     return phases
-
-
-def _expected_phases(row):
-    """当前 runner 的可排赛道一律要求写查两段，与已落档的 challenge 无关。"""
-    return {'w', 'q'}
 
 
 def _measurement_key(row, ordinal):
@@ -831,8 +817,3 @@ def filter_rows(plan, rows):
     """按编排计划剔除已覆盖的格。rows 是 (车, 赛道, 轮次) 序列。"""
     skip = set((c['car'], c['track'], c['round']) for c in plan['skipped'])
     return [r for r in rows if (r[0], r[1], r[2]) not in skip]
-
-
-def if_empty(coverage):
-    """指标库不可用时的占位覆盖表（界面据此显示"未连接"而不是"全空"）。"""
-    return Coverage(available=False, error=coverage.error if coverage else '未配置指标库')

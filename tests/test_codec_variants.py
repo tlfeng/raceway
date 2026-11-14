@@ -346,6 +346,21 @@ class TestTrackNameHelpText(unittest.TestCase):
     REJECT = 'track 参数必须是'
     PH = '\x00'          # 占位符哨兵：<> 里是形态说明，不是能直接跑的名字
 
+    @classmethod
+    def setUpClass(cls):
+        # 这里跑的是 runner 的真身，而 runner 用了关联数组（declare -A）等 bash 4 特性。
+        # macOS 自带 bash 3.2：空数组在 set -u 下展开会直接崩，报的是 `_pos[@]: unbound`，
+        # 与"文案与实现不一致"毫无关系 —— 版本不够就明确跳过，别让人误判成代码坏了。
+        probe = subprocess.run(['bash', '-c', 'echo ${BASH_VERSINFO[0]}'],
+                               capture_output=True, text=True)
+        try:
+            major = int((probe.stdout or '0').strip())
+        except ValueError:
+            major = 0
+        if major < 4:
+            raise unittest.SkipTest('需 bash ≥ 4（当前 %s）；压测机为 Linux，macOS 自带 3.2 不支持'
+                                    % (probe.stdout or '?').strip())
+
     def _prepare(self, d):
         shutil.copy(os.path.join(ROOT, 'run-bench.sh'), d)
         shutil.copy(os.path.join(ROOT, 'vm-bench-lib.sh'), d)
@@ -717,7 +732,6 @@ class TestHistoryVariantDimension(unittest.TestCase):
         comp, sr = E.codec_dims({'user-tags': {'codec': 'ZSTD+source_reuse'}}, None)
         self.assertEqual(comp, 'ZSTD')
         self.assertEqual(sr, 'true')
-        self.assertEqual(H.variant_of('geo', comp, sr), 'geo-codec-zstd-sr')
 
     def test_non_codec_row_keeps_base_track(self):
         cov = H.build_coverage([self._row(track='ds-j1024', track_raw='ds-j1024',
