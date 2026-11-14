@@ -353,19 +353,27 @@ def track_dashboard_id(track, variant):
     return 'bench-' + track if variant == runner_base(track) else 'bench-%s-variant-%s' % (track, variant)
 
 
-def build_track_dashboard(track, groups, interval, time_from, time_to, variant=None):
+def build_track_dashboard(track, groups, interval, time_from, time_to, variant=None, reserved=()):
     variant = variant or runner_base(track)
     scope = variant_scope(track, variant)
     dash_id = track_dashboard_id(track, variant)
     objects, dropped = [], []
+
+    def _pid(suffix):
+        # 面板 id = 看板 id + 后缀，但兄弟赛道的看板 id 也长这样
+        # （如基座 hv1024x-os 的存储面板 bench-hv1024x-os-disk 撞上 hv1024x-os-disk 看板），
+        # 撞 reserved 时改用 -res- 前缀，面板 id 永不冒充看板 id。
+        pid = dash_id + suffix
+        return dash_id + '-res-' + suffix if pid in reserved else pid
+
     for key, title, filt, fmt, terms, metric_type, iv in track_panel_specs(track, groups, interval):
         if not panel_has_data(filt, scope):
             dropped.append((title, '该固定 variant / 测量可信度口径下没有数据'))
             continue
-        objects.append(visualization_obj(dash_id + '-' + key, title, filt, fmt, terms, metric_type, iv))
+        objects.append(visualization_obj(_pid('-' + key), title, filt, fmt, terms, metric_type, iv))
     if dropped:
         md = '**未出图指标**\n\n' + '\n'.join('- %s：%s' % row for row in dropped)
-        objects.append(markdown_obj(dash_id + '-nodata', '未出图指标', md))
+        objects.append(markdown_obj(_pid('-nodata'), '未出图指标', md))
     title = 'Benchmark · %s · %s' % (track, variant)
     return dashboard_objects(dash_id, title, objects, time_from, time_to, scope,
                              '固定 runner variant；实验分线 comparison_key；跨圈中位，错误率最坏值。'), dropped
@@ -688,9 +696,12 @@ def main():
         raise ValueError('指标库没有可建板的场次')
     track_info = []
     tf, tt = data_window()
+    # 所有看板 id 先行预留：任何面板 id 都不允许与（现有或将建的）看板 id 同名
+    reserved = {track_dashboard_id(t, v) for t, f in facts.items() for v in f['variants']}
     for track, fact in sorted(facts.items()):
         for variant, info in sorted(fact['variants'].items()):
-            built, _dropped = build_track_dashboard(track, group_tasks(info['tasks']), '1d', tf, tt, variant)
+            built, _dropped = build_track_dashboard(track, group_tasks(info['tasks']), '1d', tf, tt, variant,
+                                                    reserved=reserved)
             objects.extend(built)
             track_info.append((track, {'variant': variant, 'dashboard': track_dashboard_id(track, variant),
                                       'runs': es_track_runs(track, variant)['runs']}))
