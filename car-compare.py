@@ -202,23 +202,43 @@ def load_thresholds(path):
     return rules
 
 
-def run_asserts(data, b, rules):
-    """对 B 车逐规则判中位；返回失败数。吞吐越高越好(>=)，延迟越低越好(<=)。"""
-    fails = 0
-    print(f"\n## 断言（对象 B={b} 的中位）")
+def evaluate_asserts(data, side, rules):
+    """逐规则判 `side` 侧中位，返回结构化结果（**不打印**）。
+
+    口径：吞吐越高越好(>=)、延迟越低越好(<=)；每条规则至少 3 个有限有效测量，
+    不足 3 个判 FAIL（样本不够就不能说达标）。侧别单独传，不写死 "B" —— 写死
+    会在 --json 里出现"对象 B=B"这种把侧别名当车名的输出。
+    """
+    out = []
     for track, task, metric, cmp_op, thr in rules:
-        rounds = data.get((b, track), {})
-        vals = [rounds[r][side].get((metric, task))
-                for r in sorted(rounds) for side in ("w", "q") if side in rounds[r]]
+        rounds = data.get((side, track), {})
+        vals = [rounds[r][p].get((metric, task))
+                for r in sorted(rounds) for p in ("w", "q") if p in rounds[r]]
         vals = [v for v in vals if finite(v)]
         m = med(vals)
-        ok = len(vals) >= 3 and m is not None and ((cmp_op == ">=" and m >= thr) or (cmp_op == "<=" and m <= thr))
-        shown = f"{m:,.1f}" if m is not None else "无数据"
-        mark = "PASS" if ok else "FAIL"
-        if not ok:
-            fails += 1
-        print(f"  [{mark}] {track}/{task} {metric}: {shown} {cmp_op} {thr:,.0f}（n={len([v for v in vals if v is not None])}）")
+        ok = (len(vals) >= 3 and m is not None
+              and ((cmp_op == ">=" and m >= thr) or (cmp_op == "<=" and m <= thr)))
+        out.append({"track": track, "task": task, "metric": metric, "op": cmp_op,
+                    "threshold": thr, "median": m, "n": len(vals), "pass": ok})
+    return out
+
+
+def print_asserts(checks, car_label, stream=sys.stdout):
+    """把 evaluate_asserts 的结果打成表；返回 FAIL 条数。"""
+    print("\n## 断言（对象 B=%s 的中位）" % car_label, file=stream)
+    fails = 0
+    for c in checks:
+        shown = ("{:,.1f}".format(c["median"]) if c["median"] is not None else "无数据")
+        print("  [{}] {}/{} {}: {} {} {}（n={}）".format(
+            "PASS" if c["pass"] else "FAIL", c["track"], c["task"], c["metric"],
+            shown, c["op"], format(c["threshold"], ",.0f"), c["n"]), file=stream)
+        fails += 0 if c["pass"] else 1
     return fails
+
+
+def run_asserts(data, side, rules, car_label="B", stream=sys.stdout):
+    """判断言并打表；返回 FAIL 条数（命令行默认路径）。"""
+    return print_asserts(evaluate_asserts(data, side, rules), car_label, stream)
 
 
 def json_payload(data, a, b, tracks, camps, rules):
@@ -245,7 +265,9 @@ def json_payload(data, a, b, tracks, camps, rules):
                "campaigns": [os.path.basename(c) for c in camps],
                "tracks": tracks_out}
     if rules is not None:
-        payload["asserts"] = {"fails": run_asserts(data, "B", rules), "rules": rules}
+        checks = evaluate_asserts(data, "B", rules)
+        payload["asserts"] = {"fails": sum(1 for c in checks if not c["pass"]),
+                              "rules": rules, "checks": checks}
     return payload
 
 
@@ -305,7 +327,7 @@ def main():
         ws = [r for r in rounds if "w" in rounds[r]]
         print(f"  池: car={car} track={track} 有效轮={len(ws)} 来自 {[rounds[r]['camp'] for r in sorted(ws)]}")
     if rules is not None:
-        fails = run_asserts(data, "B", rules)
+        fails = run_asserts(data, "B", rules, car_label=b)
         print(f"\n断言结果: {'全部通过' if fails == 0 else f'{fails} 条 FAIL'}")
         return 1 if fails else 0
     return 0

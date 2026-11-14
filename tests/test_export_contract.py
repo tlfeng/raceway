@@ -172,8 +172,17 @@ class TestExportContract(ExportFixture):
 
     def test_index_type_fid_inference_and_jinja_rejection(self):
         self.assertEqual(E.index_type_of({}, 'hv1024x-int8-codec-zstd-sr'), 'int8_hnsw')
+        # 未渲染的 Jinja 模板 = 没测到 → 回落到赛道名推导值（旧 campaign 不能被它拖垮整批导出）
+        self.assertEqual(
+            E.index_type_of({'run_params': {'knn_params': {'index_type': '{{ vector_index_type }}'}}},
+                            'hv1024x-int8'), 'int8_hnsw')
+        # 非量化档位没有可推导的值 → 如实返回 None（"未测到"），不凭空造类型
+        self.assertIsNone(
+            E.index_type_of({'run_params': {'knn_params': {'index_type': "{{ x | default('hnsw') }}"}}},
+                            'hv1024x'))
+        # 其它非法值仍然 fail closed：说不清就不许猜
         with self.assertRaises(ValueError):
-            E.index_type_of({'run_params': {'knn_params': {'index_type': '{{ vector_index_type }}'}}}, 'hv1024x-int8')
+            E.index_type_of({'run_params': {'knn_params': {'index_type': 'HNSW/int8 bad'}}}, 'hv1024x')
 
     def test_missing_monitor_nodes_or_bad_verdict_not_exported(self):
         for case, kwargs in [('missing', {'nodes': ('node-alpha',)}), ('warn', {'verdict': 'WARN'}),

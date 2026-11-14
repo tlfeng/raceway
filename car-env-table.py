@@ -11,10 +11,6 @@ import statistics
 from result_selection import finite, monitor_summary, select_measurements
 
 
-def summary_of(camp_dir, fid, phases=None, expected_nodes=None):
-    return monitor_summary(camp_dir, fid, phases, expected_nodes)
-
-
 def collect(camps):
     rows = []
     for camp in dict.fromkeys(camps):
