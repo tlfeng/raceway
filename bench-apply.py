@@ -256,12 +256,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
     ap.add_argument("--es", required=True)
-    ap.add_argument("--auth", default=None, help="user:pass；无鉴权集群留空")
+    ap.add_argument("--auth", default=None,
+                    help="user:pass；无鉴权集群留空。命令行传会进 argv（远端 ps 可见），"
+                         "控制台走 RACEWAY_AUTH（stdin 通道）")
     ap.add_argument("--insecure", action="store_true")
     ap.add_argument("--only", default=",".join(IDX))
     ap.add_argument("--batch", type=int, default=1000)
     ap.add_argument("--drop", action="store_true", help="先删除三张索引（mapping 变更时必需）")
     args = ap.parse_args()
+    # 凭据优先取 RACEWAY_AUTH：控制台通过 stdin 的 JSON 信封注入（见 bench-compose
+    # 的 APPLY_BOOTSTRAP），避免口令出现在远端 ps 的 argv 里。
+    if not args.auth:
+        args.auth = globals().get("RACEWAY_AUTH") or None
 
     want = [i.strip() for i in args.only.split(",")]
     if args.batch <= 0 or not want or any(i not in IDX for i in want) or len(set(want)) != len(want):
