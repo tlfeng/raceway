@@ -130,6 +130,7 @@ python3 bench-compose.py start --cars-file <f> --tracks ds-* --rounds 3 --ds-hou
 | [docs/GUIDE.md](docs/GUIDE.md) | 使用手册：上篇「怎么跑」，下篇「跑起来之后」（分层、脚本清单、单场流程、赛道、控制台、规则与后果） |
 | [docs/METHODOLOGY.md](docs/METHODOLOGY.md) | 方法学与口径：卡点链、统计口径、时延口径、三张索引的字段与词表 |
 | [docs/hv1024-track.md](docs/hv1024-track.md) | hv1024 赛道的数据来源与制作方法 |
+| [docs/TESTING.md](docs/TESTING.md) | 测试怎么跑：宿主要求（Linux/WSL + bash ≥ 4）、用例在守什么、加用例的规矩 |
 | [tracks/README.md](tracks/README.md) | 赛道定义定版目录：规矩、目录现状、压测机侧待办 |
 
 ## 环境要求
