@@ -23,6 +23,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 文件名带连字符，只能用 importlib 导入
 Q = importlib.import_module('bench-queue')  # noqa: E402
@@ -407,10 +408,12 @@ class TestCampaignSummaries(unittest.TestCase):
         write(os.path.join(self.root, cid, 'RACES.md'), '\n'.join(races) + '\n')
 
     def test_summary_from_parts(self):
+        # 第 3/4 列已经是**去重后的场次数**（远端 awk / 本地 field_counts 同一口径），
+        # 这里不再减表头：减 2 会把"2 场 + 一次重试"算成 3。
         s = Q._summary_from_parts('c1', '1770000000', '4', '2', '1', '1',
                                   '[2026-10-20 11:00:00] campaign 结束: 2/2 场有效。')
         self.assertEqual(s['cid'], 'c1')
-        self.assertEqual(s['total'], 2)      # 4 行 - 表头 + 分隔线 2 行
+        self.assertEqual(s['total'], 4)
         self.assertEqual(s['valid'], 2)
         self.assertTrue(s['ended'])
         s2 = Q._summary_from_parts('c2', 'x', '0', '', '1', '0',
@@ -468,22 +471,66 @@ class TestCampaignSummaries(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_remote_script_executes_against_fixture(self):
-        """远端脚本不在 ssh 环境也能跑对：直接用本地 bash 执行同一份脚本比对输出。"""
+        """远端脚本不在 ssh 环境也能跑对：直接用本地 bash 执行同一份脚本比对输出。
+
+        夹具刻意混入 `-try2`：重试是同一场的第 N 次尝试，不能把总数抬高
+        （否则同一份 campaign 在命令行 `list` 与网页列表页会显示不同数字）。
+        """
         bash = shutil.which('bash')
         if not bash:
             self.skipTest('本机没有 bash')
-        self._camp('a-old', True, [('a-geo-r1', 'VALID'), ('a-geo-r2', 'VALID')])
+        self._camp('a-old', True, [('a-geo-r1', 'VALID'), ('a-geo-r2', 'VALID'),
+                                   ('a-geo-r2-try2', 'RACE-FAIL')])
         p = subprocess.run([bash], input=Q.remote_summaries_script(self.root),
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         rows = {x.split('\t')[0]: x.split('\t') for x in p.stdout.splitlines() if x}
         self.assertIn('a-old', rows)
         r = rows['a-old']
-        self.assertEqual(r[2], '4')    # raw 行数（含表头+分隔线）
-        self.assertEqual(r[3], '2')    # VALID 行数
+        self.assertEqual(r[2], '2')    # 去重后的场次数（2 场 + 1 次重试 = 2）
+        self.assertEqual(r[3], '2')    # VALID 场次数
         self.assertEqual(r[4], '1')    # 起跑头行数
         self.assertEqual(r[5], '1')    # 结束行数
         self.assertIn('campaign 结束', r[6])
+
+    def test_field_counts_dedupes_retries(self):
+        """本地分支与远端 awk 必须给出同一个数字：按基础 fid 去重。"""
+        text = ('| 场次 | 状态 | 赛前卡点 | 用时 |\n|---|---|---|---|\n'
+                '| a-geo-r1 | VALID | precheck=PASS | 20min |\n'
+                '| a-geo-r2-try2 | VALID | precheck=PASS | 21min |\n'
+                '| a-geo-r2 | RACE-FAIL | precheck=PASS | 3min |\n'
+                '| a-geo-r3 | STOP-FAIL | precheck=NOT-RUN | - |\n')
+        self.assertEqual(Q.field_counts(Q.parse_races(text)), (3, 2))
+
+
+class TestStatusVocabulary(unittest.TestCase):
+    """状态词表是**跨文件契约**：runner 会写、queue 会解析、history 会判失败。
+
+    三处各写一份，最容易悄悄漂移。漂移的后果是"失败不算失败、连续失败告警不响"，
+    界面上看不出来，所以用源码扫描把它钉死。
+    """
+
+    def test_every_status_runner_writes_is_known(self):
+        with open(os.path.join(ROOT, 'run-bench.sh'), encoding='utf-8') as f:
+            text = f.read()
+        written = set(re.findall(r'echo "\| \$fid \| ([A-Z][A-Z-]*) \|', text))
+        self.assertTrue(written, '没抓到任何状态写入 —— runner 的写法变了，请同步本正则')
+        unknown = written - set(Q.KNOWN_STATUS)
+        self.assertEqual(unknown, set(),
+                         'runner 会写、观测层却不认识（会被算成"既非失败也非跳过"）: %s'
+                         % sorted(unknown))
+        # 非 VALID / 非跳过的状态必须全部进 STATUS_FAILS —— 否则 sum(各项) != total
+        expected_fails = written - {Q.STATUS_VALID, Q.STATUS_SKIP, Q.STATUS_DEADLINE}
+        self.assertEqual(written & set(Q.STATUS_FAILS), expected_fails)
+
+    def test_history_fail_table_matches_queue(self):
+        with open(os.path.join(ROOT, 'bench-history.py'), encoding='utf-8') as f:
+            text = f.read()
+        m = re.search(r'FAIL_STATUSES = \((.*?)\)', text, re.S)
+        self.assertIsNotNone(m, 'bench-history.FAIL_STATUSES 不见了')
+        hist = set(re.findall(r"'([A-Z][A-Z-]*)'", m.group(1)))
+        self.assertEqual(hist, set(Q.STATUS_FAILS),
+                         'bench-history.FAIL_STATUSES 与 bench-queue.STATUS_FAILS 漂移了')
 
 
 if __name__ == '__main__':

@@ -1583,6 +1583,11 @@ ibs_selfcheck
 apply_config "${CONFIGS[0]:-}"      # 排程模式下为空（配置在推进时逐条注册）
 load_topology "$ENGINE_NAME"
 PROGSTEP "campaign $CAMP_ID 启动: configs=[${CONF_LABELS[*]}] tracks=${TRACKS[*]} rounds=$ROUNDS（轮内右旋配对交错）topology=$NNODES 节点（ip.txt 行 $NODE_RANGE）"
+# 排程来源单独记一行：观测台（bench-queue / 控制台）靠它把 campaign 认成排程模式，
+# 并在排程文件被改动时告警。以前只有 --dry-run 打这行，真跑反而没有。
+if [ -n "$SCHEDULE_FILE" ]; then
+  PROGSTEP "排程模式: SCHEDULE_FILE=$SCHEDULE_FILE CARS_FILE=$CARS_FILE"
+fi
 if [ -s "$RACES" ]; then
   # 断点续跑：复用同一 CAMP_ID 时保留既有判定表（追加），否则已完成场会被重跑
   PROGSTEP "断点续跑：沿用已有判定表 $RACES（已 VALID 的场自动跳过）"

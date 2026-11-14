@@ -59,7 +59,9 @@ import time
 from dataclasses import dataclass, field, asdict
 
 # ------------------------------------------------------------------ 状态词表
-# 来源：run-bench.sh 写 RACES.md 的全部状态（run_field / run_field_with_retry）
+# 来源：run-bench.sh 写 RACES.md 的全部状态（run_field / run_field_with_retry）。
+# 新增状态时**必须**同步这里：漏一个会让「失败」被算成「既非失败也非跳过」，
+# 页面上总数与各项之和对不上，连续失败告警也不会响（tests/test_queue.py 有守卫）。
 STATUS_VALID = 'VALID'
 STATUS_SKIP = 'SKIP'
 STATUS_DEADLINE = 'DEADLINE-SKIP'
@@ -68,6 +70,9 @@ STATUS_FAILS = (
     'COLD-START-FAIL', 'CLUSTER-NOT-READY', 'HEAP-ASSERT-FAIL',
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
     'SEG-ASSERT-FAIL', 'ENV-FAIL', 'RACE-FAIL',
+    # 场前环境/编排失败：runner 在 run_field 的最前面就会写这三行，
+    # 它们恰恰是「环境坏了」的信号（停服没确认 / 清数据失败 / 任务清单生成失败）。
+    'STOP-FAIL', 'CLEAN-FAIL', 'TASKS-FAIL',
 )
 KNOWN_STATUS = (STATUS_VALID, STATUS_SKIP, STATUS_DEADLINE) + STATUS_FAILS
 
@@ -326,15 +331,29 @@ RE_HEADER = re.compile(
     r'campaign\s+(\S+)\s+启动:\s*(configs|cars)=\[([^\]]*)\]\s+tracks=(.+?)\s+rounds=(\d+)')
 # 老 runner 的排程模式起跑头：schedule=24 场, 窗口 12h, deadline ...
 RE_SCHED_OLD = re.compile(r'campaign\s+(\S+)\s+启动:\s*schedule=(\d+)\s*场')
-RE_SCHED_MODE = re.compile(r'排程模式:\s*(\S+)\s*（车定义\s*(\S+?)\s*）')
-RE_DEADLINE = re.compile(r'窗底守卫:\s*(\S+?)h（截止\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+# 现役 runner（run-bench.sh 起跑头之后）：
+#   [ts] 排程模式: SCHEDULE_FILE=/x/schedule.txt CARS_FILE=/x/cars.txt
+# 老格式是 `排程模式: <排程文件>（车定义 <车文件>）`，两条分支都认。
+RE_SCHED_MODE = re.compile(
+    r'排程模式:\s*(?:SCHEDULE_FILE=(\S+)(?:\s+CARS_FILE=(\S+))?'
+    r'|(\S+)\s*（车定义\s*(\S+?)\s*）)\s*$')
+# 现役 runner 写 `窗底守卫: 12h（固定截止 2026-11-14 20:00:00）`；
+# 早先写成 `（截止 …）`，两种都认（否则窗底漂移检查会静默失效）。
+RE_DEADLINE = re.compile(
+    r'窗底守卫:\s*(\d+(?:\.\d+)?)h（(?:固定)?截止\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
 RE_FIELD_START = re.compile(r'^\[([\d\-: ]+)\]\s+=====\s+\[(\d+)\]\s+(\S+)\s+开始\s+=====')
 RE_FIELD_DONE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+完成:\s*(\S+?)（(.*?)）')
-RE_FIELD_FAIL = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+(' + '|'.join(KNOWN_STATUS) + r')\b(.*)$')
+# 只认**失败**状态：DEADLINE-SKIP 也在 KNOWN_STATUS 里，若并进来会被当成 fail，
+# 于是 kind=='deadline' 永远不会产生（DEADLINE-SKIP 被 fail 先吃掉）。
+RE_FIELD_FAIL = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+(' + '|'.join(STATUS_FAILS) + r')\b(.*)$')
 RE_FIELD_SKIP = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+跳过（(.*?)）')
+# 赛前卡点没过写的是 `SKIP: 赛前负载检测未通过（…）`（冒号形态，不是「跳过（…）」）。
+# 两个正则的捕获组必须同形（ts/seq/fid/原因），事件循环才不用分支。
+RE_FIELD_SKIP_COLON = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+SKIP:?\s*(.*)$')
 RE_FIELD_DEADLINE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+DEADLINE-SKIP（(.*?)）')
 RE_RETRY = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+第\s*(\d+)/(\d+)\s*次尝试')
-RE_GIVEUP = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+已达最大重试次数')
+# runner 写「已达本次最大重试次数（3），放弃本场」
+RE_GIVEUP = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+已达(?:本次)?最大重试次数')
 RE_PHASE = re.compile(r'^\[([\d\-: ]+)\]\s+\[(\d+)\]\s+(\S+)\s+(full race 开始|recall 探针开始)')
 # RE_PHASE 第 4 组 → 展示词（进度页的"当前相位"）
 PHASE_LABEL = {'full race 开始': 'write+query', 'recall 探针开始': 'recall'}
@@ -433,8 +452,9 @@ def parse_progress(text):
             continue
         m = RE_SCHED_MODE.search(line)
         if m:
-            out['schedule_file'] = m.group(1)
-            out['cars_file'] = m.group(2)
+            # 两条分支：新格式给 SCHEDULE_FILE[ CARS_FILE]，老格式给「<排程>（车定义 <车文件>）」
+            out['schedule_file'] = (m.group(1) or m.group(3) or '').strip()
+            out['cars_file'] = (m.group(2) or m.group(4) or '').strip()
             continue
         m = RE_DEADLINE.search(line)
         if m:
@@ -449,10 +469,12 @@ def parse_progress(text):
             out['end_valid'] = int(m.group(2))
             out['end_total'] = int(m.group(3))
             continue
+        # 顺序有讲究：具体的（SKIP/DEADLINE-SKIP）必须排在泛化的 fail 之前，
+        # 否则会被 fail 先吃掉，kind 就永远不是 skip/deadline。
         for rx, kind in ((RE_FIELD_START, 'start'), (RE_FIELD_DONE, 'done'),
-                         (RE_FIELD_FAIL, 'fail'), (RE_FIELD_SKIP, 'skip'),
-                         (RE_FIELD_DEADLINE, 'deadline'), (RE_RETRY, 'retry'),
-                         (RE_GIVEUP, 'giveup'), (RE_PHASE, 'phase')):
+                         (RE_FIELD_SKIP, 'skip'), (RE_FIELD_SKIP_COLON, 'skip'),
+                         (RE_FIELD_DEADLINE, 'deadline'), (RE_FIELD_FAIL, 'fail'),
+                         (RE_RETRY, 'retry'), (RE_GIVEUP, 'giveup'), (RE_PHASE, 'phase')):
             m = rx.match(line)
             if m:
                 out['events'].append((kind, m.groups()))
@@ -477,6 +499,22 @@ def parse_races(text):
         rows.append((cells[0], cells[1], cells[2] if len(cells) > 2 else '',
                      cells[3] if len(cells) > 3 else ''))
     return rows
+
+
+def field_counts(rows):
+    """RACES 行 → (场次数, VALID 场次数)。
+
+    按**基础 fid** 去重：`-try2`/`-try3` 是同一场的第 N 次尝试，不是新场次。
+    直接数行会把"一场成功 + 两次失败重试"显示成 1/3，与 runner 自己收尾写的
+    `1/1 场有效` 对不上（tests/test_queue.py 有守卫）。
+    """
+    seen, valid = set(), set()
+    for fid, status, _pre, _dur in rows:
+        b = base_fid(fid)
+        seen.add(b)
+        if status == STATUS_VALID:
+            valid.add(b)
+    return len(seen), len(valid)
 
 
 def parse_state(text):
@@ -571,7 +609,11 @@ def build_campaign(src, cid, schedule_override=None):
             local = datetime.timezone(datetime.timedelta(hours=8))
             c.deadline = (datetime.datetime.fromtimestamp(epoch, local).strftime('%Y-%m-%d %H:%M:%S')
                           if epoch else '')
-            c.deadlines = [c.deadline] if c.deadline else []
+            # DEADLINE 文件只有**当前**这一轮的窗底，历史在 PROGRESS 里。
+            # 不能整体覆盖 c.deadlines：覆盖后 len(set(...)) 恒为 1，
+            # 「窗底被重启推后」这条检查就永远不触发。
+            if c.deadline and c.deadline not in c.deadlines:
+                c.deadlines = c.deadlines + [c.deadline]
         except (ValueError, OverflowError, OSError):
             c.deadline = ''
             c.deadlines = []
@@ -866,8 +908,8 @@ def _parse_ts(s):
 # 这里一次调用/一次扫描拿全部：cid、PROGRESS.txt mtime、RACES 行数、VALID 数、
 # 最后一行（判定"是否已结束"用），细节留给点开后的 build_campaign。
 
-def _summary_from_parts(cid, mtime, raw_rows, valid_rows, n_start, n_end, last_line):
-    """摘要元组 → dict。RACES 行数含表头+分隔线两行，数据行要减掉。
+def _summary_from_parts(cid, mtime, raw_fields, valid_fields, n_start, n_end, last_line):
+    """摘要元组 → dict。raw_fields / valid_fields 已是**去重后的场次数**。
 
     「已结束」判定与 build_campaign 同语义：campaign 结束行出现在**最后一次**
     起跑头之后才算真结束 —— 用行数近似（结束行数 ≥ 起跑头行数）。
@@ -878,11 +920,11 @@ def _summary_from_parts(cid, mtime, raw_rows, valid_rows, n_start, n_end, last_l
     except (TypeError, ValueError):
         mtime = 0
     try:
-        total = max(0, int(raw_rows or 0) - 2)
+        total = max(0, int(raw_fields or 0))
     except (TypeError, ValueError):
         total = 0
     try:
-        valid = int(valid_rows or 0)
+        valid = int(valid_fields or 0)
     except (TypeError, ValueError):
         valid = 0
     try:
@@ -904,11 +946,12 @@ def _summary_from_parts(cid, mtime, raw_rows, valid_rows, n_start, n_end, last_l
     }
 
 
-_RACES_VALID_RE = r'^\\|[^|]*\\|[[:space:]]*VALID[[:space:]]*\\|'
-
-
 def remote_summaries_script(root):
     """campaign 摘要的远端采集脚本：一次 bash 循环，TSV 输出七列。
+
+    第 3/4 列是**去重后的场次数**（按基础 fid，去掉 `-tryN`），与本地分支
+    `field_counts()` 同一口径 —— 两个分支必须给出同样的数字，否则同一份
+    campaign 在命令行和网页上会显示不同的总数。
 
     抽成函数是为了可测（bash -n 语法检查 / 本地 bash 直接执行比对）。
     """
@@ -919,8 +962,19 @@ def remote_summaries_script(root):
         '  [ -f "$p" ] || continue\n'
         '  cid="${d%/}"\n'
         '  last=$(grep -v "^[[:space:]]*$" "$p" 2>/dev/null | tail -n 1 | cut -c1-120)\n'
-        '  raw=$(grep -c "^|" "$r" 2>/dev/null)\n'
-        '  valid=$(grep -cE "' + _RACES_VALID_RE + '" "$r" 2>/dev/null)\n'
+        '  counts=$(awk -F\'|\' \'\n'
+        '    /^\\|/ {\n'
+        '      fid=$2; st=$3\n'
+        '      gsub(/^[[:space:]]+|[[:space:]]+$/, "", fid)\n'
+        '      gsub(/^[[:space:]]+|[[:space:]]+$/, "", st)\n'
+        '      if (fid == "" || fid == "场次" || fid ~ /^-+$/) next\n'
+        '      sub(/-try[0-9]+$/, "", fid)\n'
+        '      all[fid] = 1\n'
+        '      if (st == "VALID") valid[fid] = 1\n'
+        '    }\n'
+        '    END { a = 0; b = 0; for (k in all) a++; for (k in valid) b++; printf "%d %d", a, b }\n'
+        '  \' "$r" 2>/dev/null)\n'
+        '  raw=${counts%% *}; valid=${counts##* }\n'
         '  ns=$(grep -c "启动:" "$p" 2>/dev/null)\n'
         '  ne=$(grep -c "campaign 结束" "$p" 2>/dev/null)\n'
         '  mt=$(stat -c %Y "$p" 2>/dev/null)\n'
@@ -960,16 +1014,11 @@ def campaign_summaries(src):
             except OSError:
                 pass
             races_path = os.path.join(src.root, cid, 'RACES.md')
-            raw = valid = 0
             try:
                 with open(races_path, 'r', encoding='utf-8', errors='replace') as f:
-                    for line in f:
-                        if line.startswith('|'):
-                            raw += 1
-                            if re.match(r'^\|[^|]*\|\s*VALID\s*\|', line):
-                                valid += 1
+                    raw, valid = field_counts(parse_races(f.read()))
             except OSError:
-                pass
+                raw = valid = 0
             try:
                 mt = os.path.getmtime(prog_path)
             except OSError:
@@ -1075,9 +1124,8 @@ def cmd_list(args, src):
     print('%-34s %-10s %-16s %s' % ('campaign', '模式', '有效/总数', '最近活动'))
     for cid in sorted(names)[-args.limit:]:
         prog = parse_progress(src.read(cid, 'PROGRESS.txt'))
-        races = parse_races(src.read(cid, 'RACES.md'))
-        total = len(races)
-        valid = sum(1 for r in races if r[1] == STATUS_VALID)
+        # 与网页列表页同一口径：按基础 fid 去重，重试不算新场次
+        total, valid = field_counts(parse_races(src.read(cid, 'RACES.md')))
         mode = 'schedule' if prog['schedule_file'] else 'legacy'
         text = src.read(cid, 'PROGRESS.txt') or ''
         lines = [x for x in text.splitlines() if x.strip()]
