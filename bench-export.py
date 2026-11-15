@@ -220,7 +220,7 @@ RACE_FIELDS = frozenset((
     "corpus_docs", "corpus_name", "cluster_revision", "cluster_flavor",
     "rally_version",
     # 赛末快照（forcemerge 之后）+ 溯源
-    "store_size_gb_post_merge", "segments_post_merge", "source",
+    "store_size_gb_post_merge", "segments_post_merge", "segments_caliber_post_merge", "source",
     # 可信度：场次级汇总（任一行 false 则 false）。判断单行看 metric 上的 trusted。
     "trusted",
 ))
@@ -709,6 +709,44 @@ def parse_jdk_files(camp_dir):
     return out
 
 
+def _open_nondot_segments(fp_dir):
+    """fp 探针目录 → open 且非 "." 系统索引的段数总和（FINDING-ez-forcemerge-segment-count-20261113）。
+
+    数据源 = run-bench sidecar 抓的两路原始探针：
+      indices-segments.txt  _all/_stats/segments（每索引 primaries.segments.count）
+      indices-list.txt      _cat/indices?h=index,status（open/closed 状态）
+    任一探针缺失/不可解析返回 None（缺探针不猜值，调用方回退节点统计混合口径）。
+    """
+    def _probe(name):
+        p = os.path.join(fp_dir, name)
+        if not os.path.isfile(p):
+            return None
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                t = fh.read().strip()
+        except OSError:
+            return None
+        for start in (t.find("{"), t.find("[")):
+            if start >= 0:
+                try:
+                    return json.loads(t[start:])
+                except ValueError:
+                    pass
+        return None
+    stats, listing = _probe("indices-segments.txt"), _probe("indices-list.txt")
+    if not stats or not isinstance(listing, list) or not listing:
+        return None
+    status_of = {it["index"]: it.get("status") for it in listing
+                 if isinstance(it, dict) and it.get("index")}
+    per = {}
+    for name, st in (stats.get("indices") or {}).items():
+        cnt = (((st or {}).get("primaries") or {}).get("segments") or {}).get("count")
+        if isinstance(cnt, (int, float)) and not isinstance(cnt, bool) \
+                and status_of.get(name) == "open" and not name.startswith("."):
+            per[name] = cnt
+    return sum(per.values()) if per else None
+
+
 def load_campaign_meta(camp_dir):
     """RACES.md 状态、PACKAGES 指纹、sidecar、monitors 摘要"""
     m = {"status": {}, "packages": "", "sidecar": {}, "sidecar_by_race": {},
@@ -764,9 +802,18 @@ def load_campaign_meta(camp_dir):
         if not nd:
             continue
         store = sum(((n.get("indices") or {}).get("store") or {}).get("size_in_bytes", 0) for n in nd.values())
-        segs = sum(((n.get("indices") or {}).get("segments") or {}).get("count", 0) for n in nd.values())
+        # 段数口径修正（FINDING-ez-forcemerge-segment-count-20261113）：节点统计和是
+        # 「业务索引+系统索引碎片」混合口径（EZ 恒带 +8 段噪声，跨引擎不可比）。
+        # 优先用同目录的每索引探针重算：只数 open 且非 "." 开头的业务索引；
+        # 探针缺席（老 campaign）回退节点统计和，字段语义在口径说明里标注。
+        _fpbase = os.path.dirname(p)
+        segs = _open_nondot_segments(_fpbase)
+        segments_caliber = "open_nondot" if segs is not None else "node_stats_all"
+        if segs is None:
+            segs = sum(((n.get("indices") or {}).get("segments") or {}).get("count", 0) for n in nd.values())
         m["post_merge"][fid] = {"store_gb": round(store / 2**30, 4) if store else None,
-                                "segments": segs, "nodes": len(nd)}
+                                "segments": segs, "segments_caliber": segments_caliber,
+                                "nodes": len(nd)}
     for p in glob.glob(os.path.join(camp_dir, "monitors", "*-summary.txt")):
         base = os.path.basename(p)[:-len("-summary.txt")]
         txt = open(p, encoding="utf-8").read()
@@ -1029,6 +1076,12 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
                         "value_original": v, "unit_original": raw_unit,
                         "direction": direction_of(fam), **row_common})
     # ---- 赛级指标（results 块）----
+    # segment_count 口径修正（FINDING-ez-forcemerge-segment-count-20261113）：
+    # rally 的 results.segment_count 是 _all.primaries 混合口径，把 .security 等系统
+    # 索引碎片一并计入（EZ 3.0.0 实测恒 +8 段），跨引擎不可比。sidecar 有干净口径
+    # （segment_stats：open 且非 "." 开头的业务索引）时用它替换；rally 原值另存
+    # segment_count_rally_all 留痕 —— 两行差值 = 被排除的系统索引段数，可审计。
+    _seg_clean = ((side or {}).get("segment_stats") or {}).get("count")
     for key, (fam, unit) in RESULT_METRICS.items():
         v = res.get(key)
         if v is None:
@@ -1041,6 +1094,15 @@ def emit_metrics(d, run_id, ts, common, out, side=None, quality_of=None, counter
             if v is None:
                 continue
         stat = "value"
+        if key == "segment_count" and _seg_clean is not None:
+            _push({"_index": "benchmark-result-metric",
+                        "_id": "%s|%s||%s|%s" % (run_id, common.get("phase"), "disk_segment_count_rally_all", stat),
+                        "@timestamp": ts, "task": None, "operation": None,
+                        "family": "disk", "metric": "segment_count_rally_all", "stat": stat,
+                        "value": v, "unit": unit, "value_original": v, "unit_original": unit,
+                        "direction": direction_of("disk"), **common})
+            v = _seg_clean
+            stat = "value"
         nv, nu = norm_value(v, unit)
         _push({"_index": "benchmark-result-metric", "_id": "%s|%s||%s|%s" % (run_id, common.get("phase"), fam + "_" + key, stat),
                     "@timestamp": ts, "task": None, "operation": None,
@@ -1754,6 +1816,9 @@ def _main():
                    # 单位换算：探针落的是 GiB，契约统一用 GB（×1.073741824）。
                    "store_size_gb_post_merge": _pm_store_gb,
                    "segments_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments"),
+                   # 段数口径标注：open_nondot（open 且非 "." 系统索引，干净口径）/ node_stats_all
+                   # （老 campaign 无每索引探针的回退值，EZ 侧恒带系统索引碎片噪声）
+                   "segments_caliber_post_merge": (meta.get("post_merge", {}).get(real_fid or fid) or {}).get("segments_caliber"),
                    "source": [d["_path"], "campaign:" + camp] + (["sidecar:" + fid + "-" + phase] if side else []),
                    "trusted": (not degraded_tasks)}
         node_counts = []
@@ -2057,6 +2122,7 @@ def _main():
         # ---- 赛末快照 + 溯源 + 可信度 ----
         "store_size_gb_post_merge": {"type": "double"},
         "segments_post_merge": {"type": "integer"},
+        "segments_caliber_post_merge": {"type": "keyword"},
         # source 是字符串数组（溯源路径），不是对象 → keyword（数组按多值索引），
         # 不能用 flattened（flattened 只收对象，标量串会被 mapper_parsing_exception 整批拒收）
         "source": {"type": "keyword"},
