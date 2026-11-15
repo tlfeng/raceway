@@ -1,0 +1,244 @@
+{
+  "name": "encrypted-store",
+  "description": "Easysearch store-encrypted 加密存储探针：create-index 烘入 index.store.type=encrypted / index.encryption.profile=index（operation 级 settings 合并覆盖 index.json 的 store.type，加密键后置必胜），随后完整跑写段（灌全量 + forcemerge 单段 + 等合并）与查段 —— 写/查操作与 full 挑战（write-only + query-only 派生）逐项同序同预算，两者唯一差异是加密设置，数字可直接对比。仅 Easysearch 可跑（ES 不认 index.encryption.profile）。",
+  "schedule": [
+        {
+          "operation": "delete-index"
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "settings": {%- set p_enc_settings = {} -%}{%- if index_settings is defined and index_settings is mapping %}{%- set _ = p_enc_settings.update(index_settings) -%}{%- endif %}{%- set _ = p_enc_settings.update({"index.store.type": "encrypted", "index.encryption.profile": "index"}) -%}{{ p_enc_settings | tojson }}
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "operation": "index-append",
+          "warmup-time-period": 70,
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-index",
+          "operation": "refresh"
+        },
+        {
+          "operation": {
+            "operation-type": "force-merge",
+            "request-timeout": 7200,
+            "max-num-segments": {{max_num_segments | default(1)}}
+          }
+        },
+        {
+          "name": "refresh-after-force-merge",
+          "operation": "refresh"
+        },
+        {
+          "name": "wait-until-merges-finish",
+          "operation": {
+            "operation-type": "index-stats",
+            "index": "_all",
+            "condition": {
+              "path": "_all.total.merges.current",
+              "expected-value": 0
+            },
+            "retry-until-success": true,
+            "include-in-reporting": false
+          }
+        },
+        {% if post_ingest_sleep|default(false) %}
+        {
+          "name": "post-ingest-sleep",
+          "operation": {
+            "operation-type": "sleep",
+            "duration": {{ post_ingest_sleep_duration|default(30) }}
+          }
+        },
+        {% endif %}
+        {
+          "operation": "index-stats",
+          "warmup-iterations": 500,
+          "iterations": 1000,
+          "target-throughput": 90
+        },
+        {
+          "operation": "node-stats",
+          "warmup-iterations": 100,
+          "iterations": 1000
+        },
+        {
+          "operation": "default",
+          "warmup-iterations": 500,
+          "iterations": 1000,
+          "target-throughput": 50
+        },
+        {
+          "operation": "term",
+          "warmup-iterations": 500,
+          "iterations": 1000,
+          "target-throughput": 100
+        },
+        {
+          "operation": "phrase",
+          "warmup-iterations": 500,
+          "iterations": 1000,
+          "target-throughput": 110
+        },
+        {
+          "operation": "country_agg_uncached",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 3
+        },
+        {
+          "operation": "country_agg_cached",
+          "warmup-iterations": 1000,
+          "iterations": 1000,
+          "target-throughput": 100
+        },
+        {
+          "operation": "scroll",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "#COMMENT": "Throughput is considered per request. So we issue one scroll request per second which will retrieve 25 pages",
+          "target-throughput": 0.8
+        },
+        {
+          "operation": "expression",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "painless_static",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.1
+        },
+        {
+          "operation": "painless_dynamic",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.4
+        },
+        {
+          "operation": "decay_geo_gauss_function_score",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1
+        },
+        {
+          "operation": "decay_geo_gauss_script_score",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1
+        },
+        {
+          "operation": "field_value_function_score",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "field_value_script_score",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "large_terms",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.1
+        },
+        {
+          "operation": "large_filtered_terms",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.1
+        },
+        {
+          "operation": "large_prohibited_terms",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.1
+        },
+        {
+          "operation": "desc_sort_population",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "desc_sort_population_can_match_shortcut",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "desc_sort_population_no_can_match_shortcut",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "asc_sort_population",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "asc_sort_with_after_population",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "desc_sort_geonameid",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 6
+        },
+        {
+          "operation": "desc_sort_with_after_geonameid",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 6
+        },
+        {
+          "operation": "asc_sort_geonameid",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 6
+        },
+        {
+          "operation": "asc_sort_with_after_geonameid",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 6
+        },
+        {
+          "operation": "sort_country_code_can_match_shortcut",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        },
+        {
+          "operation": "sort_country_code_no_can_match_shortcut",
+          "warmup-iterations": 200,
+          "iterations": 100,
+          "target-throughput": 1.5
+        }
+  ]
+}

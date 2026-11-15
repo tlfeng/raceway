@@ -6,7 +6,12 @@
       {% if p_include_non_serverless_index_settings %}
     "index.number_of_shards": {{number_of_shards | default(5)}},
     "index.number_of_replicas": {{number_of_replicas | default(0)}},
+    {%- if encrypted_store is defined and encrypted_store %}
+    "index.store.type": "encrypted",
+    "index.encryption.profile": "index",
+    {%- else %}
     "index.store.type": "{{store_type | default('fs')}}",
+    {%- endif %}
     {%- if index_codec is defined %}
     "index.codec": "{{index_codec}}",
     {%- endif %}

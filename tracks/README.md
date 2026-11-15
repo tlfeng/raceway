@@ -28,7 +28,7 @@ git 里是什么，跑的就是什么。回答一个问题：**跑结果用的�
 
 | 目录 | 状态 | 说明 |
 |---|---|---|
-| `geonames/` | ✅ 完整 | 官方基座 + raceway 口径：`write-only`/`query-only` 由上游 `append-no-conflicts` **机械派生**（写段 = 建索引 + forcemerge 单段 + 等合并；查段 = 其余 30 个查询操作；与上游逐项同序）；`create-only` 探针在位 |
+| `geonames/` | ✅ 完整 | 官方基座 + raceway 口径：`write-only`/`query-only` 由上游 `append-no-conflicts` **机械派生**（写段 = 建索引 + forcemerge 单段 + 等合并；查段 = 其余 30 个查询操作；与上游逐项同序）；`create-only` 探针在位；`encrypted-store` 加密探针（easysearch store-encrypted 插件读写性能：create-index 烘入 `index.store.type=encrypted` + `index.encryption.profile=index`，写/查段与 full 逐项同序同预算，数字与 full 基线直接对比，仅 Easysearch 可跑；index.json 另有 `encrypted_store` 选通条件块，让 full/write-only/query-only 也能经 `--track-params=encrypted_store:true` 跑加密变体；回归闸门 `tests/test_geonames_encrypted_store.py`） |
 | `nested/` | ✅ 完整 | 官方基座，shards 走 params |
 | `hv1024/` | ✅ 定义齐；起跑前补 `queries.json`（`bzcat $HV_QUERIES_BZ2 \| head -2000`）与语料软链 `ln -sfn $HV_CORPUS documents-1024.json`（1M×1024 维，22 739 096 214 字节，断言在 track.json） | m=32/efC=100；`_source` **整个关掉**（`enabled: false`） |
 | `hv1024x/` | ✅ 完整（四臂收成一份定义 + params） | 1024 维量化/压缩四臂：**一份基座定义**，各臂差异只由两个参数维度表达 —— 量化档 `vector_index_type=int8_hnsw\|bbq_hnsw`（`index_options.type`）、压缩档 `index_codec=ZSTD + source_reuse=true`（settings，**仅 Easysearch**）。量化/压缩两侧通用性：int8/bbq 两侧通用（ES 8.19.23 与 ez 都能建），ZSTD+sr 仅 ez。`create-only` 建索引探针随基座保留。索引名 `vectors`，语料同 hv1024（VARIANT.txt 记台账）；`queries-recall.jsonl`/`truth.jsonl` 为 recall 探针数据，不进 git。结论：`REPORT-hvbbq-1024维量化压缩对比-20261104.md` |
