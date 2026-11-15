@@ -969,13 +969,29 @@ track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
  esac; }
 track_tmo_q() { local b; b=$(track_base "$1"); case "$b" in geonames-upsert) echo "${TIMEOUT_UPSERT_Q:-$TIMEOUT_GEO_Q}";; geo) echo "$TIMEOUT_GEO_Q";; hnsw) echo "$TIMEOUT_HNSW_Q";; hv1024|hv1024x*) echo "$TIMEOUT_HV1024_Q";; nested) echo "$TIMEOUT_NESTED_Q";; ds-*) echo "$TIMEOUT_DS_Q";; esac; }
 
+# 监控生命周期 ssh 重试：重 IO 场次收尾瞬间虚机 sshd 接受连接可超 8s（ConnectTimeout=8），
+# 单发失败即 ENV-FAIL 会把干净测量整场作废（jdk3c 20261113 夜 4 槽位实锤：ES bbqdisk/bbq r1/r3）。
+# 3 次尝试、间隔 5s；带可选 stdout 捕获文件。
+vm_retry() { # <ip> <cmd> [outfile]
+  local __ip="$1" __cmd="$2" __out="${3:-}" __try
+  for __try in 1 2 3; do
+    if [ -n "$__out" ]; then
+      vm "$__ip" "$__cmd" > "$__out" 2>/dev/null && return 0
+    else
+      vm "$__ip" "$__cmd" >/dev/null 2>&1 && return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
 monitor_start() { # <fid-phase> <eng>，任一节点未启动则整场 ENV 不可信
   local fid="$1" eng="$2" ip dir
   dir=$(eng_dir_of "$eng") || return 1
   safe_abs_path "$MON_DIR" || return 1
   ACTIVE_MONITOR="$fid"; MONITOR_OK=1
   for ip in "${VM_IPS[@]}"; do
-    vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") ENGINE_MARK=$(shell_quote "$dir") '$MON_DIR/load-monitor.sh' start $(shell_quote "$fid")" >/dev/null 2>&1 \
+    vm_retry "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") ENGINE_MARK=$(shell_quote "$dir") '$MON_DIR/load-monitor.sh' start $(shell_quote "$fid")" \
       || { log "  $ip 监控启动失败"; MONITOR_OK=0; }
   done
   [ "$MONITOR_OK" = 1 ]
@@ -986,13 +1002,18 @@ monitor_stop() { # <fid-phase> —— 每节点保留身份与 NO-DATA，绝不�
   mkdir -p "$mondir" || return 1
   for k in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$k]}"; f="$mondir/$fid-${VM_NAMES[$k]}"
-    if ! vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") '$MON_DIR/load-monitor.sh' stop $(shell_quote "$fid")" >/dev/null 2>&1; then ok=0; fi
-    if ! vm "$ip" "cat '$MON_DIR/mon-$fid.csv'" > "$f.csv.tmp" 2>/dev/null; then ok=0; fi
+    vm_retry "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") '$MON_DIR/load-monitor.sh' stop $(shell_quote "$fid")" || ok=0
+    vm_retry "$ip" "cat '$MON_DIR/mon-$fid.csv'" "$f.csv.tmp" || ok=0
     mv "$f.csv.tmp" "$f.csv" || ok=0
-    summary=$(vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") VERDICT_STEAL_MAX=$(shell_quote "$VERDICT_STEAL_MAX") VERDICT_FOREIGN_MAX=$(shell_quote "$VERDICT_FOREIGN_MAX") '$MON_DIR/load-monitor.sh' summary '$MON_DIR/mon-$fid.csv'" 2>/dev/null) || { ok=0; summary='ENV-VERDICT: NO-DATA'; }
+    if vm_retry "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") VERDICT_STEAL_MAX=$(shell_quote "$VERDICT_STEAL_MAX") VERDICT_FOREIGN_MAX=$(shell_quote "$VERDICT_FOREIGN_MAX") '$MON_DIR/load-monitor.sh' summary '$MON_DIR/mon-$fid.csv'" "$f-summary.raw"; then
+      summary=$(cat "$f-summary.raw")
+    else
+      ok=0; summary='ENV-VERDICT: NO-DATA'
+    fi
+    rm -f "$f-summary.raw"
     { printf 'node=%s ip=%s phase=%s\n' "${VM_NAMES[$k]}" "$ip" "${fid##*-}"; printf '%s\n' "$summary"; } > "$f-summary.txt.tmp" &&
       mv "$f-summary.txt.tmp" "$f-summary.txt" || ok=0
-    vm "$ip" "rm -f '$MON_DIR/mon-$fid.csv'" >/dev/null 2>&1 || ok=0
+    vm_retry "$ip" "rm -f '$MON_DIR/mon-$fid.csv'" || ok=0
   done
   ACTIVE_MONITOR=''
   [ "$ok" = 1 ] || MONITOR_OK=0
