@@ -1243,6 +1243,14 @@ sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> �
   # 每分片真实段数（force merge 后应为每分片 1 段；段数没收敛就不该进查询口径）
   [ -n "$sidx" ] && curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
     "https://${VM_IPS[0]}:$HTTP_PORT/$sidx/_segments" > "$d/index-segments.txt" 2>&1 || true
+  # 段数口径修正的数据源（FINDING-ez-forcemerge-segment-count-20261113）：
+  # rally 赛末的 _all.primaries.segments.count 会把 .security 等系统索引碎片一并计入
+  # （EZ 3.0.0 实测 .security 8 docs/8 段且永不合并 → EZ 报 11 段 vs ES 3 段）。
+  # 这两个探针供 bench-sidecar 重算干净口径：只数 open 且非 "." 开头的业务索引。
+  curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
+    "https://${VM_IPS[0]}:$HTTP_PORT/_cat/indices?format=json&h=index,status" > "$d/indices-list.txt" 2>&1 || true
+  curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
+    "https://${VM_IPS[0]}:$HTTP_PORT/_all/_stats/segments" > "$d/indices-segments.txt" 2>&1 || true
   # 实测生效的映射（dot_product / index_options.type —— 决定跑的是不是目标量化格式）
   [ -n "$sidx" ] && curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 25 \
     "https://${VM_IPS[0]}:$HTTP_PORT/$sidx/_mapping" > "$d/index-mapping.txt" 2>&1 || true

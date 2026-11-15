@@ -332,6 +332,55 @@ def parse_knn_params(spec_blob, op_files, py_blob='', track_params=None, mapping
     return p or None
 
 
+# ---------- 段数口径修正：只数 open 且非 "." 开头的业务索引 ----------
+# rally 赛末采的 _all.primaries.segments.count 是 _all 混合口径：.security 等系统
+# 索引的碎片（EZ 3.0.0 实测 8 docs/8 段且永不合并）被一并计入，EZ 恒比 ES 多 8 段，
+# 跨引擎比段数不可用 —— 见 raceway/docs/FINDING-ez-forcemerge-segment-count-20261113.md。
+# 这里用每索引 stats（indices-segments.txt）+ _cat/indices 状态（indices-list.txt）
+# 重算干净口径：open 且索引名不以 "." 开头。被排除项原样留痕，差值可审计。
+def probe_json(text):
+    """curl 输出 → JSON（容忍 curl 报错前缀/数组根；解析不了返回 None）"""
+    if not text:
+        return None
+    t = text.strip()
+    for start in (t.find("{"), t.find("[")):
+        if start >= 0:
+            try:
+                return json.loads(t[start:])
+            except (ValueError, json.JSONDecodeError):
+                pass
+    return None
+
+
+def segments_open_nondot(stats_text, list_text):
+    """(每索引段数 stats, _cat/indices 状态) → {count, per_index, excluded} | None
+
+    两个探针任一缺失/不可解析都返回 None（缺探针不猜值，沿用旧口径并留痕）。
+    """
+    stats = probe_json(stats_text)
+    listing = probe_json(list_text)
+    if not stats or not isinstance(listing, list) or not listing:
+        return None
+    status_of = {}
+    for it in listing:
+        if isinstance(it, dict) and it.get("index"):
+            status_of[it["index"]] = it.get("status")
+    per, excluded = {}, {}
+    for name, st in (stats.get("indices") or {}).items():
+        cnt = (((st or {}).get("primaries") or {}).get("segments") or {}).get("count")
+        if not isinstance(cnt, (int, float)) or isinstance(cnt, bool):
+            continue
+        stt = status_of.get(name)
+        if stt != "open" or name.startswith("."):
+            excluded[name] = {"count": cnt, "status": stt or "unknown"}
+        else:
+            per[name] = cnt
+    if not per and not excluded:
+        return None
+    return {"count": sum(per.values()), "per_index": per or None,
+            "excluded": excluded or None}
+
+
 def node_extras(full_stats_text):
     """从完整 _nodes/stats 探针里取"引擎压力与健康"指标。
 
@@ -371,6 +420,8 @@ def node_extras(full_stats_text):
             e["engine_index_total"] = i.get("index_total")
         seg = idx.get("segments") or {}
         if seg:
+            # 注意：节点统计是「该节点上所有索引」的混合口径（业务索引+系统索引碎片），
+            # 跨引擎比较要用 segment_stats（open 且非 "." 索引，见 segments_open_nondot）
             e["segment_count"] = seg.get("count")
         st = idx.get("store") or {}
         if st.get("size_in_bytes"):
@@ -608,6 +659,11 @@ def main():
                    "spec_hash": corpus_spec_hash(tm)},
         "cluster_measured": measured,
         "cluster_extras": node_extras(read(args.raw, "nodes-stats-full.txt")),
+        # 段数干净口径（open 且非 "." 系统索引）：跨引擎比段数用它，
+        # 不要用 rally 的 _all.primaries 口径（被系统索引碎片污染）——
+        # FINDING-ez-forcemerge-segment-count-20261113
+        "segment_stats": segments_open_nondot(read(args.raw, "indices-segments.txt"),
+                                              read(args.raw, "indices-list.txt")),
         "env": {
             "env_id": args.env_id,
             "host": {"hostname": host.get("hostname"), "cpu_model": host.get("cpu_model"),
@@ -617,6 +673,7 @@ def main():
         },
         "source": ["race.json(rally FileRaceStore)",
                    "_nodes/_all/jvm,os,process,settings", "_nodes/_all/stats/jvm,os,process,indices",
+                   "_cat/indices?h=index,status", "_all/_stats/segments",
                    "pkg java -version", "procfs/lscpu/virsh", "track spec", "PACKAGES.txt"],
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
