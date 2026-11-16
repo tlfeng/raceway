@@ -65,6 +65,7 @@ scp -r *.sh *.py *.conf vm-bench.env tracks/ kibana/ web/ 压测机:/opt/raceway
 | nested 文档 | `./run-bench.sh nested 3` | 官方基座 |
 | 维度扫描（多档位） | `SCHEDULE_FILE=… CARS_FILE=… DS_HOURS=12 ./run-bench.sh ds` | 定义已定版 `tracks/ds-*`；语料 `CORPORA_DS` |
 | 冒烟 / 补跑一场 | `./run-bench.sh geo 1` | 续跑需显式复用 `CAMP_ID` 和相同计划；成功尝试自动跳过，`FRESH=1` 分配新尝试，保留历史 |
+| 链路冒烟（<1 分钟/场） | `RALLY_TEST_MODE=1 ./run-bench.sh geo 1` | esrally `--test-mode`：迷你语料 + 完整任务结构，验证全链路；**数字与正式跑不可比**。控制台「启动排程」页勾 ⚡ 冒烟开关即可 |
 
 每场时长与多配置对比的写法见 [docs/GUIDE.md §1](docs/GUIDE.md)。
 
@@ -116,10 +117,16 @@ python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--inse
 ### 六、控制台（可选）
 
 ```bash
-python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 八页合一，见下
-#   趋势页图表用随仓库分发的 echarts.min.js（Apache-2.0）；漏同步只影响画图，表格仍可用
+cp console.conf.example console.conf && vi console.conf   # 可选：外链清单 + 入库默认值（口令只留本机）
+python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 五页合一，见下
+#   趋势图表用随仓库分发的 echarts.min.js（Apache-2.0）；漏同步只影响画图，表格仍可用
 python3 bench-compose.py start --cars-file <f> --tracks ds-* --rounds 3 --ds-hours 12   # 不开页面直接起跑
 ```
+
+**console.conf**（可选，raceway 根，真身 gitignore）：`extlink.<名称> = URL` 定义历史页
+外部结果入口的默认清单；`apply.es / apply.auth / apply.insecure / apply.drop` 是入库页
+默认值——口令只留在服务端使用，前端留空即用、不回传浏览器。没有这个文件，控制台用
+内置默认（Kibana/LogPilot 两条入口）。
 
 **两种后端**：默认 Python 单进程 `serve`；也可用 Go 外壳（HTTP 层/守卫/静态资源在 Go，常驻内存更低）：
 
@@ -129,7 +136,7 @@ cd serve-go && go build -o raceway-serve . && ./raceway-serve --port 8802 --root
 #   新增的扩展 API 在 Go 侧原生实现（见下），无需 Python 常驻。
 ```
 
-**八个页签**：① 启动排程（含编排预设 + est 自动校准）② 运行进度 ③ 历史与结果 ④ 趋势 ⑤ 赛道与入库 ⑥ 赛道文件（浏览/新建/编辑/删除，原子写 + sha256 并发校验 + 改动需回传压测机）⑦ 场次详情（实测身份卡 / 逐任务指标 / 每节点 5s 监控曲线 / 日志全文 / campaign 收尾）⑧ 报告与导出（Markdown/HTML 报告 + 一键生成导出）。支持 `#/tab/cid` 深链路由，刷新与分享可直达某场。
+**五个页签**：① 启动排程（编排预设 + est 逐赛道校准 + **勾选即刷新的实时排程预览**，左选择右预览两栏）② 运行进度（campaign 快切条 + 逐场明细 + **进行中场次的每节点实时监控曲线** + 日志着色跟随 + 日志全文 + campaign 收尾）③ 结果与趋势（外部结果入口可配链接 / 两场对比 / Markdown·HTML 报告 / 指标趋势 / 全部 campaign 一览与「按此重排」）④ 赛道管理（赛道目录一览 + 赛道文件浏览/新建/编辑/删除，原子写 + sha256 并发校验）⑤ 导出与入库（一键生成导出 + bench-apply 入库，默认值出自 console.conf）。逐场详情抽屉（实测身份卡 / 逐任务指标 / 监控曲线 / 日志全文）从进度页任意已开跑场次一行点击直达。支持 `#/tab/cid` 深链路由，刷新与分享可直达某场。
 
 > 赛道 `tracks/` 是 git 定版目录；⑥ 的编辑只改仓库文件，改动需重新同步到压测机才会被 runner 消费。所有写操作带 CSRF，`/api/close` 默认 dry-run。
 

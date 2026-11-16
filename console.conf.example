@@ -1,0 +1,15 @@
+# raceway 控制台配置模板 —— 复制成 console.conf 后按需修改
+#   cp console.conf.example console.conf && vi console.conf
+# 真身已 gitignore（可含口令），只留在跑控制台的那台机器上；没有本文件控制台照常用内置默认。
+# serve 启动时读取（改完刷新页面即可，无需重启服务）。
+
+# ---- 外部结果入口（历史页链接清单；名称可含中文与空格）----
+# extlink.Kibana 看板 = http://127.0.0.1:5601
+# extlink.LogPilot = http://127.0.0.1:8802
+# extlink.趋势大屏 = http://grafana.local:3000/d/raceway
+
+# ---- 结果入库默认值（导出与入库页；bench-apply）----
+# apply.es = https://127.0.0.1:9237
+# apply.auth = admin:changeme        # 只在服务端使用，不下发浏览器；前端口令框留空即用这里
+# apply.insecure = 1                 # 自签证书 --insecure
+# apply.drop = 0                     # --drop 默认关；页面上勾选仍需二次确认

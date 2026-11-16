@@ -75,16 +75,16 @@ const ICONS = {
   tracks: 'M4 6h16M4 6v12a2 2 0 002 2h12a2 2 0 002-2V6M4 6a2 2 0 012-2h12a2 2 0 012 2M9 10h6M9 14h6',
   detail: 'M4 4h6v16H4zM14 4h6v7h-6zM14 15h6v5h-6z',
   report: 'M6 2h9l5 5v15H6zM15 2v5h5M9 12h6M9 16h6',
+  export: 'M12 3v10M8 9l4 4 4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2',
 };
 
 // ==================== 应用根 ====================
 const TABS = [
-  { id: 'compose', num: '①', label: '启动排程', title: '启动排程' },
-  { id: 'progress', num: '②', label: '运行进度', title: '运行进度' },
-  { id: 'history', num: '③', label: '历史与结果', title: '历史与结果' },
-  { id: 'trend', num: '④', label: '趋势', title: '指标趋势' },
-  { id: 'ops', num: '⑤', label: '赛道与入库', title: '赛道与导出' },
-  { id: 'detail', num: '⑥', label: '场次详情', title: '场次详情 / 身份 / 监控 / 日志' },
+  { id: 'compose', label: '启动排程', title: '启动排程' },
+  { id: 'progress', label: '运行进度', title: '运行进度' },
+  { id: 'history', label: '结果与趋势', title: '历史 · 对比 · 趋势' },
+  { id: 'tracks', label: '赛道管理', title: '赛道目录与文件' },
+  { id: 'export', label: '导出与入库', title: '导出与入库' },
 ];
 
 function App() {
@@ -132,11 +132,34 @@ function App() {
     } catch (e) { /* 网络抖动下轮再试 */ }
   }
 
+  // 车表 / 赛道清单刷新：后端重读 cars 文件与 tracks/ 定义（?refresh=1），
+  // 前端把已失效的勾选裁掉（自定义字段不动，用户勾选尽量保留）。
+  async function reloadBoot(silent) {
+    try {
+      const { status, j } = await getJSON('/api/bootstrap?refresh=1');
+      if (status !== 200) { toast.err(j.error || '刷新失败'); return; }
+      CSRF.token = j.csrf_token || CSRF.token;
+      setBoot(j);
+      setForm((f) => f && Object.assign({}, f, {
+        cars: f.cars.filter((c) => (j.cars || []).some((a) => a.name === c)),
+        tracks: f.tracks.filter((t) => (j.tracks || []).some((x) => x.name === t)),
+      }));
+      if (!silent) toast.ok('车与赛道清单已刷新（' + (j.cars || []).length + ' 车 / ' + (j.tracks || []).length + ' 赛道）');
+    } catch (e) { toast.err('刷新失败: ' + e); }
+  }
+
+  // 赛道文件保存/删除后自动刷新清单（extras.js 发事件；静默，避免与保存 toast 抢位）
+  useEffect(() => {
+    const onRefresh = () => reloadBoot(true);
+    window.addEventListener('raceway-boot-refresh', onRefresh);
+    return () => window.removeEventListener('raceway-boot-refresh', onRefresh);
+  }, []);
+
   const goHash = useRef(null);
   function setTab(id) {
     setTabRaw(id);
-    if (id === 'progress' || id === 'history' || id === 'detail') loadCampaigns();
-    if (goHash.current) goHash.current(id, (id === 'progress' || id === 'detail') ? curCid : null);
+    if (id === 'progress' || id === 'history' || id === 'export') loadCampaigns();
+    if (goHash.current) goHash.current(id, id === 'progress' ? curCid : null);
   }
 
   // 深链路由：#/progress/<cid> 之类，刷新/分享可直达；hash 变化反向切页
@@ -149,7 +172,7 @@ function App() {
         if (!valid) return;
         setTabRaw(tab);
         if (cid) setCurCid(cid);
-        if (tab === 'progress' || tab === 'history' || tab === 'detail') loadCampaigns(cid || undefined);
+        if (tab === 'progress' || tab === 'history' || tab === 'export') loadCampaigns(cid || undefined);
       });
     return () => { goHash.current = null; };
   }, []);
@@ -169,6 +192,7 @@ function App() {
         cars: form.cars, tracks: form.tracks, custom: form.custom,
         rounds: form.rounds, recall: form.recall, est: form.est,
         ds_hours: +form.ds_hours, include_covered: form.incov, tag: form.tag,
+        test_mode: !!form.test_mode,
       }));
     } catch (e) { /* 隐私模式忽略 */ }
   }, [form]);
@@ -214,7 +238,7 @@ function App() {
         <nav class="nav">
           ${TABS.map((t) => html`
             <button key=${t.id} class="nav-item ${tab === t.id ? 'on' : ''}" onClick=${() => setTab(t.id)}>
-              <span class="nav-num">${t.num}</span><${Icon} d=${ICONS[t.id]} /><span>${t.label}</span>
+              <${Icon} d=${ICONS[t.id]} /><span>${t.label}</span>
             </button>`)}
         </nav>
         <div class="side-foot">
@@ -238,17 +262,16 @@ function App() {
           ${tab === 'compose' && html`
             <${ComposeView} boot=${boot} form=${form} setForm=${setForm}
               schedBox=${schedBox} setSchedBox=${setSchedBox}
-              outBox=${outBox} setOutBox=${setOutBox} />`}
+              outBox=${outBox} setOutBox=${setOutBox} reloadBoot=${reloadBoot} />`}
           ${tab === 'progress' && html`
             <${ProgressView} boot=${boot} camps=${camps} curCid=${curCid}
-              setCurCid=${setCurCid} reload=${loadCampaigns} />`}
+              setCurCid=${setCurCid} reload=${loadCampaigns} EX=${EX} />`}
           ${tab === 'history' && html`
             <${HistoryView} boot=${boot} camps=${camps} reload=${loadCampaigns}
               onView=${(cid) => { setCurCid(cid); setTab('progress'); }}
               onReorder=${reorderCamp} EX=${EX} curCid=${curCid} />`}
-          ${tab === 'trend' && html`<${TrendView} boot=${boot} />`}
-          ${tab === 'ops' && html`<${OpsView} camps=${camps} />`}
-          ${tab === 'detail' && EX && html`<${EX.DetailView} camps=${camps} curCid=${curCid} setCurCid=${setCurCid} />`}
+          ${tab === 'tracks' && html`<${TracksView} boot=${boot} EX=${EX} reloadBoot=${reloadBoot} />`}
+          ${tab === 'export' && html`<${ExportView} boot=${boot} camps=${camps} EX=${EX} />`}
         </div>
       </div>
     </div>
@@ -284,7 +307,7 @@ function defaultForm(boot) {
   const baseTracks = (boot.tracks || []).filter((t) => !t.variant).map((t) => t.name);
   if (!saved) return {
     cars: allCars, tracks: baseTracks, custom: '', rounds: 1,
-    recall: 'recall', est: '', ds_hours: 12, tag: '', incov: false,
+    recall: 'recall', est: '', ds_hours: 12, tag: '', incov: false, test_mode: false,
   };
   return {
     cars: saved.cars || allCars,
@@ -296,12 +319,28 @@ function defaultForm(boot) {
     ds_hours: saved.ds_hours != null ? saved.ds_hours : 12,
     tag: saved.tag != null ? saved.tag : '',
     incov: !!saved.include_covered,
+    test_mode: !!saved.test_mode,
   };
 }
 
-function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOutBox }) {
+// est 覆盖串 "a=1,b=2" ↔ 对象（编辑表格的数据形态）
+function parseEst(s) {
+  const m = {};
+  (s || '').split(',').forEach((p) => {
+    const [k, v] = p.trim().split('=');
+    if (k && v && /^\d+$/.test(v.trim())) m[k.trim()] = +v.trim();
+  });
+  return m;
+}
+function estToStr(m) {
+  return Object.keys(m).map((k) => k + '=' + m[k]).join(',');
+}
+
+function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOutBox, reloadBoot }) {
   const [hist, setHist] = useState(undefined); // undefined=加载中 null=不可用
-  const previewRef = useRef(null); // {key, digest}
+  const previewRef = useRef(null); // {key, digest} ← 实时 render 喂给 dry-run/起跑
+  const [live, setLive] = useState({ busy: false, err: '', rows: 0, estTotal: 0, tag: '' });
+  const [mutex, setMutex] = useState(null); // {free, why} 起跑前探集群占用
 
   const tracks = boot.tracks || [];
   const baseTracks = useMemo(() => tracks.filter((t) => !t.variant), [tracks]);
@@ -312,11 +351,18 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
   };
   useEffect(() => { loadHist(); }, []);
 
+  // 清单外的自定义赛道（逗号/空白分隔）
+  const customTracks = useMemo(
+    () => [...new Set(form.custom.split(/[\s,]+/).filter(Boolean))], [form.custom]);
+  const allTracks = useMemo(
+    () => [...new Set(form.tracks.concat(customTracks))], [form.tracks, customTracks]);
+
   function matrix() {
     const m = {
       cars: form.cars, tracks: form.tracks.concat(form.custom.split(',').map((s) => s.trim()).filter(Boolean)),
       rounds: +form.rounds, recall: form.recall, est: form.est,
       ds_hours: +form.ds_hours, include_covered: form.incov, tag: form.tag,
+      test_mode: !!form.test_mode,
     };
     try { localStorage.setItem('raceway.compose', JSON.stringify(m)); } catch (e) { /* 隐私模式忽略 */ }
     return m;
@@ -329,42 +375,92 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
   }
   async function post(path) {
     const m = matrix(), key = JSON.stringify(m);
-    if (path === '/api/start' && previewRef.current && previewRef.current.key === key) m.digest = previewRef.current.digest;
+    if (previewRef.current && previewRef.current.key === key) m.digest = previewRef.current.digest;
     const { status, j } = await postJSON(path, m);
-    if (path === '/api/preview') previewRef.current = (status === 200 && j.rc === 0) ? { key, digest: j.digest } : null;
     return { status, j };
   }
 
-  async function doRender() {
-    const { status, j } = await post('/api/render');
-    if (status !== 200) { setSchedBox('错误: ' + (j.error || '未知')); toast.err('生成失败'); return; }
-    setSchedBox(j.schedule);
-    toast.ok('生成 ' + j.rows + ' 场' + windowHint(j.est_total_min));
-  }
+  // 实时排程预览：/api/render 纯本地计算（不碰集群、不上传），勾选即算 —— 起跑前所见即所得。
+  // 与 dry-run/起跑共用同一段矩阵材料，digest 随预览刷新，起跑前服务端仍会复核。
+  const matrixKey = JSON.stringify([form.cars, allTracks, form.rounds, form.recall,
+    form.est, form.ds_hours, form.incov, form.tag, !!form.test_mode]);
+  useEffect(() => {
+    if (!form.cars.length || !allTracks.length) {
+      previewRef.current = null;
+      setLive({ busy: false, err: '', rows: 0, estTotal: 0, tag: '' });
+      setSchedBox('（未生成）');
+      return;
+    }
+    let alive = true;
+    setLive((s) => Object.assign({}, s, { busy: true }));
+    const t = setTimeout(async () => {
+      const m = matrix(), key = matrixKey;
+      const { status, j } = await postJSON('/api/render', m);
+      if (!alive) return;
+      if (status !== 200) {
+        previewRef.current = null;
+        setLive({ busy: false, err: j.error || '未知错误', rows: 0, estTotal: 0, tag: '' });
+      } else {
+        previewRef.current = { key, digest: j.digest };
+        setLive({ busy: false, err: '', rows: j.rows, estTotal: j.est_total_min, tag: j.tag });
+        setSchedBox(j.schedule);
+      }
+    }, 350);
+    return () => { alive = false; clearTimeout(t); };
+  }, [matrixKey]);
+
   async function doPreview() {
-    toast.info('dry-run 运行中…');
+    if (!previewRef.current) { toast.err('排程还没有预览成功 —— 先解决上方红字（兼容性/矩阵为空）'); return; }
+    toast.info('上传 + dry-run 运行中…');
     const { status, j } = await post('/api/preview');
     if (status !== 200) { setOutBox('错误: ' + (j.error || '未知')); toast.err('dry-run 失败'); return; }
     setSchedBox(j.schedule); setOutBox(j.dryrun);
     toast[j.rc == 0 ? 'ok' : 'err'](j.rc == 0 ? ('dry-run 通过，可起跑；' + j.rows + ' 场' + windowHint(j.est_total_min || 0)) : 'dry-run 非零，勿起跑');
   }
   async function doStart() {
+    if (!previewRef.current) { toast.err('排程还没有预览成功 —— 先解决红字提示'); return; }
+    // 起跑前探一眼集群占用（start 服务端还会再查一次，这里只是提前给出可行动提示）
+    try {
+      const { j } = await getJSON('/api/mutex');
+      if (j && j.free === false) {
+        setMutex(j);
+        toast.err('集群被占用，未起跑: ' + (j.why || 'runner 在跑') + '（进度页可看是谁）');
+        return;
+      }
+      setMutex(j);
+    } catch (e) { /* 预检失败不拦起跑 —— 服务端仍会做最终互斥检查 */ }
     if (!confirm('确认起跑？会占用压测集群。')) return;
     toast.info('校验并起跑…');
     const { status, j } = await post('/api/start');
     if (status !== 200) { setOutBox('错误: ' + (j.error || '未知')); toast.err('未起跑'); return; }
     setOutBox(j.result); toast.ok('已起跑');
-    if (j.campaign) dispatchView(j.campaign); // 起跑成功 → 直接带到进度页盯它
+    if (j.campaign) window.dispatchEvent(new CustomEvent('raceway-view', { detail: j.campaign }));
   }
-  function dispatchView(cid) {
-    window.dispatchEvent(new CustomEvent('raceway-view', { detail: cid }));
+  function copySched() {
+    navigator.clipboard && navigator.clipboard.writeText(schedBox || '').then(
+      () => toast.ok('排程已复制到剪贴板'),
+      () => toast.err('复制失败（浏览器拒绝了剪贴板访问）'));
+  }
+
+  // 分组全选/反选：点组名一键勾/清该组全部赛道
+  function toggleGroup(groupId) {
+    const names = tracks.filter((t) => t.group === groupId).map((t) => t.name);
+    const all = names.every((n) => form.tracks.includes(n));
+    setForm((f) => Object.assign({}, f, { tracks: all
+      ? f.tracks.filter((n) => names.indexOf(n) < 0)
+      : [...new Set(f.tracks.concat(names))] }));
+  }
+  function toggleAllCars() {
+    const names = (boot.cars || []).map((a) => a.name);
+    const all = names.every((n) => form.cars.includes(n));
+    setForm((f) => Object.assign({}, f, { cars: all ? [] : names }));
   }
 
   // 兼容性检查：ZSTD 压缩与 index.source_reuse 是 Easysearch 专有，ES 上直接拒
   const bad = [];
   form.cars.forEach((name) => {
     const car = (boot.cars || []).find((x) => x.name === name) || {};
-    form.tracks.concat(form.custom.split(',').map((s) => s.trim()).filter(Boolean)).forEach((t) => {
+    allTracks.forEach((t) => {
       const info = tracks.find((x) => x.name === t);
       const allow = info ? (info.engines || '') : '';
       if (allow && (car.engine || '').toLowerCase() !== allow)
@@ -388,17 +484,26 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
   }
 
   return html`
+    <div class="compose-grid">
+      <div class="compose-left">
     ${EX && EX.PresetBar ? html`<div class="card">
       <div class="card-title">编排预设</div>
       <${EX.PresetBar} form=${form} setForm=${setForm} />
-      <${EX.EstSuggestBar} form=${form} setForm=${setForm} />
     </div>` : null}
+
     <div class="card">
-      <div class="card-title">排程矩阵</div>
-      <p class="card-desc">矩阵勾选 → <b>自动剔除指标库里已跑过的格</b> → 生成排程 → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
+      <div class="card-title">排程矩阵
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" onClick=${() => reloadBoot && reloadBoot()}
+          title="重读车定义文件与 tracks/ 定义（车表变了、引擎支持变了都从这里拿最新）">↻ 刷新车与赛道</button>
+      </div>
+      <p class="card-desc">矩阵勾选 → <b>自动剔除指标库里已跑过的格</b> → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
         交错由服务端复刻 <code>order_for_round</code>；本页不做任何绕过 precheck 的事。勾选会记住（localStorage），下次打开不用重勾。</p>
 
-      <div class="card-title" style="margin-top:10px">车（来自车定义文件）</div>
+      <div class="card-title" style="margin-top:10px">车（来自车定义文件）
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" onClick=${toggleAllCars}>${(boot.cars || []).every((a) => form.cars.includes(a.name)) ? '清空' : '全选'}</button>
+      </div>
       <div class="grid-checks">
         ${(boot.cars || []).map((a) => html`
           <label key=${a.name} class="check-item">
@@ -408,13 +513,19 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
           </label>`)}
       </div>
 
-      <div class="card-title" style="margin-top:14px">赛道（全部可起跑的赛道，按族分组）</div>
+      <div class="card-title" style="margin-top:14px">赛道（全部可起跑的赛道，按族分组 · 点组名整组勾选/清空）</div>
       ${(boot.track_groups || []).map((g) => {
         const bases = baseTracks.filter((t) => t.group === g[0]);
         if (!bases.length) return null;
+        const groupNames = tracks.filter((t) => t.group === g[0]).map((t) => t.name);
+        const selN = groupNames.filter((n) => form.tracks.includes(n)).length;
         return html`
           <div key=${g[0]}>
-            <div class="track-group">${g[1]}</div>
+            <div class="track-group">
+              <button class="track-group-btn" onClick=${() => toggleGroup(g[0])}
+                title="整组勾选/清空">${g[1]}</button>
+              <span class="muted"> ${selN}/${groupNames.length}</span>
+            </div>
             ${bases.map((b) => {
               const vs = tracks.filter((t) => t.base === b.name && t.variant);
               return html`<div key=${b.name} class="track-block">
@@ -462,19 +573,35 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
             <option value="recall">recall（带召回探针）</option>
             <option value="norecall">norecall</option>
           </select></label>
-        <label class="muted">est 覆盖 <input type="text" style="width:24ch" placeholder="ds-g1920=52,nested=40"
-          title="赛道=分钟；留空用赛道清单的实测值" value=${form.est}
-          onInput=${(e) => setForm((f) => Object.assign({}, f, { est: e.target.value }))} /></label>
         <label class="muted">DS_HOURS <input type="number" style="width:5em" min="0" value=${form.ds_hours}
           title="0=不启用窗底守卫" onInput=${(e) => setForm((f) => Object.assign({}, f, { ds_hours: e.target.value }))} /></label>
         <label class="muted">tag <input type="text" style="width:20ch" placeholder="留空自动生成" value=${form.tag}
           onInput=${(e) => setForm((f) => Object.assign({}, f, { tag: e.target.value }))} /></label>
+        <label class="check-item smoke-toggle" title="esrally --test-mode：迷你语料 + 完整任务结构，单场不到 1 分钟。
+        用于改配置后快速验证链路；数字与正式跑完全不可比，判定口径不变（VALID 才算数）">
+          <input type="checkbox" checked=${!!form.test_mode}
+            onChange=${(e) => setForm((f) => Object.assign({}, f, { test_mode: e.target.checked }))} />
+          <span>⚡ 冒烟 test-mode <small>（&lt;1 分钟/场，数字不可比）</small></span>
+        </label>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">已入库历史（指标库 benchmark-result-race）<div class="spacer"></div>
-        <button class="btn btn-ghost btn-sm" onClick=${loadHist}>刷新历史</button></div>
+      <div class="card-title">每条赛道的耗时 est（分钟）
+        <div class="spacer"></div>
+        <${EstSuggestBtn} form=${form} setForm=${setForm} allTracks=${allTracks} />
+      </div>
+      <p class="card-desc">est 只用于排程预估与 DS_HOURS 窗口判定；留空用赛道清单的实测值。逐条改比手写 <code>ds-g1920=52,nested=40</code> 方便。</p>
+      <${EstEditor} boot=${boot} form=${form} setForm=${setForm} allTracks=${allTracks} />
+    </div>
+
+    <div class="card">
+      <details class="fold">
+        <summary>已入库历史（指标库 benchmark-result-race）
+          ${hist === undefined ? ' · 查询中…'
+            : hist === null ? ' · 指标库不可用'
+            : hist ? html` · ${hist.summary.races} 场次 / 本次矩阵将剔除 <b>${skip.length}</b> 格` : null}</summary>
+        <div class="row"><button class="btn btn-ghost btn-sm" onClick=${loadHist}>刷新历史</button></div>
       ${hist === undefined && html`<p class="muted">查询指标库…</p>`}
       ${hist === null && html`<p class="st-bad">指标库不可用 —— 编排照常可用，但无法自动剔除已跑过的格（压测窗口内指标库停着是常态）。</p>`}
       ${hist && hist !== null && html`
@@ -494,36 +621,134 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
           ? html`<b>已勾选"含已跑过的格"</b>：本次会重跑全部已跑过的格。`
           : html`本次矩阵将<b>剔除</b> ${skip.length} 格（指标库里当前 build 已跑过）：<br/>${skip.length ? skip.join('、') : '（无）'}`}
         </div>`}
+      </details>
     </div>
 
     <div class="card">
-      <div class="card-title">车 × 变体 兼容性</div>
-      ${!bad.length
-        ? html`<p class="st-ok">✔ 当前矩阵的车×变体组合全部兼容</p>`
-        : html`<p class="st-bad">✘ ${bad.length} 个组合不兼容（起跑会被拦下）</p>`}
+      <details class="fold" ...${bad.length ? { open: 'open' } : {}}>
+        <summary>车 × 变体 兼容性
+          ${bad.length ? html`<span class="st-bad">✘ ${bad.length} 个组合不兼容（起跑会被拦下）</span>`
+            : html`<span class="st-ok">✔ 当前矩阵全部兼容</span>`}</summary>
       ${bad.length ? html`
-        <details class="fold" open>
-          <summary>展开明细（${bad.length} 条）</summary>
-          <div style="font-size:12px;margin:4px 0 0 8px">
-            ${bad.map((b, i) => html`<div key=${i} class="st-bad">${b.car}（${b.eng}）× ${b.t} —— 只支持 ${b.allow}</div>`)}
-          </div>
-        </details>` : null}
+        <div style="font-size:12px;margin:4px 0 0 8px">
+          ${bad.map((b, i) => html`<div key=${i} class="st-bad">${b.car}（${b.eng}）× ${b.t} —— 只支持 ${b.allow}</div>`)}
+        </div>` : null}
       <p class="card-desc">ZSTD 压缩与 <code>index.source_reuse</code> 是 Easysearch 专有
         （ES 的 <code>index.codec</code> 只有 default/best_compression，也不认 source_reuse）——
         编排台与 runner 都会在起跑前拦下不兼容的组合。</p>
+      </details>
     </div>
+      </div>
 
-    <div class="row" style="margin:14px 0">
-      <button class="btn btn-secondary" onClick=${doRender}>生成排程</button>
-      <button class="btn btn-secondary" onClick=${doPreview}>上传 + dry-run 预览</button>
-      <button class="btn btn-primary" onClick=${doStart}>互斥预检并起跑</button>
+      <div class="compose-right">
+        <div class="card preview-card">
+          <div class="card-title">实时排程预览 <div class="spacer"></div>
+            <button class="btn btn-ghost btn-sm" onClick=${copySched}
+              title="复制排程文本（粘贴给 run-bench.sh / 存档用）">复制</button>
+          </div>
+          <div class="live-count">
+            <b>${form.cars.length}</b> 车 × <b>${allTracks.length}</b> 赛道 × <b>${form.rounds}</b> 轮
+            ${live.rows ? html` = <b>${live.rows}</b> 场 · 预计 <b>${fmtMin(live.estTotal)}</b>` : null}
+            ${+form.ds_hours > 0 && live.estTotal > form.ds_hours * 60
+              ? html` <span class="live-warn">⚠ 超 DS_HOURS=${form.ds_hours}h 窗口</span>` : null}
+          </div>
+          <div class="row" style="margin-top:4px">
+            ${live.busy && html`<span class="live-chip">⟳ 排程计算中…</span>`}
+            ${live.err && html`<span class="live-chip err">✘ ${live.err.split('\n')[0]}</span>`}
+            ${!live.busy && !live.err && live.rows ? html`<span class="live-chip ok">✓ 排程已就绪（tag ${live.tag}）</span>` : null}
+            ${!form.cars.length || !allTracks.length ? html`<span class="live-chip">至少选一台车和一条赛道</span>` : null}
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn btn-secondary" onClick=${doPreview} disabled=${!previewRef.current}>上传 + dry-run 预览</button>
+            <button class="btn btn-primary" onClick=${doStart} disabled=${!previewRef.current}>互斥预检并起跑</button>
+            <button class="btn btn-ghost" onClick=${async () => {
+              const { status, j } = await getJSON('/api/mutex');
+              if (status !== 200) { toast.err(j.error || '查询失败'); return; }
+              setMutex(j);
+              toast[j.free ? 'ok' : 'err'](j.free ? '集群空闲，随时可起跑' : '集群被占用: ' + (j.why || ''));
+            }}>查集群占用</button>
+          </div>
+          ${mutex && !mutex.free ? html`<div class="warn-box" style="margin-top:6px">⚠ 集群被占用 —— ${mutex.why || 'runner 在跑'}。进度页可看是哪场；等它结束或停止后再起跑。</div>`
+            : mutex && mutex.free ? html`<p class="st-ok" style="margin:4px 0 0">✓ 集群空闲（.runner.lock 未被占用）</p>` : null}
+          <p class="card-desc">排程随左侧勾选实时刷新（0.35s 防抖，纯本地计算不碰集群）；起跑前仍会做互斥预检与 runner dry-run。</p>
+          <div class="mini-h">排程</div>
+          <pre class="out light sched-pre">${schedBox}</pre>
+          <div class="mini-h">输出（dry-run / 起跑 / 环境体检）</div>
+          <pre class="out sched-pre">${outBox}</pre>
+        </div>
+      </div>
     </div>
-
-    <div class="section-h">排程</div>
-    <pre class="out light">${schedBox}</pre>
-    <div class="section-h">输出（dry-run / 起跑 / 环境体检）</div>
-    <pre class="out">${outBox}</pre>
   `;
+}
+
+// est 逐赛道编辑表格：已选赛道一行一格，改完自动回到 form.est 字符串（后端契约不变）
+function EstEditor({ boot, form, setForm, allTracks }) {
+  const estMap = parseEst(form.est);
+  function setEst(track, v) {
+    setForm((f) => {
+      const m = parseEst(f.est);
+      if (v === '' || v == null || !/^\d+$/.test(String(v))) delete m[track];
+      else m[track] = +v;
+      return Object.assign({}, f, { est: estToStr(m) });
+    });
+  }
+  const rows = allTracks.slice().sort();
+  return html`<table class="tbl est-tbl">
+    <thead><tr><th>赛道</th><th class="num">清单实测</th><th class="num">覆盖 est</th><th>按历史校准</th></tr></thead>
+    <tbody>
+      ${rows.map((t) => {
+        const info = (boot.tracks || []).find((x) => x.name === t);
+        const v = estMap[t];
+        return html`<tr key=${t}>
+          <td class="mono">${t}${info && info.dataset ? html` <small class="muted">${info.dataset}</small>` : null}</td>
+          <td class="num muted">${info ? '~' + info.est + 'm' : '—'}</td>
+          <td class="num"><input type="number" style="width:6.5em" min="1" placeholder="（用实测）"
+            value=${v == null ? '' : v} onInput=${(e) => setEst(t, e.target.value)} /></td>
+          <td><${EstCalBtn} track=${t} onSet=${(m) => setEst(t, m)} /></td>
+        </tr>`;
+      })}
+      ${!rows.length && html`<tr><td colspan="4" class="muted">（还没选赛道 —— 上方勾选后这里逐条列出）</td></tr>`}
+    </tbody>
+  </table>`;
+}
+
+function EstCalBtn({ track, onSet }) {
+  const [busy, setBusy] = useState(false);
+  async function go() {
+    setBusy(true);
+    try {
+      const { j } = await getJSON('/api/est-suggest?track=' + encodeURIComponent(track));
+      if (j.available && j.suggest) { onSet(j.suggest); toast.ok(track + ' → ' + j.suggest + ' 分钟（历史中位）'); }
+      else toast.err(track + '：历史里没有可用耗时');
+    } catch (e) { toast.err(String(e)); }
+    setBusy(false);
+  }
+  return html`<button class="btn btn-ghost btn-sm" onClick=${go} disabled=${busy}>${busy ? '…' : '校准'}</button>`;
+}
+
+// 一键把所有已选赛道按历史中位回填（保留手写过的）
+function EstSuggestBtn({ form, setForm, allTracks }) {
+  const [busy, setBusy] = useState(false);
+  async function calibrate() {
+    if (!allTracks.length) { toast.err('先选赛道'); return; }
+    setBusy(true);
+    const out = {};
+    await Promise.all(allTracks.map(async (t) => {
+      try {
+        const { j } = await getJSON('/api/est-suggest?track=' + encodeURIComponent(t));
+        if (j.available && j.suggest) out[t] = j.suggest;
+      } catch (e) { /* 单条失败忽略 */ }
+    }));
+    setBusy(false);
+    if (!Object.keys(out).length) { toast.err('历史里没有这些赛道的可用耗时'); return; }
+    setForm((f) => {
+      const m = Object.assign(parseEst(f.est), out);
+      return Object.assign({}, f, { est: estToStr(m) });
+    });
+    toast.ok('已按历史中位耗时回填 ' + Object.keys(out).length + ' 条 est（可再手改）');
+  }
+  return html`<button class="btn btn-secondary btn-sm" onClick=${calibrate} disabled=${busy}>
+    ${busy ? '查询历史中…' : '全部校准'}</button>`;
 }
 
 function toggled(arr, item, on) {
@@ -578,7 +803,7 @@ function HistMatrix({ hist, boot, form, setForm }) {
 }
 
 // ==================== ② 运行进度 ====================
-function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
+function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
   const [queue, setQueue] = useState(null);
   const [tail, setTail] = useState('（空）');
   // 轮询间隔（秒）：0=手动。压测期间可调大/关掉，减少压测机上的 ssh 轮询噪声；
@@ -589,35 +814,84 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
   });
   const [notify, setNotify] = useState(false);
   const [lastPoll, setLastPoll] = useState(null);
+  const [paused, setPaused] = useState(false); // 标签页切后台时自动暂停轮询
   const [pollTick, setPollTick] = useState(0);  // 点「立即刷新」时 +1，重跑 effect 拉一次并重排
+  const [mon, setMon] = useState(null);         // 进行中场次的每节点 5s 监控
+  const [monOn, setMonOn] = useState(() => localStorage.getItem('raceway.monOn') !== '0');
+  const [drawerFid, setDrawerFid] = useState(null);
+  const [followLog, setFollowLog] = useState(true);
+  const [res, setRes] = useState(null);         // 场内速览（逐场次判定 + 关键指标）
+  const [stopClose, setStopClose] = useState(null); // stale 一键停止+收尾的状态与输出
   const prevEnded = useRef(null);
+  const prevStaleRef = useRef(null);
   const timer = useRef(null);
+  const logBox = useRef(null);
+  const visibleRef = useRef(true);
 
   useEffect(() => {
     if (notify && typeof Notification !== 'undefined' && Notification.permission !== 'granted')
       Notification.requestPermission();
   }, [notify]);
 
+  // 标签页切后台自动暂停轮询（回前台立即补一轮）—— 别让挂着的页面空烧压测机
+  useEffect(() => {
+    const onVis = () => {
+      visibleRef.current = !document.hidden;
+      if (!document.hidden) setPollTick((n) => n + 1);
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
+  useEffect(() => { setPaused(document.hidden); }, [pollTick]);
+
   useEffect(() => {
     let alive = true;
     async function poll() {
       clearTimeout(timer.current);
       if (!curCid || !alive) return;
+      if (document.hidden) { setPaused(true); scheduleNext(); return; }
+      setPaused(false);
       const enc = encodeURIComponent(curCid);
       try {
         const [rq, rt] = await Promise.all([
           getJSON('/api/queue?cid=' + enc),
           getJSON('/api/logtail?cid=' + enc + '&n=40'),
         ]);
-        if (rq.status === 200) setQueue(rq.j);
+        if (rq.status === 200) {
+          setQueue(rq.j);
+          // 进行中场次的实时监控：跟轮询同频，关掉或没在跑就清掉
+          const run2 = (rq.j.fields || []).find((f) => f.status === 'RUNNING');
+          if (run2 && monOn) {
+            const rm = await getJSON('/api/monitor?cid=' + enc + '&fid=' + encodeURIComponent(run2.fid));
+            if (alive) setMon(rm.status === 200 ? rm.j : null);
+          } else setMon(null);
+        }
         if (rt.status === 200) setTail(rt.j.lines || '（空）');
         setLastPoll(new Date());
       } catch (e) { /* 网络抖动下一轮再试 */ }
+      scheduleNext();
+    }
+    function scheduleNext() {
       if (alive && pollSec > 0) timer.current = setTimeout(poll, pollSec * 1000);
     }
     poll();  // 切到本页/换间隔/换 campaign 时立刻拉一次，之后按间隔排程
     return () => { alive = false; clearTimeout(timer.current); };
-  }, [curCid, pollSec, pollTick]);
+  }, [curCid, pollSec, pollTick, monOn]);
+
+  // 日志自动跟随：新内容到了就滚到底（关掉跟随则不动）
+  useEffect(() => {
+    if (followLog && logBox.current) logBox.current.scrollTop = logBox.current.scrollHeight;
+  }, [tail, followLog]);
+
+  // 场内速览：campaign 切换 / 立即刷新时拉一次（纯本地文件聚合，便宜）
+  useEffect(() => {
+    if (!curCid) { setRes(null); return; }
+    let alive = true;
+    getJSON('/api/campaign-result?cid=' + encodeURIComponent(curCid))
+      .then(({ j }) => { if (alive) setRes(j); })
+      .catch(() => { /* 下轮再试 */ });
+    return () => { alive = false; };
+  }, [curCid, pollTick]);
 
   const s = (queue && queue.stats) || {};
   const run = queue && (queue.fields || []).find((f) => f.status === 'RUNNING');
@@ -646,14 +920,40 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
   }
 
   function endState(c) { return !c.ended ? '运行中' : (/中止/.test(c.last || '') ? '已中止' : '已结束'); }
-  // 没收尾但进度文件长期无更新 → runner 大概率已被杀（页面标出来，别让人干等）
-  const warns = (queue && queue.warnings || []).slice();
+  // 没收尾但进度文件长期无更新 → runner 大概率已被杀（页面标出来 + 一键处理）
+  const warns = (queue && queue.warnings || []).map((w) => ({ text: w, stale: false }));
   const camp = camps.find((x) => x.cid === (queue && queue.campaign));
+  let staleCamp = false;
   if (camp && !camp.ended && camp.mtime) {
     const staleMin = (Date.now() / 1000 - camp.mtime) / 60;
-    if (staleMin > 30)
-      warns.unshift('进度文件已 ' + Math.round(staleMin) + ' 分钟无更新 —— runner 可能已停止'
-        + '（确认没人跑后：./close-campaign.sh ' + (queue && queue.campaign) + ' 补结束行收尾，或 CAMP_ID=' + (queue && queue.campaign) + ' 断点续跑）');
+    if (staleMin > 30) {
+      staleCamp = true;
+      warns.unshift({ text: '进度文件已 ' + Math.round(staleMin) + ' 分钟无更新 —— runner 可能已停止'
+        + '（确认没人跑后可在此收尾补结束行，或 CAMP_ID=' + (queue && queue.campaign) + ' 断点续跑）', stale: true });
+    }
+  }
+  // stale 状态变化 → 系统通知（复用完成提醒的授权开关），别让人干等一个卡死的场
+  if (staleCamp && notify && prevStaleRef.current !== true
+    && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    try { new Notification('raceway: campaign 疑似卡死', { body: (queue && queue.campaign || '') + ' 进度文件长时间无更新，请到运行进度页处理' }); } catch (e) { /* 忽略 */ }
+  }
+  if (queue) prevStaleRef.current = staleCamp;
+  function gotoClose() {
+    const el = document.getElementById('close-fold');
+    if (el) { el.open = true; el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  }
+  // 一键「停止并收尾」：stop（已死则安全跳过）→ close 补结束行（非 dry-run）
+  async function stopAndClose() {
+    if (!curCid) return;
+    if (!confirm('停止并收尾 ' + curCid + '？\n1) 停止远端 runner 与 esrally 进程（已死则安全跳过）\n2) 直接补结束行（非 dry-run，会写入 RACES/PROGRESS）')) return;
+    setStopClose({ busy: true, text: '【停止】发送停止命令…' });
+    const s = await postJSON('/api/stop', { cid: curCid });
+    let text = '【停止】' + (s.status === 200 ? (s.j.result || '已发送停止命令') : ('失败: ' + (s.j.error || '未知')));
+    setStopClose({ busy: true, text: text + '\n【收尾】补结束行…' });
+    const c = await postJSON('/api/close', { cid: curCid, dry_run: false });
+    text += '\n【收尾】' + (c.status === 200 ? (c.j.result || '完成') : ('失败: ' + (c.j.error || '未知')));
+    setStopClose({ busy: false, text });
+    reload(curCid);
   }
 
   const done = s.total - s.pending;
@@ -661,6 +961,25 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
     ? new Date(Date.now() + s.est_remaining_min * 60000).toLocaleTimeString() : '-';
   const cards = [['总场次', s.total], ['有效', s.valid], ['失败', s.failed], ['跳过', s.skipped],
     ['待跑', s.pending], ['剩余约(分)', s.est_remaining_min != null ? Math.round(s.est_remaining_min) : '-'], ['预计完成', eta]];
+  // 快切条：最近 20 场；当前选中的若不在其中（比如老的遗留 campaign），插到最前保证可见
+  const chipCamps = camps.slice(0, 20);
+  if (curCid && !chipCamps.some((c) => c.cid === curCid)) {
+    const curCamp = camps.find((c) => c.cid === curCid);
+    if (curCamp) chipCamps.unshift(curCamp);
+  }
+  // 警告降噪：最多直接展示 2 条（矛盾判定/STATE 冲突一多就把整张表推到视野外），
+  // 其余收进折叠
+  const warnHead = warns.slice(0, 2);
+  const warnTail = warns.slice(2);
+
+  // PROGRESS 行着色：一眼分清 OK / 失败 / 警告 / 相位推进
+  function lineCls(l) {
+    if (/✗|FAIL|CONTAMINATED|ERROR|失败|中止/.test(l)) return 'lg-bad';
+    if (/✔|✓|VALID\b/.test(l)) return 'lg-ok';
+    if (/WARN|⚠|DEGRAD|SKIP|降级/.test(l)) return 'lg-warn';
+    if (/▶|\[[0-9]+\/[0-9]+\]|相位|阶段|precheck|部署|bulk|search/.test(l)) return 'lg-run';
+    return '';
+  }
 
   return html`
     <div class="card">
@@ -684,10 +1003,21 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
             <option value="0">手动（不自动轮询）</option>
           </select>
         </label>
+        ${paused && pollSec > 0 && html`<span class="live-chip">⏸ 后台已暂停，回前台继续</span>`}
         ${lastPoll && html`<span class="muted">上次拉取 ${lastPoll.toLocaleTimeString()}</span>`}
         <label class="chk"><input type="checkbox" checked=${notify} onChange=${(e) => setNotify(e.target.checked)} /> 完成提醒</label>
         <div class="spacer"></div>
         <button class="btn btn-danger btn-sm" onClick=${doStop}>■ 停止该 campaign</button>
+      </div>
+
+      <div class="camp-chips" title="最近 campaign 快速切换">
+        ${chipCamps.map((c) => html`
+          <button key=${c.cid} class=${'camp-chip' + (c.cid === curCid ? ' on' : '') + (!c.ended ? ' running' : '')}
+            onClick=${() => setCurCid(c.cid)}>
+            ${c.cid} <small>${c.valid}/${c.total}</small>
+            ${!c.ended ? html`<i class="dot"></i>` : null}
+          </button>`)}
+        ${camps.length > chipCamps.length && html`<span class="muted">…共 ${camps.length} 场（下拉框可选全部）</span>`}
       </div>
 
       <div class="cur-box">
@@ -700,9 +1030,20 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
       <div class="stat-cards">
         ${cards.map((c) => html`<div key=${c[0]} class="stat-card"><b>${c[1]}</b><span>${c[0]}</span></div>`)}
       </div>
-      ${warns.map((w, i) => html`<div key=${i} class="warn-box">⚠ ${w}</div>`)}
+      ${warnHead.map((w, i) => html`<div key=${i} class="warn-box">⚠ ${w.text}
+        ${w.stale && html`<span style="margin-left:8px;white-space:nowrap">
+          <button class="btn btn-ghost btn-sm" onClick=${gotoClose}
+            title="展开下方收尾卡，先预演再补结束行">去收尾</button>
+          <button class="btn btn-danger btn-sm" disabled=${stopClose && stopClose.busy}
+            onClick=${stopAndClose} title="停止远端 runner（已死则安全跳过）并直接补结束行">停止并收尾…</button>
+        </span>`}</div>`)}
+      ${stopClose && html`<pre class="out" style="max-height:200px">${stopClose.text}</pre>`}
+      ${warnTail.length ? html`<details class="fold warn-more">
+        <summary>⚠ 还有 ${warnTail.length} 条警告（矛盾判定 / STATE 冲突 / 窗底等）</summary>
+        ${warnTail.map((w, i) => html`<div key=${i} class="warn-box">⚠ ${w.text}</div>`)}
+      </details>` : null}
       <table class="tbl">
-        <thead><tr><th>seq</th><th>场次</th><th>状态</th><th>用时</th><th>recall</th><th>说明</th></tr></thead>
+        <thead><tr><th>seq</th><th>场次</th><th>状态</th><th>用时</th><th>recall</th><th>说明</th><th></th></tr></thead>
         <tbody>
           ${(queue && queue.fields || []).map((f) => {
             const cls = f.status === 'VALID' ? 'st-ok' : f.status === 'RUNNING' ? 'st-run'
@@ -719,20 +1060,191 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
               if (tag) notes.push(tag);
             }
             if (f.detail) notes.push(f.detail);
-            return html`<tr key=${f.seq} class=${f.status === 'RUNNING' ? 'now' : ''}>
-              <td>${f.seq}</td><td>${f.fid}</td><td class=${cls}>${f.status}</td>
-              <td>${f.duration || '-'}</td><td>${f.recall || '-'}</td><td>${notes.join('  ')}</td></tr>`;
+            const openable = f.fid && f.status !== 'PENDING';
+            return html`<tr key=${f.seq} class=${f.status === 'RUNNING' ? 'now clickable' : 'clickable'}
+              title=${openable ? '点击看该场详情（身份 / 指标 / 监控 / 日志）' : ''}
+              onClick=${openable ? () => setDrawerFid(f.fid) : null}>
+              <td>${f.seq}</td><td class="mono">${f.fid}</td><td class=${cls}>${f.status}</td>
+              <td>${f.duration || '-'}</td><td>${f.recall || '-'}</td><td>${notes.join('  ')}</td>
+              <td style="white-space:nowrap" onClick=${(e) => e.stopPropagation()}>
+                ${openable ? html`<button class="btn btn-ghost btn-sm"
+                  onClick=${() => setDrawerFid(f.fid)}>详情</button>` : null}
+              </td></tr>`;
           })}
           ${(!queue || !(queue.fields || []).length) && html`
-            <tr><td colspan="6" class="muted">（等待选择 campaign）</td></tr>`}
+            <tr><td colspan="7" class="muted">（等待选择 campaign）</td></tr>`}
         </tbody>
       </table>
     </div>
+
+    ${res && res.rows && res.rows.some((r) => r.metrics.length) && html`
+      <div class="card">
+        <div class="card-title">本场结果速览（逐任务指标来自 race.json；点行开详情）
+          <div class="spacer"></div>
+          <span class="muted">${res.rows.filter((r) => r.metrics.length).length}/${res.rows.length} 场有指标</span>
+          <button class="btn btn-ghost btn-sm" onClick=${() => setPollTick((n) => n + 1)}>刷新</button></div>
+        <table class="tbl">
+          <thead><tr><th>场次</th><th>赛道/轮</th><th>判定</th><th class="num">写入吞吐</th>
+            <th>最弱查询任务</th><th class="num">最弱 ops/s</th><th class="num">最弱 p99</th></tr></thead>
+          <tbody>
+            ${res.rows.map((r) => {
+              const write = r.metrics.find((m) => /bulk|index/i.test(m.task) && m.throughput);
+              let weak = null;
+              for (const m of r.metrics) {
+                if (!m.throughput || /bulk|index|refresh|merge|force/i.test(m.task)) continue;
+                if (!weak || m.throughput < weak.throughput) weak = m;
+              }
+              const vCls = r.verdict === 'VALID' ? 'badge-ok'
+                : /FAIL/.test(r.verdict) ? 'badge-fail' : /SKIP/.test(r.verdict) ? 'badge-skip' : 'badge-none';
+              return html`<tr key=${r.fid} class="clickable" title="点击开详情（身份 / 指标 / 监控 / 日志）"
+                onClick=${() => setDrawerFid(r.fid)}>
+                <td class="mono">${r.fid}</td>
+                <td>${r.track}${r.round ? html` · r${r.round}` : null}</td>
+                <td><span class=${'badge ' + vCls}>${r.verdict}</span></td>
+                <td class="num">${write ? html`${fmtN(write.throughput)} <small>${write.tput_unit || ''}</small>` : '—'}</td>
+                <td class="mono" style="font-size:12px">${weak ? weak.task : '—'}</td>
+                <td class="num">${weak ? fmtN(weak.throughput) : '—'}</td>
+                <td class="num">${weak && weak.lat_p99 != null
+                  ? html`${fmtN(weak.lat_p99)} <small>${weak.lat_unit || ''}</small>` : '—'}</td>
+              </tr>`;
+            })}
+          </tbody>
+        </table>
+        <p class="card-desc">「最弱查询」= 该场次全部查询任务里吞吐中位最低的一个（整体被最弱任务卡住，跨场次看它最有对比意义）；完整逐任务数字点行进详情。</p>
+      </div>`}
+
+    ${run && monOn && html`
+      <div class="card">
+        <div class="card-title">当前场次实时监控（每节点 ${mon ? mon.interval : 5}s 采样 · 跟轮询同频刷新）
+          <div class="spacer"></div>
+          ${mon && mon.series && html`<span class="muted">${mon.series.map((x) => x.node).join(' / ')}</span>`}
+          <button class="btn btn-ghost btn-sm" onClick=${() => {
+            setMonOn(false);
+            try { localStorage.setItem('raceway.monOn', '0'); } catch (e) { /* 忽略 */ }
+          }}>收起监控</button>
+        </div>
+        ${mon && mon.series && mon.series.some((x) => (x.rows || []).some((r) => typeof r.cpu_usr === 'number'))
+          ? html`<div class="mon-grid">
+              ${['cpu_usr', 'cpu_steal', 'load1', 'bench_cpu', 'foreign_cpu'].map((f) =>
+                mon.series.some((x) => (x.header || []).includes(f))
+                  ? html`<div key=${f} class="mon-cell">
+                      <div class="mon-label">${f}${f === 'cpu_steal' ? '（被宿主抢走 = 数据可信度红线）' : ''}</div>
+                      ${EX && EX.MonitorChart && html`<${EX.MonitorChart} series=${mon.series} field=${f} />`}
+                    </div>` : null)}
+            </div>`
+          : html`<p class="muted">监控采样还没有数据（部署/冷启动阶段是空的，进压测相位后出现）。</p>`}
+      </div>`}
+    ${!monOn && html`<div class="row" style="margin-bottom:10px">
+      <button class="btn btn-ghost btn-sm" onClick=${() => {
+        setMonOn(true);
+        try { localStorage.setItem('raceway.monOn', '1'); } catch (e) { /* 忽略 */ }
+      }}>展开当前场次实时监控</button>
+    </div>`}
+
     <div class="card">
-      <div class="card-title">PROGRESS.txt 尾部（实时日志）</div>
-      <pre class="out">${tail}</pre>
+      <div class="card-title">PROGRESS.txt 尾部（实时日志）
+        <div class="spacer"></div>
+        <label class="chk"><input type="checkbox" checked=${followLog}
+          onChange=${(e) => setFollowLog(e.target.checked)} /> 自动滚到底</label>
+      </div>
+      <pre class="out" ref=${logBox}>${String(tail).split('\n').map((l, i) =>
+        html`<div key=${i} class=${lineCls(l)}>${l}</div>`)}</pre>
     </div>
+
+    ${EX && drawerFid && html`<${EX.RaceDetailDrawer} cid=${curCid} fid=${drawerFid}
+      onClose=${() => setDrawerFid(null)} />`}
+
+    <div class="card">
+      <details class="fold">
+        <summary>日志全文 / 任意 campaign 文件（PROGRESS / RACES / STATE / monitors / 自定义路径 + 关键字过滤）</summary>
+        ${EX && html`<${EX.LogViewer} cid=${curCid} />`}
+      </details>
+    </div>
+    ${curCid && html`<div class="card">
+      <details class="fold" id="close-fold">
+        <summary>campaign 收尾（给没结束行的 campaign 补结束行，默认 dry-run 不改动）</summary>
+        ${EX && html`<${EX.CloseCard} cid=${curCid} />`}
+      </details>
+    </div>`}
   `;
+}
+
+// ==================== ③ 外部结果入口（console.conf 默认清单 + 浏览器个人覆盖） ====================
+const EXT_LINKS_KEY = 'raceway.extlinks';
+function defaultExtLinks(boot) {
+  // 优先 console.conf 的 extlink.*（bootstrap 下发）；没有配置文件时用内置两条
+  if (boot.ext_links && boot.ext_links.length) return boot.ext_links;
+  return [
+    { name: 'Kibana 看板', url: boot.kibana_url || '' },
+    { name: 'LogPilot', url: '' },
+  ];
+}
+function ExternalLinks({ boot }) {
+  const [links, setLinks] = useState(null); // null = 用默认，一旦编辑即固化成个人清单
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({});
+  useEffect(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(EXT_LINKS_KEY) || 'null');
+      if (Array.isArray(v) && v.length) setLinks(v.filter((x) => x && x.name));
+    } catch (e) { /* 忽略 */ }
+  }, []);
+  const list = links || defaultExtLinks(boot);
+  function persist(l) {
+    setLinks(l);
+    try { localStorage.setItem(EXT_LINKS_KEY, JSON.stringify(l)); } catch (e) { /* 忽略 */ }
+  }
+  function upd(i, k, v) { persist(list.map((x, idx) => idx === i ? Object.assign({}, x, { [k]: v }) : x)); }
+  function del(i) { persist(list.filter((_, idx) => idx !== i)); }
+  function add() {
+    const name = (draft.name || '').trim(), url = (draft.url || '').trim();
+    if (!name || !url) { toast.err('名称和 URL 都要填'); return; }
+    persist(list.concat([{ name, url }]));
+    setDraft({});
+    toast.ok('已添加: ' + name);
+  }
+  function reset() {
+    setLinks(null); setEditing(false);
+    try { localStorage.removeItem(EXT_LINKS_KEY); } catch (e) { /* 忽略 */ }
+    toast.ok('已恢复默认链接' + (boot.console_conf ? '（console.conf 清单）' : ''));
+  }
+  return html`<div class="card">
+    <div class="card-title">外部结果入口
+      <div class="spacer"></div>
+      ${editing && html`<button class="btn btn-ghost btn-sm" onClick=${reset}>恢复默认</button>`}
+      <button class="btn btn-ghost btn-sm" onClick=${() => setEditing(!editing)}>${editing ? '完成' : '配置'}</button>
+    </div>
+    ${!editing && html`
+      <div class="row">
+        ${list.map((l, i) => l.url ? html`
+          <a key=${i} class="ext-link" href=${l.url} target="_blank" rel="noreferrer"
+            title=${l.url}>${l.name} ↗</a>`
+          : html`<span key=${i} class="ext-link ext-none" title="还没配 URL —— 点「配置」填写"
+              onClick=${() => setEditing(true)}>${l.name}（未配置）</span>`)}
+      </div>
+      <p class="card-desc" style="margin-top:6px">默认清单来自 raceway 根的 <code>console.conf</code>（extlink.* 行；
+        没有配置文件则用内置 Kibana/LogPilot）；此处的改动存浏览器本地、只影响这台机器。
+        Kibana 若只听远端 127.0.0.1，先建隧道：ssh -L 5601:127.0.0.1:5601 ${boot.ssh || 'user@host'}</p>`}
+    ${editing && html`
+      <div>
+        ${list.map((l, i) => html`<div class="row" key=${i}>
+          <input class="input" style="width:16ch" value=${l.name} placeholder="名称"
+            onInput=${(e) => upd(i, 'name', e.target.value)} />
+          <input class="input x-grow" value=${l.url} placeholder="URL（http…）"
+            onInput=${(e) => upd(i, 'url', e.target.value)} />
+          <button class="btn btn-ghost btn-sm" onClick=${() => del(i)} title="删除">✕</button>
+        </div>`)}
+        <div class="row">
+          <input class="input" style="width:16ch" placeholder="新链接名"
+            value=${draft.name || ''} onInput=${(e) => setDraft(Object.assign({}, draft, { name: e.target.value }))} />
+          <input class="input x-grow" placeholder="URL（http…）"
+            value=${draft.url || ''} onInput=${(e) => setDraft(Object.assign({}, draft, { url: e.target.value }))} />
+          <button class="btn btn-secondary btn-sm" onClick=${add}>＋ 添加</button>
+        </div>
+        <p class="card-desc">改完即存；URL 留空的条目在页面上显示为「未配置」。想给所有人换默认清单，
+          改 console.conf 后刷新页面（个人清单可「恢复默认」丢弃）。</p>
+      </div>`}
+  </div>`;
 }
 
 // ==================== ③ 历史与结果 ====================
@@ -768,13 +1280,7 @@ function HistoryView({ boot, camps, reload, onView, onReorder, EX, curCid }) {
   function chipCls(s) { return s === '运行中' ? 'badge-run' : s === '已中止' ? 'badge-abort' : 'badge-end'; }
 
   return html`
-    <div class="card">
-      <div class="card-title">外部结果入口</div>
-      <a href=${boot.kibana_url + '/app/dashboards'} target="_blank" rel="noreferrer">
-        Kibana 看板（${boot.kibana_url}）→</a>
-      <p class="card-desc" style="margin-top:4px">Kibana 若只听远端 127.0.0.1，先建隧道：
-        ssh -L 5601:127.0.0.1:5601 ${boot.ssh || 'user@host'}</p>
-    </div>
+    <${ExternalLinks} boot=${boot} />
 
     <div class="card">
       <div class="card-title">两场对比（car-compare：逐轮实测 + 中位差值 Δ + 轮间极差）</div>
@@ -796,6 +1302,7 @@ function HistoryView({ boot, camps, reload, onView, onReorder, EX, curCid }) {
         典型用法：两场各跑了 jdk25/kona25，对比 jdk25 vs kona25。
         Δ 着色：绿=B 更好，红=B 更差，|Δ|&lt;2% 视为持平。</p>
       ${cmpOut && html`<${CompareResult} out=${cmpOut} />`}
+      ${cmpOut && cmpOut.data && EX && html`<${AssertCsv} data=${cmpOut.data} EX=${EX} />`}
       ${cmpOut && html`
         <details class="fold"><summary>原始文本输出（复制进报告用）</summary>
           <pre class="out light" style="max-height:320px">${cmpOut.text}</pre></details>`}
@@ -827,7 +1334,61 @@ function HistoryView({ boot, camps, reload, onView, onReorder, EX, curCid }) {
         </tbody>
       </table>
     </div>
+
+    <${TrendView} boot=${boot} />
   `;
+}
+
+// 对比结果 → 断言 CSV（B 侧中位做阈值，car-compare --assert / campaign-thresholds.conf 直接可用）
+function assertsFromCompare(d) {
+  const lines = ['# track,task,metric,cmp,value —— 由对比结果生成（对象 B 的中位）；按需修改阈值/删行'];
+  const f4 = (v) => String(Math.round(v * 10000) / 10000);
+  (d.tracks || []).forEach((t) => {
+    (t.write || []).forEach((r) => {
+      if (r.b_med == null) return;
+      lines.push([t.track, r.task, r.metric,
+        r.direction === 'higher-better' ? '>=' : '<=', f4(r.b_med)].join(','));
+    });
+    (t.query || []).forEach((r) => {
+      if (r.b_tput != null)
+        lines.push([t.track, r.task, 'Median Throughput', '>=', f4(r.b_tput)].join(','));
+      if (r.b_p99 != null)
+        lines.push([t.track, r.task, '99th percentile service time', '<=', f4(r.b_p99)].join(','));
+    });
+  });
+  return lines.join('\n') + '\n';
+}
+
+function AssertCsv({ data, EX }) {
+  const [text, setText] = useState('');
+  function download() {
+    try {
+      const blob = new Blob([text || ''], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'campaign-thresholds.conf';
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
+      toast.ok('已下载 campaign-thresholds.conf');
+    } catch (e) { toast.err('下载失败: ' + e); }
+  }
+  return html`<details class="fold" onToggle=${(e) => {
+    if (e.target.open && !text) setText(assertsFromCompare(data));
+  }}>
+    <summary>生成断言 CSV —— B 侧中位做阈值，可编辑后下载</summary>
+    ${text ? html`<div>
+      <textarea class="textarea mono" style="width:100%;height:180px;font-size:12px;margin-top:6px"
+        value=${text} onInput=${(e) => setText(e.target.value)} spellcheck=${false}></textarea>
+      <div class="row">
+        <button class="btn btn-secondary btn-sm" onClick=${download}>下载 CSV</button>
+        <button class="btn btn-ghost btn-sm" onClick=${() => {
+          navigator.clipboard && navigator.clipboard.writeText(text)
+            .then(() => toast.ok('已复制'), () => toast.err('复制失败'));
+        }}>复制</button>
+        <span class="muted">用法：car-compare --assert 此文件（或 campaign-thresholds.conf）→ 每条规则要求 B 侧 ≥3 轮有效测量，不达标非零退出。</span>
+      </div>
+    </div>` : html`<p class="muted">展开即按当前对比结果生成。</p>`}
+  </details>`;
 }
 
 // 对比结果结构化渲染：Δ 着色（方向感知：吞吐高好/时延低好），|Δ|<2% 持平
@@ -985,26 +1546,65 @@ function TrendTable({ res }) {
     </table>`;
 }
 
-// ==================== ⑤ 赛道与入库 ====================
-function OpsView({ camps }) {
-  const [tracksOut, setTracksOut] = useState('（未运行）');
+// ==================== ④ 赛道管理 ====================
+function TracksView({ boot, EX, reloadBoot }) {
+  const tracks = boot.tracks || [];
+  return html`
+    <div class="card">
+      <div class="card-title">赛道目录（${tracks.length} 条 · 与 run-bench.sh list 同源）
+        <div class="spacer"></div>
+        <span class="muted">在「启动排程」页勾选即可编排</span>
+        <button class="btn btn-ghost btn-sm" onClick=${() => reloadBoot && reloadBoot()}
+          title="重读 tracks/ 定义（引擎支持等）—— 下方赛道文件保存后会自动刷新">↻ 刷新清单</button></div>
+      ${(boot.track_groups || []).map((g) => {
+        const bases = tracks.filter((t) => t.group === g[0] && !t.variant);
+        if (!bases.length) return null;
+        return html`<div key=${g[0]}>
+          <div class="section-h">${g[1]}</div>
+          <table class="tbl">
+            <thead><tr><th>赛道</th><th>说明</th><th class="num">~耗时</th><th>语料</th><th>变体</th><th>限定引擎</th></tr></thead>
+            <tbody>
+              ${bases.map((b) => {
+                const vs = tracks.filter((t) => t.base === b.name && t.variant);
+                const vEngs = [...new Set(vs.filter((v) => v.engines).map((v) => v.engines))];
+                return html`<tr key=${b.name}>
+                  <td class="mono">${b.name}</td>
+                  <td>${b.label}</td>
+                  <td class="num">~${b.est}m</td>
+                  <td>${b.dataset || '—'}</td>
+                  <td style="max-width:340px;white-space:normal">${vs.length
+                    ? vs.map((v) => html`<span key=${v.name} class="mono"
+                        style=${'font-size:11px;margin-right:6px;' + (v.engines ? 'color:hsl(221 83% 50%)' : '')}
+                        title=${v.engines ? '只支持 ' + v.engines : '两侧通用'}>${v.name}${v.engines ? ' *' : ''}</span>`)
+                    : '—'}</td>
+                  <td>${b.engines ? html`<span class="badge badge-run">${b.engines}</span>`
+                    : vEngs.length ? html`<span class="muted">基座通用 · * 变体限 ${vEngs.join('/')}</span>`
+                    : html`<span class="muted">通用</span>`}</td>
+                </tr>`;
+              })}
+            </tbody>
+          </table>
+        </div>`;
+      })}
+    </div>
+    ${EX && html`<${EX.TrackFilesView} />`}
+  `;
+}
+
+// ==================== ⑤ 导出与入库 ====================
+function ExportView({ boot, camps, EX }) {
   const [exports, setExports] = useState([]);
   const [expInfo, setExpInfo] = useState('（先刷新导出清单）');
   const [exp, setExp] = useState('');
-  const [es, setEs] = useState('https://127.0.0.1:9237');
+  // 默认值来自 console.conf 的 apply.*（bootstrap 下发 apply_defaults；auth 不下发，
+  // 服务端在前端口令留空时自动使用配置里的口令）
+  const ad = boot.apply_defaults || {};
+  const [es, setEs] = useState(ad.es || 'https://127.0.0.1:9237');
   const [auth, setAuth] = useState('');
-  const [insec, setInsec] = useState(true);
-  const [drop, setDrop] = useState(false);
+  const [insec, setInsec] = useState(ad.insecure !== '0');
+  const [drop, setDrop] = useState(ad.drop === '1');
   const [apOut, setApOut] = useState('（未运行）');
 
-  async function doTracks() {
-    setTracksOut('读取中…');
-    const { status, j } = await postJSON('/api/tracks');
-    if (status !== 200) { setTracksOut('读取失败: ' + (j.error || '未知')); return; }
-    // rc!=0 时 result 是 runner 的报错文本，不能当赛道清单渲染
-    if (j.rc !== 0 && j.rc !== undefined) { setTracksOut('读取失败（rc=' + j.rc + '）：' + (j.result || '')); return; }
-    setTracksOut(j.result);
-  }
   async function loadExports() {
     setExpInfo('读取 exports/ 清单中…');
     const { status, j } = await getJSON('/api/exports');
@@ -1030,34 +1630,31 @@ function OpsView({ camps }) {
   }
 
   return html`
-    <div class="card">
-      <div class="card-title">赛道目录（远端 run-bench.sh list：定义在不在位 / 近期 campaign）
-        <div class="spacer"></div>
-        <button class="btn btn-secondary btn-sm" onClick=${doTracks}>刷新赛道清单</button></div>
-      <pre class="out light" style="max-height:420px">${tracksOut}</pre>
-    </div>
-    ${EX && html`<${EX.TrackFilesView} />`}
     ${EX && html`<${EX.ExportGenView} camps=${camps} />`}
     <div class="card">
-      <div class="card-title">结果入库（exports/ → ES；bench-apply 预检不过不发任何请求，退出码 0=成功 1=有拒收 2=预检失败）</div>
+      <div class="card-title">结果入库（exports/ → ES；bench-apply 预检不过不发任何请求，退出码 0=成功 1=有拒收 2=预检失败）
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" onClick=${loadExports}>刷新导出清单</button></div>
       <div class="row">
         <select style="max-width:260px" value=${exp} onChange=${(e) => setExp(e.target.value)}>
           ${exports.map((e) => html`
             <option key=${e.tag} value=${e.tag}>${e.tag}（${e.assertions === 'pass' ? '✔断言通过' : '✘断言' + (e.assertions || '无')}，${e.counts ? e.counts.bench_metric + ' 行指标' : '?'}）</option>`)}
         </select>
-        <button class="btn btn-ghost btn-sm" onClick=${loadExports}>刷新导出清单</button>
+        <span class="muted">${expInfo}</span>
       </div>
-      <p class="card-desc">${expInfo}</p>
       <div class="row">
         <label class="muted">ES <input type="text" style="width:32ch" value=${es} onInput=${(e) => setEs(e.target.value)} /></label>
-        <label class="muted">口令 <input type="password" style="width:14ch" placeholder="user:pass（无鉴权集群留空）"
+        <label class="muted">口令 <input type="password" style="width:14ch"
+          placeholder=${boot.apply_auth_configured ? '（已由 console.conf 提供，留空即用）' : 'user:pass（无鉴权集群留空）'}
           value=${auth} onInput=${(e) => setAuth(e.target.value)} /></label>
         <label class="chk"><input type="checkbox" checked=${insec} onChange=${(e) => setInsec(e.target.checked)} /> 自签证书 --insecure</label>
         <label class="chk"><input type="checkbox" checked=${drop} onChange=${(e) => setDrop(e.target.checked)} />
           --drop（先删三张索引再重建；mapping 变更时必需）</label>
         <button class="btn btn-primary btn-sm" onClick=${doApply}>入库</button>
       </div>
-      <p class="card-desc">口令只用于本次远端命令，不在服务端留存。</p>
+      <p class="card-desc">ES / insecure / drop 默认值来自 raceway 根的 <code>console.conf</code>（apply.* 行，
+        没有配置文件用内置默认）；口令若已写进 console.conf，此框留空即用且不在服务端留存。
+        入库后在「结果与趋势」页的 Kibana 看板查看。</p>
       <pre class="out" style="max-height:320px">${apOut}</pre>
     </div>
   `;
