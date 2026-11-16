@@ -3,6 +3,7 @@
 """bench-compose.py — raceway 控制台（启动排程 + 运行进度 + 历史结果 + 趋势 + 入库）
 
 serve 是五合一 Web 控制台（原"排程编排台"逐步扩容）：
+- 前端在 web/ 目录（Preact+HTM 轻量单页，风格对齐 logpilot web）；web/ 缺失时回退内联旧页
 - ① 启动排程（PLAN v1：矩阵 → 排程文件 → 预览 → 起跑）
 - ② 运行进度：campaign 队列实时视图（复用 bench-queue 的推导），自动选中
   最新没收尾的 campaign；显示当前场次/相位/已进行时长、进度条、剩余预估、
@@ -1732,6 +1733,23 @@ boot();
 </script></body></html>
 """
 
+# ---- 新前端（web/ 目录，Preact+HTM 轻量实现）：白名单静态服务，防路径穿越 ----
+_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
+_WEB_STATIC = {
+    '/web/style.css': 'style.css',
+    '/web/app.js': 'app.js',
+    '/web/vendor/preact.umd.js': 'vendor/preact.umd.js',
+    '/web/vendor/hooks.umd.js': 'vendor/hooks.umd.js',
+    '/web/vendor/htm.umd.js': 'vendor/htm.umd.js',
+}
+_WEB_MIME = {
+    '/web/style.css': 'text/css; charset=utf-8',
+    '/web/app.js': 'application/javascript; charset=utf-8',
+    '/web/vendor/preact.umd.js': 'application/javascript; charset=utf-8',
+    '/web/vendor/hooks.umd.js': 'application/javascript; charset=utf-8',
+    '/web/vendor/htm.umd.js': 'application/javascript; charset=utf-8',
+}
+
 
 class ComposeState:
     """serve 模式的共享状态：启动参数 + 已解析车。线程锁保护远端操作串行。"""
@@ -1742,9 +1760,21 @@ class ComposeState:
         # 分钟级操作走 long_lock —— 否则进度页与"停止"会被一起堵住。
         self.lock = threading.Lock()
         self.long_lock = threading.Lock()
-        text = read_cars_file(args)
+        try:
+            text = read_cars_file(args)
+        except (OSError, SystemExit) as e:
+            # serve 降级：车定义读不到（本地缺文件 / 远端不可达）时起空车表，
+            # 页面提示原因；进度/历史/趋势/入库板块照常工作。
+            print('警告：车定义读取失败（%s）—— 排程板块不可用，其余板块不受影响'
+                  % e, file=sys.stderr)
+            text = ''
         self.cars = tuple(parse_cars(text))
         self.problems = validate_cars(self.cars)
+        if not self.cars:
+            self.problems = list(self.problems) + [('error',
+                '车定义不可用: %s —— 排程板块不可用（其余板块不受影响）；'
+                '用 --cars-file / RACEWAY_CARS_FILE 指向车定义后重启恢复'
+                % args.cars_file)]
         # 远端从 vm-bench.env 子 shell 解析 RESULTS_ROOT；本地只读页面可显式提供。
         if args.ssh:
             self.results_root = remote_operation(args, 'inspect')['results_root']
@@ -2321,7 +2351,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_get(self, path, q, st):
         if path == '/':
-            self._send(200, 'text/html; charset=utf-8', _PAGE)
+            web_page = os.path.join(_WEB_DIR, 'index.html')
+            if os.path.isfile(web_page):
+                # 新前端（web/ 目录，Preact+HTM 轻量实现）；no-store 保证改版即生效
+                with open(web_page, encoding='utf-8') as f:
+                    self._send(200, 'text/html; charset=utf-8', f.read(), cache='no-store')
+            else:
+                # 兜底：web/ 未随仓库同步时仍可用内联旧页
+                self._send(200, 'text/html; charset=utf-8', _PAGE)
+        elif path in _WEB_STATIC:
+            local = os.path.join(_WEB_DIR, _WEB_STATIC[path])
+            if os.path.isfile(local):
+                with open(local, encoding='utf-8') as f:
+                    self._send(200, _WEB_MIME[path], f.read(), cache='public, max-age=300')
+            else:
+                self._send(404, 'text/plain', '前端文件缺失: ' + path)
         elif path == '/api/bootstrap':
             self._send(200, 'application/json', json.dumps({
                 'cars': [{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars],
@@ -2426,7 +2470,15 @@ def cmd_serve(args):
             '要编排它的 campaign 也应传仓库根，例如 --root /opt/raceway' % args.root)
 
     if not args.ssh:
-        args.results_root = remote_operation(args, 'inspect')['results_root']
+        try:
+            args.results_root = remote_operation(args, 'inspect')['results_root']
+        except SystemExit as e:
+            # 本地 inspect 失败（缺 vm-bench.env / 无 bash 等）时降级：
+            # RESULTS_ROOT 按 <root>/campaigns 处理，进度/历史板块读文件不碰集群，
+            # 仍然可用；起服务别被环境配置卡死。
+            print('警告：本地 inspect 失败（%s）—— RESULTS_ROOT 按 %s 处理'
+                  % (e, posixpath.join(args.root, 'campaigns')), file=sys.stderr)
+            args.results_root = posixpath.join(args.root, 'campaigns')
     state = ComposeState(args)
     hard = [m for s, m in state.problems if s == 'error']
     if hard:
@@ -2467,7 +2519,9 @@ def main(argv=None):
                          '（单赛道用它自己 / 全 ds-* 用 ds / 混排用 all）')
     ap.add_argument('--ds-hours', type=int, default=0)
     ap.add_argument('--camp-prefix', default=None)
-    ap.add_argument('--root', default=DEFAULT_ROOT, help='远端 raceway 目录')
+    ap.add_argument('--root', default=None,
+                    help='raceway 仓库根（要有 run-bench.sh）；缺省用本脚本所在目录'
+                         '（它本身就是仓库克隆时），否则退回部署约定 %s' % DEFAULT_ROOT)
     ap.add_argument('--ssh', default=os.environ.get('RACEWAY_SSH'),
                     help='user@host；缺省读环境变量 RACEWAY_SSH，再缺省操作本地')
     ap.add_argument('--port', type=int, default=8802)
@@ -2489,6 +2543,15 @@ def main(argv=None):
                     help='不查指标库历史（默认会查；查不到时编排照常，只是不剔除）')
     args = ap.parse_args(argv)
 
+    if args.root is None:
+        # 未指定 --root：本脚本所在目录是仓库克隆（有 run-bench.sh）时优先用它 ——
+        # 在克隆目录里直接跑 compose 是常见用法，不该被部署约定的 /opt/raceway 卡住
+        here = os.path.dirname(os.path.abspath(__file__))
+        if os.path.isfile(os.path.join(here, 'run-bench.sh')):
+            args.root = here
+        else:
+            args.root = DEFAULT_ROOT
+
     if args.cars_file is None:
         if args.ssh:
             args.cars_file = posixpath.join(args.root, 'schedules', 'dimsweep-cars.conf')
@@ -2506,13 +2569,21 @@ def main(argv=None):
                 if _leg != args.cars_file and os.path.isfile(_leg):
                     args.cars_file = _leg
             if not os.path.isfile(args.cars_file):
-                raise SystemExit(
-                    '找不到车定义文件: %s\n'
-                    '车定义属内部资料，未随公共库公开 —— 用 --cars-file 指定路径，'
-                    '或设环境变量 RACEWAY_CARS_FILE 指向它。\n'
-                    '远端模式（--ssh）不受影响：默认读远端 %s'
-                    % (args.cars_file,
-                       posixpath.join(args.root, 'schedules', 'dimsweep-cars.conf')))
+                if args.cmd == 'serve':
+                    # serve 是五合一控制台：进度/历史/趋势/入库板块不依赖车定义，
+                    # 起服务别被车定义卡死 —— ComposeState 降级为空车表并在页面提示。
+                    print('警告：本地车定义 %s 不存在 —— 排程板块不可用'
+                          '（进度/历史/趋势/入库不受影响）。'
+                          '用 --cars-file 或 RACEWAY_CARS_FILE 指向车定义后重启恢复。'
+                          % args.cars_file, file=sys.stderr)
+                else:
+                    raise SystemExit(
+                        '找不到车定义文件: %s\n'
+                        '车定义属内部资料，未随公共库公开 —— 用 --cars-file 指定路径，'
+                        '或设环境变量 RACEWAY_CARS_FILE 指向它。\n'
+                        '远端模式（--ssh）不受影响：默认读远端 %s'
+                        % (args.cars_file,
+                           posixpath.join(args.root, 'schedules', 'dimsweep-cars.conf')))
 
     {'cars': cmd_cars, 'gen': cmd_gen, 'preview': cmd_preview,
      'start': cmd_start, 'serve': cmd_serve}[args.cmd](args)
