@@ -12,6 +12,9 @@ const { h, render } = preact;
 const { useState, useEffect, useRef, useMemo } = preactHooks;
 const html = htm.bind(h);
 
+// 扩展功能组件（extras.js 注入依赖后提供；在文件末尾 render 前完成 setup）
+let EX = null;
+
 // ==================== API 封装 ====================
 const CSRF = { token: '' };
 function writeHeaders() {
@@ -69,6 +72,9 @@ const ICONS = {
   history: 'M3 3v18h18M7 14l4-4 3 3 5-6',
   trend: 'M12 8v4l3 3M21 12A9 9 0 1 1 12 3a9 9 0 0 1 9 9z',
   ops: 'M4 7h16M4 12h16M4 17h10M18 15l3 3-3 3',
+  tracks: 'M4 6h16M4 6v12a2 2 0 002 2h12a2 2 0 002-2V6M4 6a2 2 0 012-2h12a2 2 0 012 2M9 10h6M9 14h6',
+  detail: 'M4 4h6v16H4zM14 4h6v7h-6zM14 15h6v5h-6z',
+  report: 'M6 2h9l5 5v15H6zM15 2v5h5M9 12h6M9 16h6',
 };
 
 // ==================== 应用根 ====================
@@ -78,6 +84,9 @@ const TABS = [
   { id: 'history', num: '③', label: '历史与结果', title: '历史与结果' },
   { id: 'trend', num: '④', label: '趋势', title: '指标趋势' },
   { id: 'ops', num: '⑤', label: '赛道与入库', title: '赛道与入库' },
+  { id: 'tracks', num: '⑥', label: '赛道文件', title: '赛道文件管理' },
+  { id: 'detail', num: '⑦', label: '场次详情', title: '场次详情 / 身份 / 监控 / 日志' },
+  { id: 'report', num: '⑧', label: '报告与导出', title: '报告导出 / 一键生成导出' },
 ];
 
 function App() {
@@ -125,10 +134,27 @@ function App() {
     } catch (e) { /* 网络抖动下轮再试 */ }
   }
 
+  const goHash = useRef(null);
   function setTab(id) {
     setTabRaw(id);
-    if (id === 'progress' || id === 'history') loadCampaigns();
+    if (id === 'progress' || id === 'history' || id === 'detail' || id === 'report') loadCampaigns();
+    if (goHash.current) goHash.current(id, (id === 'progress' || id === 'detail') ? curCid : null);
   }
+
+  // 深链路由：#/progress/<cid> 之类，刷新/分享可直达；hash 变化反向切页
+  useEffect(() => {
+    if (!EX || !EX.installHashRoute) return;
+    goHash.current = EX.installHashRoute(
+      () => curCid,
+      (tab, cid) => {
+        const valid = TABS.some((t) => t.id === tab);
+        if (!valid) return;
+        setTabRaw(tab);
+        if (cid) setCurCid(cid);
+        if (tab === 'progress' || tab === 'history' || tab === 'detail' || tab === 'report') loadCampaigns(cid || undefined);
+      });
+    return () => { goHash.current = null; };
+  }, []);
 
   // 「起跑成功 → 直接带到进度页盯它」：compose 页发事件，这里接住
   useEffect(() => {
@@ -224,6 +250,12 @@ function App() {
               onReorder=${reorderCamp} />`}
           ${tab === 'trend' && html`<${TrendView} boot=${boot} />`}
           ${tab === 'ops' && html`<${OpsView} setToast=${toast} />`}
+          ${tab === 'tracks' && EX && html`<${EX.TrackFilesView} />`}
+          ${tab === 'detail' && EX && html`<${EX.DetailView} camps=${camps} curCid=${curCid} setCurCid=${setCurCid} />`}
+          ${tab === 'report' && EX && html`<div>
+            <${EX.ReportView} camps=${camps} curCid=${curCid} setCurCid=${setCurCid} />
+            <${EX.ExportGenView} camps=${camps} />
+          </div>`}
         </div>
       </div>
     </div>
@@ -363,6 +395,11 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
   }
 
   return html`
+    ${EX && EX.PresetBar ? html`<div class="card">
+      <div class="card-title">编排预设</div>
+      <${EX.PresetBar} form=${form} setForm=${setForm} />
+      <${EX.EstSuggestBar} form=${form} setForm=${setForm} />
+    </div>` : null}
     <div class="card">
       <div class="card-title">排程矩阵</div>
       <p class="card-desc">矩阵勾选 → <b>自动剔除指标库里已跑过的格</b> → 生成排程 → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
@@ -1027,6 +1064,14 @@ function OpsView() {
       <pre class="out" style="max-height:320px">${apOut}</pre>
     </div>
   `;
+}
+
+// 注入依赖给扩展组件（extras.js 已先于本脚本加载）
+if (window.RacewayExtras && window.RacewayExtras.setup) {
+  EX = window.RacewayExtras.setup({
+    h, html, useState, useEffect, useRef, useMemo,
+    getJSON, postJSON, toast, fmtMin, fmtN, fmtTime, Icon, ICONS, writeHeaders,
+  });
 }
 
 render(html`<${App} />`, document.getElementById('app'));
