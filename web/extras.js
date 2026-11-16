@@ -87,6 +87,7 @@
         setBusy(false);
         if (status !== 200) { toast.err(j.error || '保存失败'); return; }
         toast.ok((sel.isNew ? '新建' : '保存') + '成功: ' + p);
+        window.dispatchEvent(new CustomEvent('raceway-boot-refresh')); // 赛道清单联动刷新
         await refresh(); setSel(null);
       }
 
@@ -99,6 +100,7 @@
         setBusy(false);
         if (status !== 200) { toast.err(j.error || '删除失败'); return; }
         toast.ok('已删除: ' + sel.path);
+        window.dispatchEvent(new CustomEvent('raceway-boot-refresh')); // 赛道清单联动刷新
         setSel(null); setConfirmDel(false); await refresh();
       }
 
@@ -190,41 +192,75 @@
     function ExportGenView({ camps }) {
       const [sel, setSel] = useState([]);
       const [tag, setTag] = useState('');
+      const [filter, setFilter] = useState('');
       const [busy, setBusy] = useState(false);
+      const [startedAt, setStartedAt] = useState(null);
+      const [elapsed, setElapsed] = useState(0);
       const [out, setOut] = useState('');
+      const [summary, setSummary] = useState(null);
       function toggle(cid) {
         setSel((s) => s.includes(cid) ? s.filter((x) => x !== cid) : s.concat([cid]));
       }
+      // 生成中计时器（远端 build-race-store → bench-export 可能数分钟）
+      useEffect(() => {
+        if (!busy || !startedAt) return undefined;
+        const t = setInterval(() => setElapsed(Math.round((Date.now() - startedAt) / 1000)), 1000);
+        return () => clearInterval(t);
+      }, [busy, startedAt]);
+      const shown = camps.filter((c) => !filter || c.cid.toLowerCase().includes(filter.toLowerCase()));
       async function gen() {
         if (!sel.length) { toast.err('先选 campaign'); return; }
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(tag.trim())) {
           toast.err('导出 tag 只能是安全文件名（字母数字开头）'); return;
         }
-        setBusy(true); setOut('生成中：build-race-store → bench-export…（可能数分钟）');
+        setBusy(true); setStartedAt(Date.now()); setElapsed(0); setSummary(null);
+        setOut('生成中：build-race-store → bench-export…（可能数分钟，取决于场次与指标量）');
         try {
           const { status, j } = await postJSON('/api/export-gen', { tag: tag.trim(), campaigns: sel });
           if (status !== 200) { setOut('失败: ' + (j.error || '未知')); toast.err('生成失败'); }
-          else { setOut(j.log || '已生成导出 ' + tag); toast.ok('导出已生成: ' + tag); }
+          else {
+            setOut(j.log || '已生成导出 ' + tag);
+            setSummary(j.summary || null);
+            toast.ok('导出已生成: ' + tag + '（耗时 ' + Math.round((Date.now() - startedAt) / 1000) + 's）');
+          }
         } catch (e) { setOut(String(e)); toast.err(String(e)); }
-        setBusy(false);
+        setBusy(false); setStartedAt(null);
       }
       return html`<div class="card">
         <div class="card-title">一键生成导出</div>
-        <p class="card-desc">选 campaign → 建 race-store → 生成 exports/&lt;tag&gt;，随后在下方「入库」页选择该 tag 写入指标库。已存在的 tag 不覆盖。</p>
+        <p class="card-desc">选 campaign → 建 race-store → 生成 exports/&lt;tag&gt;，随后在下方「结果入库」选择该 tag 写入指标库。已存在的 tag 不覆盖；staging 中断自动清理。</p>
         <div class="row">
           <label class="muted">导出 tag</label>
           <input class="input mono" value=${tag} onInput=${(e) => setTag(e.target.value)}
             placeholder="如 exp-20261116" style="max-width:220px" />
           <button class="btn btn-primary btn-sm" onClick=${gen} disabled=${busy || !sel.length}>
-            ${busy ? '生成中…' : '生成导出（' + sel.length + ' 场）'}</button>
+            ${busy ? html`生成中… <small>已 ${elapsed}s</small>` : '生成导出（' + sel.length + ' 场）'}</button>
+          ${busy && html`<span class="muted">长操作占锁（最长 ${Math.round(1300 / 60)} 分钟）；生成完成前别发起入库。</span>`}
         </div>
-        <div style="max-height:220px;overflow:auto;border:1px solid hsl(var(--border));border-radius:6px;margin-top:10px">
-          ${camps.map((c) => html`<label key=${c.cid} class="check-item" style="border:0;border-bottom:1px solid hsl(var(--border));border-radius:0">
+        <div class="row" style="margin-top:8px">
+          <input class="input x-grow" placeholder="按 campaign 名过滤…" value=${filter}
+            onInput=${(e) => setFilter(e.target.value)} style="max-width:260px" />
+          <button class="btn btn-ghost btn-sm" onClick=${() => setSel([...new Set(sel.concat(shown.map((c) => c.cid)))])}>选中过滤结果</button>
+          <button class="btn btn-ghost btn-sm" onClick=${() => setSel([])}>清空</button>
+          <span class="muted">${sel.length}/${camps.length} 已选</span>
+        </div>
+        <div style="max-height:220px;overflow:auto;border:1px solid hsl(var(--border));border-radius:6px;margin-top:8px">
+          ${shown.map((c) => html`<label key=${c.cid} class="check-item" style="border:0;border-bottom:1px solid hsl(var(--border));border-radius:0">
             <input type="checkbox" checked=${sel.includes(c.cid)} onChange=${() => toggle(c.cid)} />
             <span class="mono" style="font-size:12px">${c.cid}</span>
+            <small class="muted">${c.valid}/${c.total}</small>
           </label>`)}
+          ${!shown.length && html`<div class="muted" style="padding:10px">（无匹配）</div>`}
         </div>
-        ${out ? html`<pre class="mono" style="max-height:240px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:10px">${out}</pre>` : null}
+        ${summary && html`<div class="row" style="margin-top:10px;gap:14px;flex-wrap:wrap">
+          <span class="stat-card" style="min-width:0"><b>${fmtN(summary.bench_metric)}</b><span>指标行</span></span>
+          <span class="stat-card" style="min-width:0"><b>${fmtN(summary.bench_run)}</b><span>场次</span></span>
+          <span class="stat-card" style="min-width:0"><b>${fmtN(summary.races_scanned)}</b><span>扫描 race</span></span>
+          <span class="stat-card" style="min-width:0"><b>${fmtN(summary.bench_env)}</b><span>环境档案</span></span>
+          ${summary.monitors_orphan_cids ? html`<span class="stat-card" style="min-width:0"><b>${summary.monitors_orphan_fids}</b><span>孤儿监控场次（${summary.monitors_orphan_cids} campaign，已丢弃）</span></span>` : null}
+        </div>`}
+        ${out ? html`<details class="fold" style="margin-top:8px"><summary>原始输出（build-race-store / bench-export）</summary>
+          <pre class="mono" style="max-height:240px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:6px">${out}</pre></details>` : null}
       </div>`;
     }
 
@@ -337,7 +373,7 @@
             <span class="spacer"></span>
             <button class="btn btn-ghost btn-sm" onClick=${onClose}>✕ 关闭</button>
           </div>
-          <div class="nav" style="flex-direction:row;border-bottom:1px solid hsl(var(--border));padding:6px 12px">
+          <div class="drawer-tabs">
             ${['身份', '详情', '监控', '日志'].map((t) => html`<button key=${t}
               class=${'btn btn-sm ' + (sub === t ? 'btn-primary' : 'btn-ghost')}
               onClick=${() => setSub(t)}>${t}</button>`)}
@@ -351,8 +387,11 @@
               <div class="section-h">尝试判定（RACES.md）</div>
               ${detail.races && detail.races.length ? detail.races.map((r, i) => html`<div key=${i} class="mono" style="font-size:12px">${r}</div>`) : html`<div class="muted">（无）</div>`}
               <div class="section-h">逐任务指标</div>
-              ${detail.metrics && detail.metrics.length ? html`<table class="hmatrix"><thead><tr><th>相位</th><th>任务</th><th>吞吐</th><th>时延</th><th>单位</th></tr></thead><tbody>
-                ${detail.metrics.map((m, i) => html`<tr key=${i}><td>${m.phase}</td><td class="mono">${esc(m.task)}</td><td>${fmtN(m.throughput)}</td><td>${fmtN(m.latency)}</td><td class="muted">${esc(m.unit)}</td></tr>`)}
+              ${detail.metrics && detail.metrics.length ? html`<table class="hmatrix"><thead><tr><th>相位</th><th>任务</th><th class="num">吞吐 median</th><th class="num">p50</th><th class="num">p99</th></tr></thead><tbody>
+                ${detail.metrics.map((m, i) => html`<tr key=${i}><td>${m.phase}</td><td class="mono">${esc(m.task)}</td>
+                  <td class="num">${fmtN(m.throughput)} <small>${esc(m.tput_unit || '')}</small></td>
+                  <td class="num">${m.lat_p50 != null ? fmtN(m.lat_p50) : '—'}</td>
+                  <td class="num">${m.lat_p99 != null ? fmtN(m.lat_p99) : '—'} <small>${m.lat_p99 != null ? esc(m.lat_unit || '') : ''}</small></td></tr>`)}
               </tbody></table>` : html`<div class="muted">（无 race.json 指标）</div>`}
               <div class="section-h">产物</div>
               ${detail.artifacts && detail.artifacts.length ? detail.artifacts.map((a) => html`<div key=${a} class="mono" style="font-size:12px">${a}</div>`) : html`<div class="muted">（无）</div>`}
@@ -378,30 +417,34 @@
       const common = ['PROGRESS.txt', 'RACES.md', 'STATE.txt', 'PLAN.tsv',
         'monitors/ENV-SUMMARY.csv'];
       const [file, setFile] = useState('PROGRESS.txt');
+      const isCustom = !common.includes(file);
       const [n, setN] = useState(300);
       const [q, setQ] = useState('');
       const [text, setText] = useState(initial || '');
       const [total, setTotal] = useState(0);
       const [busy, setBusy] = useState(false);
       async function load() {
+        if (!cid) return;
         setBusy(true);
         try {
           const url = '/api/logfile?cid=' + encodeURIComponent(cid) + '&file=' +
             encodeURIComponent(file) + '&n=' + n + '&q=' + encodeURIComponent(q);
           const { status, j } = await getJSON(url);
-          if (status !== 200) toast.err(j.error || '读日志失败');
+          if (status !== 200) setText('读取失败: ' + (j.error || '未知'));
           else { setText((j.lines || []).join('\n')); setTotal(j.total || 0); }
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { setText('读取失败: ' + e); }
         setBusy(false);
       }
-      useEffect(() => { load(); }, [cid, file]);
+      useEffect(() => { if (cid) load(); }, [cid, file]);
       return html`<div>
         <div class="row">
-          <select class="input" value=${file} onInput=${(e) => setFile(e.target.value)}>
+          <select class="input" value=${isCustom ? '__custom' : file}
+            onInput=${(e) => { const v = e.target.value; setFile(v === '__custom' ? (file && file) || '' : v); }}>
             ${common.map((f) => html`<option key=${f} value=${f}>${f}</option>`)}
+            <option value="__custom">自定义路径…</option>
           </select>
-          <input class="input x-grow" placeholder="自定义相对路径…" value=${file}
-            onInput=${(e) => setFile(e.target.value)} />
+          ${isCustom && html`<input class="input x-grow" placeholder="相对路径，如 monitors/ENV-SUMMARY.csv" value=${file}
+            onInput=${(e) => setFile(e.target.value)} />`}
           <select class="input" value=${n} onInput=${(e) => setN(+e.target.value)}>
             <option value="100">100 行</option><option value="300">300 行</option>
             <option value="1000">1000 行</option><option value="5000">5000 行</option>
@@ -445,7 +488,7 @@
             </select>
             <button class="btn btn-primary btn-sm" onClick=${() => setDrawer(true)} disabled=${!fid}>打开详情抽屉</button>
           </div>
-          <div class="nav" style="flex-direction:row;border-top:1px solid hsl(var(--border));padding-top:8px;margin-top:10px">
+          <div class="drawer-tabs" style="border-top:1px solid hsl(var(--border));border-bottom:none;padding:8px 0 0">
             ${['场次', '日志', '收尾'].map((t) => html`<button key=${t}
               class=${'btn btn-sm ' + (sub === t ? 'btn-primary' : 'btn-ghost')} onClick=${() => setSub(t)}>${t}</button>`)}
           </div>
@@ -496,6 +539,7 @@
         cars: form.cars, tracks: form.tracks, custom: form.custom,
         rounds: form.rounds, recall: form.recall, est: form.est,
         ds_hours: form.ds_hours, incov: form.incov, tag: form.tag,
+        test_mode: !!form.test_mode,
       };
     }
     function PresetBar({ form, setForm }) {

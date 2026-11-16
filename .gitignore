@@ -82,3 +82,6 @@ kibana/es-proxy.py
 # Go 外壳构建产物
 serve-go/serve-go-bin
 serve-go-bin
+
+# 控制台配置真身（可含入库口令）：只留本地，模板 console.conf.example 入库
+console.conf

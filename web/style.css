@@ -94,10 +94,6 @@ body::before {
   color: hsl(var(--primary)); font-weight: 600;
 }
 .nav-item svg { flex: 0 0 auto; }
-.nav-num {
-  font-size: 10px; color: hsl(var(--muted-foreground));
-  width: 16px; text-align: center; flex: 0 0 auto;
-}
 
 .side-foot {
   padding: 12px 14px; border-top: 1px solid hsl(var(--border));
@@ -304,11 +300,125 @@ pre.out.light { background: hsl(var(--muted)); color: hsl(var(--foreground)); }
 #trchart { height: 360px; margin: 10px 0; border: 1px solid hsl(var(--border)); border-radius: var(--radius); background: hsl(var(--card)); }
 
 /* ---------- 车道分组 ---------- */
-.track-group { margin: 10px 0 4px; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); }
+.track-group { margin: 10px 0 4px; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); display: flex; align-items: center; gap: 6px; }
+.track-group-btn {
+  font: inherit; font-size: 12px; font-weight: 600; color: inherit;
+  background: none; border: none; cursor: pointer; padding: 2px 6px;
+  border-radius: calc(var(--radius) - 4px);
+}
+.track-group-btn:hover { background: hsl(var(--muted)); color: hsl(var(--primary)); }
 .track-block { margin: 6px 0 12px 10px; }
 .vgrid { border-collapse: collapse; font-size: 12px; margin: 4px 0 2px 2px; }
 .vgrid td, .vgrid th { border: 1px solid hsl(var(--border)); padding: 3px 8px; }
 .vgrid th { background: hsl(var(--muted)); font-weight: 600; }
+
+/* ---------- 启动排程：两栏（左选择 / 右 sticky 预览） ---------- */
+.compose-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(380px, 44%);
+  gap: 16px; align-items: start;
+}
+.compose-left { min-width: 0; }
+.compose-right { position: sticky; top: 64px; }
+.preview-card .live-count { font-size: 13.5px; line-height: 1.7; }
+.preview-card .live-count b { font-size: 15px; }
+.mini-h {
+  font-size: 11px; font-weight: 600; color: hsl(var(--muted-foreground));
+  text-transform: uppercase; letter-spacing: .06em; margin: 12px 0 4px;
+}
+.sched-pre { max-height: 32vh; margin: 0; }
+@media (max-width: 1100px) {
+  .compose-grid { grid-template-columns: 1fr; }
+  .compose-right { position: static; }
+}
+
+/* ---------- 外部结果入口 ---------- */
+a.ext-link, span.ext-link {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 13px; padding: 4px 14px; border-radius: 999px;
+  border: 1px solid hsl(221 83% 53% / .35);
+  color: hsl(var(--primary)); background: hsl(221 83% 53% / .06);
+  text-decoration: none; cursor: pointer;
+}
+a.ext-link:hover, span.ext-link:hover { background: hsl(221 83% 53% / .14); }
+span.ext-none { color: hsl(var(--muted-foreground)); border-style: dashed; border-color: hsl(var(--border)); background: none; }
+
+.smoke-toggle { border-color: hsl(45 93% 47% / .5); }
+.smoke-toggle input:checked + span { color: hsl(32 81% 34%); font-weight: 600; }
+.smoke-toggle small { color: hsl(var(--muted-foreground)); font-weight: 400; }
+
+/* ---------- 排程实时预览栏 ---------- */
+.live-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: hsl(var(--card)); border: 1px solid hsl(var(--border));
+  border-radius: var(--radius); padding: 10px 16px; margin-bottom: 14px;
+  position: sticky; top: 52px; z-index: 15;
+  box-shadow: 0 2px 10px hsl(222 47% 11% / .06);
+  animation: fadeIn .2s ease-out;
+}
+.live-count { font-size: 13.5px; }
+.live-count b { font-size: 15px; }
+.live-warn { color: hsl(32 81% 34%); font-weight: 600; }
+.live-chip {
+  font-size: 12px; border-radius: 999px; padding: 2px 10px;
+  background: hsl(var(--muted)); color: hsl(var(--muted-foreground));
+  max-width: 46vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.live-chip.ok { background: hsl(142 71% 45% / .14); color: hsl(142 71% 30%); font-weight: 600; }
+.live-chip.err { background: hsl(0 84% 60% / .13); color: hsl(0 74% 42%); font-weight: 600; }
+
+/* ---------- est 编辑表格 ---------- */
+.est-tbl td { vertical-align: middle; }
+.est-tbl input[type=number] { text-align: right; }
+
+/* ---------- 进度页：可点行 / 日志着色 / 监控网格 ---------- */
+tr.clickable { cursor: pointer; }
+.lg-ok { color: hsl(142 71% 62%); }
+.lg-bad { color: hsl(0 84% 68%); font-weight: 600; }
+.lg-warn { color: hsl(45 93% 58%); }
+.lg-run { color: hsl(210 90% 70%); font-weight: 600; }
+.mon-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px; margin-top: 8px;
+}
+.mon-cell {
+  border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) - 2px);
+  padding: 8px 10px; min-width: 0;
+}
+.mon-label { font-size: 12px; color: hsl(var(--muted-foreground)); margin-bottom: 4px; font-family: ui-monospace, Menlo, monospace; }
+
+details.warn-more > summary { margin: 4px 0; color: hsl(32 81% 40%); }
+details.warn-more { margin: 2px 0 6px; }
+
+/* ---------- campaign 快切条 ---------- */
+.camp-chips {
+  display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;
+  overflow-x: auto; padding: 2px 0 6px; margin-bottom: 4px;
+}
+.camp-chip {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  font: inherit; font-size: 12px; cursor: pointer;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid hsl(var(--border)); background: hsl(var(--background));
+  color: hsl(var(--muted-foreground));
+  transition: border-color .15s, background .15s, color .15s;
+}
+.camp-chip small { font-size: 11px; color: hsl(var(--muted-foreground)); }
+.camp-chip:hover { border-color: hsl(221 83% 53% / .5); color: hsl(var(--foreground)); }
+.camp-chip.on {
+  background: hsl(221 83% 53% / .10); border-color: hsl(221 83% 53% / .5);
+  color: hsl(var(--primary)); font-weight: 600;
+}
+.camp-chip.running { border-color: hsl(142 71% 45% / .5); }
+.camp-chip .dot {
+  width: 7px; height: 7px; border-radius: 50%; background: hsl(142 71% 45%);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+@media (max-width: 860px) {
+  .live-bar { top: 0; padding: 8px 12px; }
+  .mon-grid { grid-template-columns: 1fr; }
+}
 
 /* ---------- 窄屏（值班场景） ---------- */
 @media (max-width: 860px) {
@@ -322,7 +432,6 @@ pre.out.light { background: hsl(var(--muted)); color: hsl(var(--foreground)); }
   .brand-sub, .side-foot { display: none; }
   .nav { flex-direction: row; overflow-x: auto; padding: 4px 8px; }
   .nav-item { padding: 6px 10px; flex: 0 0 auto; }
-  .nav-num { display: none; }
   .content { padding: 14px 12px 40px; }
   .topbar { padding: 10px 12px; }
   .conn-chip { max-width: 40vw; }
@@ -355,6 +464,10 @@ pre.out.light { background: hsl(var(--muted)); color: hsl(var(--foreground)); }
   border-bottom: 1px solid hsl(var(--border)); font-size: 14px;
 }
 .drawer-body { flex: 1; overflow: auto; padding: 10px 18px 40px; }
+.drawer-tabs {
+  display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  padding: 8px 14px; border-bottom: 1px solid hsl(var(--border));
+}
 @media (max-width: 760px) {
   .drawer { width: 100vw; }
 }

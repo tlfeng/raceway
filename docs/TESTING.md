@@ -42,12 +42,27 @@ macOS 上跑会看到一批 skip（bash 3.2 / `/proc` / BSD 工具），这是�
 | `test_comparison_safety.py` | 有效尝试筛选、`--assert` fail closed、`--json` 输出纯净 |
 | `test_track_settings.py` / `test_track_runtime.py` / `test_hv1024x_family.py` | 赛道定义的存储参数、变体家族、引擎兼容性 |
 | `test_dashboard_contract.py` / `test_dashboard_verifier.py` | 建板字段契约、验收不放行空数据 |
+| `test_web_api_contract.py` | 控制台前端引用的每个 `/api/*` 在 `bench-compose.py` 路由层存在、被 `tests/mock_console.py` stub、mock 不发明后端没有的接口 |
 
 ## 加新用例时的两条规矩
 
 1. **不许连网**。需要远端数据就造夹具（参考 `tests/test_queue.py` 的 `write()` 与 `_camp()`）。
 2. **契约变化要同时改测试**。测试是唯一的跨文件闸门（例如 `run-bench.sh` 写进 RACES 的状态词表、
    指标字段白名单）——只改一边会让另一边的断言变成假绿。
+
+## 控制台 UI 离线迭代（mock 控制台）
+
+改 `web/` 前端时不必连压测机：
+
+```bash
+python3 tests/mock_console.py          # http://127.0.0.1:8899 （端口可作第一个参数改）
+```
+
+stub 全部 `/api/*` + 静态 `web/`。三方契约（`test_web_api_contract.py`）只把守**接口名**，
+不把守返回字段 —— mock 的数据形状是手工对齐的，后端改响应字段时 mock 静默过期；
+对 mock 开发完要上真机验一遍，漂移多了就把真实响应（脱敏后）固化成夹具。monitor 是
+随机游走的活数据方便看曲线交互。只用于开发/演示/截图，**放在 tests/ 是刻意的**——
+README 的同步命令拷顶层 `*.py` 与 `web/`，tests/ 不上压测机。
 
 ## 已知的环境噪音
 
