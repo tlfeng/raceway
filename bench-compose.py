@@ -1268,6 +1268,137 @@ def api_logtail(st, cid, n):
     return 200, {'lines': st.src.tail(cid, 'PROGRESS.txt', n)}
 
 
+def api_assets(st):
+    """引擎安装包与 JDK 的只读盘点，并关联车定义的起跑依赖。
+
+    判定语义与 runner `resolve_engine` 的 die 点完全一致：
+      easysearch    -> $PKG_DIR/easysearch-<ver>-<build>-linux-amd64-bundle.tar.gz
+      elasticsearch -> $PKG_DIR/elasticsearch-<ver>-linux-x86_64.tar.gz
+      opensearch    -> $PKG_DIR/opensearch-<ver>-linux-x64.tar.gz
+      JDK_DIR jdk-26/27 -> $PKG_DIR/openjdk-<v>_linux-x64_bin.tar.gz（硬编码映射）
+    包缺失 = 起跑直接 die，所以这里提前标红。只读；上传/替换仍走 scp。
+    ssh 模式下本页不可用（包在压测机上，控制台读不到）。
+    """
+    if st.args.ssh:
+        return 200, {'available': False, 'reason': 'ssh 模式下包盘点在压测机本机控制台查看'}
+    envf = os.path.join(st.args.root, 'vm-bench.env')
+    pkg_dir, bundles = None, []
+    try:
+        with open(envf, encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#') or '=' not in s:
+                    continue
+                k, _, v = s.partition('=')
+                k = k.strip()
+                v = v.replace('$ROOT', st.args.root).strip().strip('"').strip("'")
+                if k == 'PKG_DIR':
+                    pkg_dir = v
+                elif k.startswith('BUNDLE_'):
+                    bundles.append({'key': k, 'path': v})
+    except OSError:
+        pass
+    pkg_dir = pkg_dir or os.path.join(st.args.root, 'pkg')
+
+    def stat_path(path):
+        try:
+            stt = os.stat(path)
+            return {'exists': stt.st_size > 0, 'size': stt.st_size,
+                    'mtime': int(stt.st_mtime)}
+        except OSError:
+            return {'exists': False, 'size': 0, 'mtime': 0}
+
+    # 车定义 → 期望包路径（复刻 resolve_engine 的三条 + JDK 硬编码 case）。
+    # ENGINE_VERSION/JDK_DIR 在 config 串里（parse_cars 只抽了 ENGINE_NAME/BUILD/JDK_DIR）。
+    def cfg_of(car, key):
+        for tok in (car.config or '').split():
+            k, _, v = tok.partition('=')
+            if k == key:
+                return v
+        return ''
+
+    deps = []
+    for car in st.cars:
+        eng = (cfg_of(car, 'ENGINE_NAME') or car.engine or '').lower()
+        ver = cfg_of(car, 'ENGINE_VERSION') or ''
+        build = car.build or cfg_of(car, 'ENGINE_BUILD') or ''
+        jdk = cfg_of(car, 'JDK_DIR') or car.jdk_dir or ''
+        if eng == 'easysearch':
+            pkg = os.path.join(pkg_dir, 'easysearch-%s-%s-linux-amd64-bundle.tar.gz' % (ver, build))
+        elif eng == 'elasticsearch':
+            pkg = os.path.join(pkg_dir, 'elasticsearch-%s-linux-x86_64.tar.gz' % ver)
+        elif eng == 'opensearch':
+            pkg = os.path.join(pkg_dir, 'opensearch-%s-linux-x64.tar.gz' % ver)
+        else:
+            pkg = None
+        dep = {'car': car.name, 'engine': car.engine, 'ver': ver, 'build': build,
+               'pkg': pkg, 'pkg_stat': stat_path(pkg) if pkg else {'exists': False}}
+        base = os.path.basename(jdk.rstrip('/'))
+        if base.startswith('jdk-'):
+            dep['jdk_pkg'] = os.path.join(pkg_dir, 'openjdk-%s_linux-x64_bin.tar.gz' % base[len('jdk-'):])
+            dep['jdk_mapped'] = True
+        else:
+            dep['jdk_pkg'], dep['jdk_mapped'] = (jdk or None), bool(jdk)
+        if dep.get('jdk_pkg'):
+            dep['jdk_stat'] = stat_path(dep['jdk_pkg'])
+        deps.append(dep)
+
+    # PKG_DIR 全清单
+    pkg_files = []
+    if os.path.isdir(pkg_dir):
+        for name in sorted(os.listdir(pkg_dir)):
+            fp = os.path.join(pkg_dir, name)
+            if os.path.isfile(fp):
+                s = stat_path(fp)
+                pkg_files.append({'name': name, 'size': s['size'], 'mtime': s['mtime'],
+                                  'exists': True})
+    for b in bundles:
+        b.update(stat_path(b['path']))
+    return 200, {'available': True, 'pkg_dir': pkg_dir, 'deps': deps,
+                 'pkg_files': pkg_files, 'bundles': bundles}
+
+
+def api_cluster_status(st):
+    """起跑前集群速览（**纯只读**，不调用任何 ibs 写操作）。
+
+    读 ibs 的 configs/ip.txt（ibs_sync_ip 维护的第 4 列 = 已装版本），并对每台
+    集群角色节点探 9200 端口 TCP 可达。只回答"集群在不在位、装的什么版本"——
+    green/卡点/冷启动仍以 runner 流水线为准；本地模式跑在开发机上时内网不可达，
+    返回 available=False，前端不显示此卡。
+    """
+    ipf = os.path.join(st.args.root, 'ibs', 'configs', 'ip.txt')
+    nodes, driver = [], None
+    try:
+        with open(ipf, encoding='utf-8') as f:
+            for line in f:
+                cols = [c.strip() for c in line.split()]
+                if len(cols) < 3:
+                    continue
+                pub, priv, name = cols[0], cols[1], cols[2]
+                ver = cols[3] if len(cols) > 3 else ''
+                if name.startswith('esrally'):
+                    driver = name
+                    continue
+                if not ver:
+                    continue
+                nodes.append({'name': name, 'ip': priv, 'ver': ver})
+    except OSError:
+        return 200, {'available': False, 'nodes': [], 'driver': ''}
+    if nodes:
+        import socket as _socket
+        for n in nodes:
+            try:
+                s = _socket.create_connection((n['ip'], 9200), timeout=1.5)
+                s.close()
+                n['port9200'] = True
+            except OSError:
+                n['port9200'] = False
+    vers = sorted({n['ver'] for n in nodes})
+    return 200, {'available': bool(nodes), 'driver': driver or '', 'engine': vers,
+                 'nodes': nodes,
+                 'up': bool(nodes) and all(n['port9200'] for n in nodes)}
+
+
 def api_mutex(st):
     """集群占用预检：runner 的 .runner.lock 是否空闲（与 start 前的互斥检查同源）。
 
@@ -2087,6 +2218,12 @@ def _route_get_core(st, path, q):
                 cache = 'no-store' if path == '/legacy' else 'public, max-age=300'
                 return 200, mime, f.read(), cache
         return 404, 'text/plain', '前端文件缺失: ' + path, 'no-store'
+    if path == '/api/cluster-status':
+        code, payload = api_cluster_status(st)
+        return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
+    if path == '/api/assets':
+        code, payload = api_assets(st)
+        return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
     if path == '/api/mutex':
         code, payload = api_mutex(st)
         return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
