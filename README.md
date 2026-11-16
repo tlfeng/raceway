@@ -116,10 +116,42 @@ python3 bench-apply.py --dir exports/<tag> --es <url> [--auth user:pass] [--inse
 ### 六、控制台（可选）
 
 ```bash
-python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 排程 / 进度 / 历史与对比 / 趋势 / 赛道与入库，五页合一
+python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'   # 八页合一，见下
 #   趋势页图表用随仓库分发的 echarts.min.js（Apache-2.0）；漏同步只影响画图，表格仍可用
 python3 bench-compose.py start --cars-file <f> --tracks ds-* --rounds 3 --ds-hours 12   # 不开页面直接起跑
 ```
+
+**两种后端**：默认 Python 单进程 `serve`；也可用 Go 外壳（HTTP 层/守卫/静态资源在 Go，常驻内存更低）：
+
+```bash
+cd serve-go && go build -o raceway-serve . && ./raceway-serve --port 8802 --root /opt/raceway --ssh root@HOST --cars-file <f>
+#   Go 后端把业务逻辑逐请求转发给 python3 bench-compose.py serve-rpc，接口契约一致；
+#   新增的扩展 API 在 Go 侧原生实现（见下），无需 Python 常驻。
+```
+
+**八个页签**：① 启动排程（含编排预设 + est 自动校准）② 运行进度 ③ 历史与结果 ④ 趋势 ⑤ 赛道与入库 ⑥ 赛道文件（浏览/新建/编辑/删除，原子写 + sha256 并发校验 + 改动需回传压测机）⑦ 场次详情（实测身份卡 / 逐任务指标 / 每节点 5s 监控曲线 / 日志全文 / campaign 收尾）⑧ 报告与导出（Markdown/HTML 报告 + 一键生成导出）。支持 `#/tab/cid` 深链路由，刷新与分享可直达某场。
+
+> 赛道 `tracks/` 是 git 定版目录；⑥ 的编辑只改仓库文件，改动需重新同步到压测机才会被 runner 消费。所有写操作带 CSRF，`/api/close` 默认 dry-run。
+
+**命令行同样可用**：raceway 的基础能力本来就全是命令行（编排/对比/入库），控制台新增的能力也没有锁在页面里。每个新能力都有 CLI 入口，与 Web/Go 复用同一套 api_\* 逻辑：
+
+```bash
+python3 bench-tools.py sidecar  <cid> <fid>          # 实测身份卡（JSON）
+python3 bench-tools.py detail   <cid> <fid>          # 场次详情：PLAN/判定/指标/产物
+python3 bench-tools.py monitor  <cid> <fid>          # 每节点 5s 时序；--raw 出 CSV，-o 写文件
+python3 bench-tools.py log      <cid> PROGRESS.txt --n 200 --q 关键字
+python3 bench-tools.py report   <cid> [--fmt md|html] [-o 报告文件]
+python3 bench-tools.py est      <track>              # 按历史中位耗时给 est 建议
+python3 bench-tools.py track-ls                      # 列赛道文件
+python3 bench-tools.py track-read geonames/index.json [-o 文件]
+python3 bench-tools.py track-write geonames/x.json --content '...' [--expect sha256]
+python3 bench-tools.py track-del   geonames/x.json [--expect sha256]
+python3 bench-tools.py export-gen  --tag <tag> <cid> [<cid>...]
+python3 bench-tools.py close       <cid>             # 默认 dry-run；--run 才真正补结束行
+# 全局：--root DIR --ssh user@host --results-root DIR；--raw 文本原样输出（便于管道/重定向）
+```
+
+默认值与页面一致：`close` 必须显式 `--run` 才改动；赛道写入带 sha256 并发校验；`--ssh` 时作用于远端仓库。原有 `bench-compose.py cars/gen/preview/start/serve` 及 `car-compare.py`、`bench-queue.py`、入库链路等 CLI 全部保留不变。
 
 ## 文档
 
@@ -152,6 +184,10 @@ precheck.sh / load-monitor.sh / cpu-affinity.sh      环境卡点 / 负载采样
 tracks/                       赛道定义定版目录（index.json / challenges / operations 全在 git 里）
 car-compare.py / car-env-table.py / codec-compare.py  结果对比（共用 result_selection.py / identity.py）
 bench-compose.py / bench-queue.py / bench-history.py  控制台与只读观测
+bench-tools.py                   扩展能力的命令行入口（复用 api_*，与 Web/Go 三通道同语义）
+bench-ops.py                     控制台写操作的远端辅助（赛道文件 CRUD / 导出生成 / 收尾；Go 与 Python 共用）
+serve-go/                        Go HTTP 外壳：守卫 + 静态资源 + 扩展 API 原生 handler
+web/extras.js                    前端扩展组件（赛道文件/详情抽屉/报告/预设/深链）
 build-race-store.py → bench-export.py → bench-apply.py  入库链路
 audit_track_settings.py     赛道 settings 结构审计（codec/source_reuse 必须是顶层键；回归闸门见 tests/）
 kibana/                      Kibana 7.17 建板工具链（安装器 + 起停 + 建板 + 验收）

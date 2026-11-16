@@ -29,6 +29,7 @@ import (
 var webStatic = map[string]struct{ file, mime string }{
 	"/web/style.css":            {"style.css", "text/css; charset=utf-8"},
 	"/web/app.js":               {"app.js", "application/javascript; charset=utf-8"},
+	"/web/extras.js":            {"extras.js", "application/javascript; charset=utf-8"},
 	"/web/vendor/preact.umd.js": {"vendor/preact.umd.js", "application/javascript; charset=utf-8"},
 	"/web/vendor/hooks.umd.js":  {"vendor/hooks.umd.js", "application/javascript; charset=utf-8"},
 	"/web/vendor/htm.umd.js":    {"vendor/htm.umd.js", "application/javascript; charset=utf-8"},
@@ -50,6 +51,7 @@ type server struct {
 	bsOnce      sync.Once
 	resultsRoot string
 	ssh         string
+	repoRoot    string // bootstrap 的 root（远端仓库根）；为空时回落 repoDir
 }
 
 // newCSRFToken 生成与 Python secrets.token_urlsafe(32) 同字符集（base64url 无填充）的令牌。
@@ -240,10 +242,15 @@ func (s *server) bootstrapCache() {
 		var b struct {
 			ResultsRoot string `json:"results_root"`
 			SSH         string `json:"ssh"`
+			Root        string `json:"root"`
 		}
 		if json.Unmarshal([]byte(resp.Body), &b) == nil {
 			s.resultsRoot = b.ResultsRoot
 			s.ssh = b.SSH
+			s.repoRoot = b.Root
+			if s.repoRoot == "" {
+				s.repoRoot = s.repoDir
+			}
 		}
 	})
 }
@@ -359,6 +366,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if path == "/api/logtail" && s.nativeLogtail(w, u.Query()) {
 			return
 		}
+		if s.nativeGetFeature(w, path, u.Query()) {
+			return
+		}
 		s.delegate(w, "GET", path, u.Query(), nil)
 	case http.MethodPost:
 		if why := s.guard(r, true); why != "" {
@@ -384,6 +394,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := probe.(map[string]any); !ok {
 			sendJSON(w, 400, map[string]string{"error": "JSON object required"})
+			return
+		}
+		if s.nativePostFeature(w, path, raw) {
 			return
 		}
 		s.delegate(w, "POST", path, nil, json.RawMessage(raw))

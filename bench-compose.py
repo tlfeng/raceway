@@ -454,6 +454,25 @@ results = results.resolve()
 def fail(message):
     raise RuntimeError(message)
 
+def safe_track_path(base, rel):
+    """赛道文件相对路径 → 绝对路径；拒绝越界、空段、绝对/反斜杠/符号链接。"""
+    if not isinstance(rel, str) or not rel or len(rel) > 200:
+        fail('非法赛道路径')
+    if '\\' in rel or rel.startswith('/') or '\0' in rel:
+        fail('非法赛道路径')
+    parts = rel.split('/')
+    if any(x in ('', '.', '..') for x in parts):
+        fail('赛道路径不能含空段、. 或 ..')
+    if any(not re.fullmatch(r'[A-Za-z0-9._-]+', x) for x in parts):
+        fail('赛道路径只允许字母数字与 ._-')
+    tracks = (base / 'tracks').resolve()
+    fp = (tracks / rel).resolve()
+    if fp != tracks and tracks not in fp.parents:
+        fail('赛道路径越界')
+    if fp.is_symlink():
+        fail('赛道文件不允许符号链接')
+    return fp
+
 def proc_identity(pid):
     text = pathlib.Path('/proc/%d/stat' % pid).read_text()
     fields = text[text.rfind(')') + 2:].split()
@@ -588,6 +607,135 @@ try:
             time.sleep(0.2)
         else:
             fail('30 秒内未确认 runner 身份；可能已启动，禁止盲目重试，见 ' + log_name)
+    elif mode == 'track-list':
+        base = root / 'tracks'
+        if not base.is_dir():
+            fail('仓库下没有 tracks/ 目录')
+        out = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for fn in filenames:
+                if fn.startswith('.'):
+                    continue
+                fp = pathlib.Path(dirpath) / fn
+                if fp.is_symlink():
+                    continue
+                st = fp.stat()
+                out.append({'path': fp.relative_to(base).as_posix(),
+                            'size': st.st_size, 'mtime': int(st.st_mtime)})
+        out.sort(key=lambda x: x['path'])
+        reply = {'files': out}
+
+    elif mode == 'track-read':
+        fp = safe_track_path(root, p['path'])
+        if not fp.is_file():
+            fail('赛道文件不存在: ' + p['path'])
+        reply = {'path': p['path'], 'content': fp.read_text(encoding='utf-8', errors='replace'),
+                 'sha256': hashlib.sha256(fp.read_bytes()).hexdigest()}
+
+    elif mode == 'track-write':
+        fp = safe_track_path(root, p['path'])
+        if fp.exists() and not fp.is_file():
+            fail('目标不是普通文件')
+        content = p['content']
+        if not isinstance(content, str):
+            fail('文件内容必须是文本')
+        old = fp.read_text(encoding='utf-8', errors='replace') if fp.is_file() else None
+        digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        if old == content:
+            reply = {'path': p['path'], 'sha256': digest, 'unchanged': True}
+        else:
+            if p.get('expect') and p['expect'] != (hashlib.sha256(old.encode('utf-8')).hexdigest()
+                                                    if old is not None else None):
+                fail('文件内容已被他人修改，请刷新后重试（期望摘要不匹配）')
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix='.track-', dir=str(fp.parent))
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, fp)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+            reply = {'path': p['path'], 'sha256': digest, 'unchanged': False}
+
+    elif mode == 'track-delete':
+        fp = safe_track_path(root, p['path'])
+        if not fp.is_file():
+            fail('赛道文件不存在: ' + p['path'])
+        old = fp.read_text(encoding='utf-8', errors='replace')
+        if p.get('expect') and p['expect'] != hashlib.sha256(old.encode('utf-8')).hexdigest():
+            fail('文件内容已变更，请刷新后重试（期望摘要不匹配）')
+        fp.unlink()
+        reply = {'path': p['path'], 'deleted': True}
+
+    elif mode == 'export-gen':
+        tag = p['tag']
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', tag):
+            fail('非法导出 tag')
+        cids = p.get('campaigns') or []
+        if not isinstance(cids, list) or not cids:
+            fail('请至少选择一个 campaign 生成导出')
+        for cid in cids:
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', cid):
+                fail('非法 campaign 名: %r' % cid)
+        import shutil
+        export_root = root / 'exports' / tag
+        if export_root.exists():
+            fail('导出 tag 已存在: %s —— 换一个 tag，已归档导出不覆盖' % tag)
+        staging = root / 'exports' / ('.gen-' + tag)
+        if staging.exists():
+            fail('上一次生成残留: %s —— 请先清理' % staging)
+        store = staging / 'race-store'
+        camps = staging / 'campaigns'
+        try:
+            staging.mkdir(parents=True)
+            camps.mkdir()
+            for cid in cids:
+                src = results / cid
+                if not src.is_dir():
+                    fail('campaign 不存在: ' + cid)
+                os.symlink(src, camps / cid)
+            env = dict(os.environ, RESULTS_ROOT=str(results))
+            r1 = subprocess.run([sys.executable, str(root / 'build-race-store.py'),
+                                 '--campaigns', str(camps), '--out', str(store)],
+                                cwd=str(root), env=env, capture_output=True, text=True, timeout=600)
+            if r1.returncode != 0:
+                fail('build-race-store 失败(rc=%d): %s' % (r1.returncode, (r1.stderr or r1.stdout)[-1200:]))
+            r2 = subprocess.run([sys.executable, str(root / 'bench-export.py'),
+                                 '--out', str(staging / 'out'), '--races', str(store),
+                                 '--campaigns', str(camps)],
+                                cwd=str(root), env=env, capture_output=True, text=True, timeout=600)
+            if r2.returncode != 0:
+                fail('bench-export 失败(rc=%d): %s' % (r2.returncode, (r2.stderr or r2.stdout)[-1200:]))
+            if not (staging / 'out' / 'manifest.json').is_file():
+                fail('导出产物缺 manifest.json，拒绝发布')
+            os.replace(staging / 'out', export_root)
+            shutil.rmtree(staging, ignore_errors=True)
+            reply = {'tag': tag, 'campaigns': cids,
+                     'log': (r1.stdout + r2.stdout).strip()[-2000:]}
+        except BaseException:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    elif mode == 'close':
+        cid = p.get('cid') or ''
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', cid):
+            fail('非法 campaign 名')
+        dry = p.get('dry_run', True)
+        cmd = ['bash', str(root / 'close-campaign.sh')]
+        if dry:
+            cmd.append('--dry-run')
+        cmd += ['--reason', '控制台收尾', cid]
+        r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=120)
+        reply = {'result': (r.stdout or '') + (r.stderr or ''), 'rc': r.returncode,
+                 'dry_run': bool(dry)}
+
     else:
         fail('未知远端操作')
     print(json.dumps(reply, ensure_ascii=False))
@@ -840,6 +988,7 @@ _JS_MIME = 'application/javascript; charset=utf-8'
 _WEB_STATIC = {
     '/web/style.css': ('style.css', 'text/css; charset=utf-8'),
     '/web/app.js': ('app.js', _JS_MIME),
+    '/web/extras.js': ('extras.js', _JS_MIME),
     '/web/vendor/preact.umd.js': ('vendor/preact.umd.js', _JS_MIME),
     '/web/vendor/hooks.umd.js': ('vendor/hooks.umd.js', _JS_MIME),
     '/web/vendor/htm.umd.js': ('vendor/htm.umd.js', _JS_MIME),
@@ -1380,6 +1529,326 @@ def api_apply(st, body):
     return 200, {'result': out, 'rc': rc}
 
 
+# ============================================================ 扩展功能 API
+# 所有新 API 只走 _route_get_core / _post_core —— Go 后端的 serve-rpc 逐请求
+# 转发共用同一核心，因此这里新增的路由 Go 侧自动可用，无需改 main.go。
+
+# 可浏览的日志/产物文件：白名单扩展名 + 相对 campaign 根的路径片段，防越界。
+_LOG_EXTS = ('.txt', '.md', '.json', '.csv', '.log', '.tsv', '.raw')
+_SAFE_REL = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}')
+
+
+def safe_camp_rel(rel):
+    """campaign 内相对路径：无 ..、无绝对、无反斜杠、扩展名白名单。"""
+    if not isinstance(rel, str) or not rel or len(rel) > 200:
+        raise ValueError('非法文件路径')
+    if '\\' in rel or rel.startswith('/') or '\0' in rel or '..' in rel:
+        raise ValueError('非法文件路径')
+    if not _SAFE_REL.fullmatch(rel):
+        raise ValueError('文件路径含非法字符')
+    if not rel.endswith(_LOG_EXTS):
+        raise ValueError('只允许查看文本/日志/JSON/CSV 文件')
+    return rel
+
+
+def api_track_list(st):
+    with st.lock:
+        return remote_operation(st.args, 'track-list')
+
+
+def api_track_read(st, body):
+    path = safe_track_rel(body.get('path'))
+    with st.lock:
+        return remote_operation(st.args, 'track-read', {'path': path})
+
+
+def safe_track_rel(value):
+    """与远端 safe_track_path 同口径的本地校验（路径串先挡一道）。"""
+    if not isinstance(value, str) or not value or len(value) > 200:
+        raise ValueError('非法赛道路径')
+    if '\\' in value or value.startswith('/') or '\0' in value:
+        raise ValueError('非法赛道路径')
+    parts = value.split('/')
+    if any(x in ('', '.', '..') for x in parts):
+        raise ValueError('赛道路径不能含空段、. 或 ..')
+    if any(not re.fullmatch(r'[A-Za-z0-9._-]+', x) for x in parts):
+        raise ValueError('赛道路径只允许字母数字与 ._-')
+    return value
+
+
+def api_track_write(st, body):
+    path = safe_track_rel(body.get('path'))
+    content = body.get('content')
+    if not isinstance(content, str):
+        raise ValueError('文件内容必须是文本')
+    if len(content.encode('utf-8')) > 8 * 1024 * 1024:
+        raise ValueError('赛道文件不能超过 8MB')
+    expect = body.get('expect')
+    if expect is not None and (not isinstance(expect, str)
+                               or not re.fullmatch(r'[0-9a-f]{64}', expect)):
+        raise ValueError('expect 必须是 64 位 sha256')
+    with st.lock:
+        return remote_operation(st.args, 'track-write',
+                                {'path': path, 'content': content, 'expect': expect})
+
+
+def api_track_delete(st, body):
+    path = safe_track_rel(body.get('path'))
+    expect = body.get('expect')
+    if expect is not None and (not isinstance(expect, str)
+                               or not re.fullmatch(r'[0-9a-f]{64}', expect)):
+        raise ValueError('expect 必须是 64 位 sha256')
+    with st.lock:
+        return remote_operation(st.args, 'track-delete',
+                                {'path': path, 'expect': expect})
+
+
+def api_export_gen(st, body):
+    tag = (body.get('tag') or '').strip()
+    cids = body.get('campaigns')
+    if not isinstance(cids, list) or not cids or not all(isinstance(x, str) for x in cids):
+        raise ValueError('请选择一个或多个 campaign')
+    with st.long_lock:
+        return remote_operation(st.args, 'export-gen', {'tag': tag, 'campaigns': cids},
+                                timeout=1300)
+
+
+def api_close(st, body):
+    cid = (body.get('cid') or '').strip()
+    why = check_cid(cid)
+    if why:
+        raise ValueError(why)
+    dry = body.get('dry_run', True)
+    if not isinstance(dry, bool):
+        raise ValueError('dry_run 必须是布尔值')
+    with st.lock:
+        return remote_operation(st.args, 'close', {'cid': cid, 'dry_run': dry})
+
+
+def api_sidecar(st, cid, fid):
+    """实测身份卡：读 results/<fid>-*-sidecar.json（含引擎版本/JDK/settings/堆/核数）。"""
+    why = check_cid(cid)
+    if why:
+        return 400, {'error': why}
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', fid or ''):
+        return 400, {'error': '非法场次 id'}
+    base = posixpath.join(st.src.root, cid, 'results')
+    listing = st.src.read_abs(posixpath.join(base, '..', 'PLAN.tsv'))  # 探活，仅用目录约定
+    sidecars = []
+    # 无目录列举接口，按 runner 命名约定逐个探测（每场最多两个尝试相位）
+    for ph in ('wq', 'w', 'q', 'm'):
+        name = '%s-%s-sidecar.json' % (fid, ph)
+        text = st.src.read_abs(posixpath.join(base, name))
+        if text:
+            try:
+                doc = json.loads(text)
+            except ValueError:
+                doc = {'_parse_error': text[:200]}
+            sidecars.append({'phase': ph, 'file': name, 'data': doc})
+    attempts = st.src.read_abs(posixpath.join(st.src.root, cid, 'attempts'))
+    return 200, {'cid': cid, 'fid': fid, 'sidecars': sidecars,
+                 'has_plan': listing is not None, 'attempts_dir_probe': attempts is not None}
+
+
+def api_race_detail(st, cid, fid):
+    """场次详情抽屉：PLAN 行 + RACES 判定 + sidecar 身份 + 逐任务指标 + 产物清单。"""
+    why = check_cid(cid)
+    if why:
+        return 400, {'error': why}
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', fid or ''):
+        return 400, {'error': '非法场次 id'}
+    plan = st.src.read_abs(posixpath.join(st.src.root, cid, 'PLAN.tsv')) or ''
+    plan_row = None
+    for line in plan.splitlines():
+        cols = line.split('\t')
+        if cols and cols[0] == fid:
+            plan_row = cols
+            break
+    races = st.src.read_abs(posixpath.join(st.src.root, cid, 'RACES.md')) or ''
+    race_rows = [ln for ln in races.splitlines() if ln.startswith('| ' + fid + ' ')]
+    progress = st.src.read(cid, 'PROGRESS.txt') or ''
+    prog_lines = [ln for ln in progress.splitlines() if fid in ln][-40:]
+
+    metrics = []
+    for ph in ('wq', 'w', 'q'):
+        text = st.src.read_abs(posixpath.join(st.src.root, cid, 'results',
+                                             '%s-%s-race.json' % (fid, ph)))
+        if not text:
+            continue
+        try:
+            race = json.loads(text)
+        except ValueError:
+            continue
+        for op in (race.get('op_metrics') or []):
+            metrics.append({
+                'phase': ph, 'task': op.get('operation') or op.get('name') or '?',
+                'throughput': (op.get('throughput') or {}).get('mean') if isinstance(op.get('throughput'), dict) else op.get('throughput'),
+                'latency': (op.get('latency') or {}).get('mean') if isinstance(op.get('latency'), dict) else op.get('latency'),
+                'unit': (op.get('throughput') or {}).get('unit') if isinstance(op.get('throughput'), dict) else None,
+            })
+    artifacts = []
+    for name in ('%s-wq.md' % fid, '%s-wq-race.json' % fid,
+                 '%s-wq-sidecar.json' % fid, '%s-expected-tasks.json' % fid):
+        if st.src.read_abs(posixpath.join(st.src.root, cid, 'results', name)) is not None:
+            artifacts.append(name)
+    return 200, {'cid': cid, 'fid': fid, 'plan': plan_row, 'races': race_rows,
+                 'progress': prog_lines, 'metrics': metrics, 'artifacts': artifacts}
+
+
+def api_monitor(st, cid, fid):
+    """读某场次的每节点 5 秒时序 CSV（monitors/<fid>-<node>.csv）。"""
+    why = check_cid(cid)
+    if why:
+        return 400, {'error': why}
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', fid or ''):
+        return 400, {'error': '非法场次 id'}
+    env_text = st.src.read_abs(posixpath.join(st.src.root, cid, 'monitors', 'ENV-SUMMARY.csv')) or ''
+    nodes = []
+    for line in env_text.splitlines()[1:]:
+        cols = line.split(',')
+        if len(cols) >= 3 and cols[0].strip() == fid and cols[2].strip():
+            if cols[2] not in nodes:
+                nodes.append(cols[2].strip())
+    if not nodes:
+        # 退化：按 campaign 的 vm 名约定给几个常见节点名探测
+        nodes = ['node1', 'node2', 'esrally']
+    series = []
+    for node in nodes:
+        name = '%s-%s.csv' % (fid, node)
+        text = st.src.read_abs(posixpath.join(st.src.root, cid, 'monitors', name))
+        if not text:
+            continue
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        header = lines[0].split(',')
+        rows = []
+        for ln in lines[1:5001]:
+            cells = ln.split(',')
+            if len(cells) != len(header):
+                continue
+            row = {}
+            for k, v in zip(header, cells):
+                try:
+                    row[k] = float(v) if v not in ('', '-') else None
+                except ValueError:
+                    row[k] = v
+            rows.append(row)
+        series.append({'node': node, 'file': name, 'header': header, 'rows': rows})
+    return 200, {'cid': cid, 'fid': fid, 'series': series, 'interval': 5}
+
+
+def api_logfile(st, cid, rel, n, q):
+    why = check_cid(cid)
+    if why:
+        return 400, {'error': why}
+    try:
+        rel = safe_camp_rel(rel)
+    except ValueError as e:
+        return 400, {'error': str(e)}
+    n = max(1, min(int(n or 200), 5000))
+    text = st.src.read(cid, rel)
+    if text is None:
+        return 404, {'error': '文件不存在或不可读: %s' % rel}
+    lines = text.splitlines()
+    if q:
+        lines = [ln for ln in lines if q.lower() in ln.lower()]
+    total = len(lines)
+    if total > n:
+        lines = lines[-n:]
+    return 200, {'cid': cid, 'file': rel, 'total': total, 'lines': lines,
+                 'truncated': total > n}
+
+
+def api_est_suggest(st, track):
+    """按历史同赛道实际耗时中位数给出 est 建议（分钟）。
+
+    来源：各 campaign 的 RACES.md 用时列（Xmin / Xs）+ PLAN.tsv 的 est 列作回退；
+    只读 campaign 文件，不碰指标库与集群。
+    """
+    if not isinstance(track, str) or not track:
+        raise ValueError('请指定赛道')
+    buckets = {}
+    for s in Q.campaign_summaries(st.src):
+        cid = s.get('cid')
+        if not cid:
+            continue
+        plan = st.src.read_abs(posixpath.join(st.src.root, cid, 'PLAN.tsv')) or ''
+        fids = [ln.split('\t')[0] for ln in plan.splitlines()[1:]
+                if len(ln.split('\t')) > 2 and ln.split('\t')[2] == track]
+        if not fids:
+            continue
+        races = st.src.read_abs(posixpath.join(st.src.root, cid, 'RACES.md')) or ''
+        for ln in races.splitlines():
+            if not ln.startswith('| '):
+                continue
+            cols = [c.strip() for c in ln.strip('|').split('|')]
+            if len(cols) < 4 or cols[0] not in fids:
+                continue
+            if 'VALID' not in cols[1] and 'DEGRADED' not in cols[1]:
+                continue
+            m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(min|s)', cols[3])
+            if not m:
+                continue
+            val = float(m.group(1)) / 60 if m.group(2) == 's' else float(m.group(1))
+            if 0 < val < 24 * 60:
+                buckets.setdefault(track, []).append(val)
+    vals = sorted(buckets.get(track, []))
+    if not vals:
+        return 200, {'track': track, 'available': False, 'n': 0, 'suggest': None}
+    mid = vals[len(vals) // 2] if len(vals) % 2 else (vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2
+    return 200, {'track': track, 'available': True, 'n': len(vals),
+                 'suggest': max(1, int(round(mid))), 'min': vals[0], 'max': vals[-1]}
+
+
+def api_report(st, cid, fmt):
+    """报告导出：按 campaign 生成 Markdown / HTML（纯离线读文件，不解析缓存）。"""
+    why = check_cid(cid)
+    if why:
+        return 400, {'error': why}
+    fmt = fmt or 'md'
+    if fmt not in ('md', 'html'):
+        raise ValueError('格式只能是 md 或 html')
+    d = Q.campaign_json(Q.build_campaign(st.src, cid))
+    # 与 api_queue 同口径：ENV-SUMMARY.csv 的逐场最坏判定 + steal 峰值附到 fields。
+    env = parse_env_summary(st.src.read_abs(
+        posixpath.join(st.src.root, cid, 'monitors', 'ENV-SUMMARY.csv')) or '')
+    for f in d.get('fields', []):
+        e = env.get(f.get('fid'))
+        if e:
+            f['env_verdict'] = e['verdict']
+            f['steal_max'] = e['steal_max']
+    lines = ['# raceway 跑分报告: %s' % cid, '']
+    if d.get('meta'):
+        lines += ['## 概况', '']
+        for k in ('deadline', 'planned', 'valid', 'failed', 'pending'):
+            if k in d['meta']:
+                lines.append('- %s: %s' % (k, d['meta'][k]))
+        lines.append('')
+    lines += ['## 逐场判定', '', '| 场次 | 状态 | 卡点 | ENV | 用时 |',
+              '|---|---|---|---|---|']
+    for f in d.get('fields', []):
+        lines.append('| %s | %s | %s | %s | %s |' % (
+            f.get('fid', ''), f.get('status', ''), f.get('precheck', ''),
+            f.get('env_verdict', '-'), f.get('elapsed', '-')))
+    lines += ['', '## 环境采样（最坏 ENV / steal 峰值）', '',
+              '| 场次 | ENV | steal_max |', '|---|---|---|']
+    for f in d.get('fields', []):
+        lines.append('| %s | %s | %s |' % (f.get('fid', ''),
+                     f.get('env_verdict', '-'), f.get('steal_max', '-')))
+    lines += ['', '---', '', '由 raceway 控制台生成；口径见 docs/METHODOLOGY.md。']
+    md = '\n'.join(lines)
+    if fmt == 'html':
+        import html as _html
+        body = _html.escape(md)
+        out = ('<!doctype html><html><head><meta charset="utf-8"><title>raceway %s</title>'
+               '<style>body{font:14px/1.6 -apple-system,Segoe UI,sans-serif;max-width:960px;'
+               'margin:40px auto;color:#222}pre{white-space:pre-wrap}</style></head>'
+               '<body><pre>%s</pre></body></html>') % (_html.escape(cid), body)
+        return 200, {'cid': cid, 'format': fmt, 'text': out}
+    return 200, {'cid': cid, 'format': fmt, 'text': md}
+
+
 def _err_body(e):
     """do_GET/serve-rpc 的兜底错误体，保持与旧内联实现一致的 'Type: msg' 形状。"""
     return (500, 'application/json',
@@ -1448,6 +1917,32 @@ def _route_get_core(st, path, q):
         code, payload = api_exports(st)
     elif path == '/api/trend':
         code, payload = api_trend(st, q)
+    elif path == '/api/track-files':
+        code, payload = api_track_list(st)
+    elif path == '/api/track-file':
+        try:
+            code, payload = api_track_read(st, {'path': (q.get('path') or [''])[0]})
+        except ValueError as e:
+            return 400, 'application/json', json.dumps({'error': str(e)}, ensure_ascii=False), 'no-store'
+    elif path == '/api/sidecar':
+        code, payload = api_sidecar(st, (q.get('cid') or [''])[0], (q.get('fid') or [''])[0])
+    elif path == '/api/race-detail':
+        code, payload = api_race_detail(st, (q.get('cid') or [''])[0], (q.get('fid') or [''])[0])
+    elif path == '/api/monitor':
+        code, payload = api_monitor(st, (q.get('cid') or [''])[0], (q.get('fid') or [''])[0])
+    elif path == '/api/logfile':
+        code, payload = api_logfile(st, (q.get('cid') or [''])[0], (q.get('file') or [''])[0],
+                                    (q.get('n') or ['200'])[0], (q.get('q') or [''])[0])
+    elif path == '/api/est-suggest':
+        try:
+            code, payload = api_est_suggest(st, (q.get('track') or [''])[0])
+        except ValueError as e:
+            return 400, 'application/json', json.dumps({'error': str(e)}, ensure_ascii=False), 'no-store'
+    elif path == '/api/report':
+        try:
+            code, payload = api_report(st, (q.get('cid') or [''])[0], (q.get('fmt') or ['md'])[0])
+        except ValueError as e:
+            return 400, 'application/json', json.dumps({'error': str(e)}, ensure_ascii=False), 'no-store'
     else:
         return 404, 'text/plain', 'not found', 'no-store'
     return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
@@ -1476,6 +1971,14 @@ def _post_core(st, path, body):
             code, payload = api_tracks(st)
         elif path == '/api/apply':
             code, payload = api_apply(st, body)
+        elif path == '/api/track-write':
+            code, payload = api_track_write(st, body)
+        elif path == '/api/track-delete':
+            code, payload = api_track_delete(st, body)
+        elif path == '/api/export-gen':
+            code, payload = api_export_gen(st, body)
+        elif path == '/api/close':
+            code, payload = api_close(st, body)
         else:
             code, payload = 404, {'error': 'not found'}
     except SystemExit as e:

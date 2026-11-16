@@ -471,7 +471,25 @@ OpenSearch 的 HNSW 搜索预算使用 `ef_search`，不等同于 ES 的每分�
 
 ## 14. 控制台（可选）
 
-`bench-compose.py serve` 起一个页面，五块内容合一（前端在 `web/` 目录，Preact+HTM 轻量单页，必须随仓库同步；`web/index.html` 缺失时自动回退旧页面 `web/legacy.html`，`/legacy` 可直接访问）：
+`bench-compose.py serve` 起一个页面，八块内容合一（原五块 + 扩展功能归入 ⑥⑦⑧）。前端在 `web/` 目录（Preact+HTM 轻量单页，必须随仓库同步；`web/index.html` 缺失时自动回退旧页面 `web/legacy.html`，`/legacy` 可直接访问）：
+
+- **后端两种**：默认 Python `serve`；`serve-go/` 提供 Go HTTP 外壳（守卫/静态资源 + 扩展 API 原生 handler，业务逻辑经 `serve-rpc` 转发给 Python）。两者接口契约一致，写操作均带 CSRF。
+- **新增 API**（Go 原生 / Python fallback 同语义）：`GET /api/track-files|track-file|sidecar|race-detail|monitor|logfile|est-suggest|report`；`POST /api/track-write|track-delete|export-gen|close`。Go 侧读操作直接读文件（本地 `os` / SSH exec），写操作经 `bench-ops.py` 做原子 I/O。
+- **⑥ 赛道文件**：浏览/新建/编辑/删除 `tracks/`，原子写 + sha256 并发校验。`tracks/` 是定版目录，改动需重新同步压测机才生效。
+- **⑦ 场次详情**：实测身份卡（sidecar）、逐任务指标（race.json）、每节点 5s 监控曲线（`monitors/<fid>-<node>.csv`）、日志全文（含关键字过滤）、campaign 收尾（`close-campaign.sh`，默认 dry-run）。
+- **⑧ 报告与导出**：按 campaign 导出 Markdown/HTML 报告；一键生成导出（build-race-store → bench-export，tag 不覆盖）。
+- **深链**：`#/progress/<cid>`、`#/detail/<cid>` 等；编排预设存 localStorage，可导入导出 JSON；est 自动校准按历史同赛道有效场次中位耗时回填。
+- **命令行入口**：上述新能力全部可用 `bench-tools.py <action>` 从 shell 使用（sidecar/detail/monitor/log/report/est/track-ls|read|write|del/export-gen/close），与 Web/Go 复用同一套 `api_*` 函数，本地与 `--ssh` 都支持。例：
+  ```bash
+  python3 bench-tools.py sidecar <cid> <fid>                       # JSON 输出，可管道 jq
+  python3 bench-tools.py monitor <cid> <fid> --raw -o mon.csv     # 每节点 5s 时序导出 CSV
+  python3 bench-tools.py report  <cid> -o report.md               # Markdown 报告
+  python3 bench-tools.py track-write tracks/new.json --content '...'  # 赛道文件（带 sha 校验）
+  python3 bench-tools.py close <cid>                # 默认 dry-run；--run 才真执行
+  ```
+  原有 CLI（`bench-compose.py` 的 cars/gen/preview/start/serve、`car-compare.py`、`bench-queue.py`、`bench-history.py`、`build-race-store.py`→`bench-export.py`→`bench-apply.py`、各 `*.sh`）全部保留不变。
+
+原五块内容（排程 / 进度 / 历史与结果 / 趋势 / 赛道与入库）见下文：
 
 ```bash
 python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
