@@ -234,21 +234,33 @@ func (s *server) nativeRaceDetail(w http.ResponseWriter, q url.Values) bool {
 		if e := json.Unmarshal([]byte(txt), &race); e != nil {
 			continue
 		}
-		opsList, _ := race["op_metrics"].([]any)
+		// 新版 rally 的指标在 results.op_metrics（顶层是空的）；兼容旧布局
+		opsList := []any{}
+		if res, ok := race["results"].(map[string]any); ok {
+			opsList, _ = res["op_metrics"].([]any)
+		}
+		if len(opsList) == 0 {
+			opsList, _ = race["op_metrics"].([]any)
+		}
 		for _, raw := range opsList {
 			op, _ := raw.(map[string]any)
 			if op == nil {
 				continue
 			}
-			task := op["operation"]
+			task := op["task"]
+			if task == nil {
+				task = op["operation"]
+			}
 			if task == nil {
 				task = op["name"]
 			}
 			metrics = append(metrics, map[string]any{
 				"phase": ph, "task": task,
-				"throughput": metricMean(op["throughput"]),
-				"latency":    metricMean(op["latency"]),
-				"unit":       metricUnit(op["throughput"]),
+				"throughput": metricMedian(op["throughput"]),
+				"tput_unit":  metricUnit(op["throughput"]),
+				"lat_p50":    metricPct(op["latency"], "50_0"),
+				"lat_p99":    metricPct(op["latency"], "99_0"),
+				"lat_unit":   metricUnit(op["latency"]),
 			})
 		}
 	}
@@ -280,6 +292,27 @@ func metricMean(v any) any {
 	return nil
 }
 
+// metricMedian：rally 吞吐取 median（缺失回 mean）
+func metricMedian(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if x, ok := m["median"]; ok {
+		return x
+	}
+	return m["mean"]
+}
+
+// metricPct：rally 百分位键是 50_0 / 99_0 这类格式
+func metricPct(v any, key string) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return m[key]
+}
+
 func metricUnit(v any) any {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -297,52 +330,87 @@ func (s *server) nativeMonitor(w http.ResponseWriter, q url.Values) bool {
 		sendErrJSON(w, 400, "非法 campaign 或场次 id")
 		return true
 	}
-	nodes := []string{}
+	// load-monitor 按相位分 tag 采集：文件名是 <fid>-<相位>-<node>.csv（如 -wq-），
+	// (相位, 节点) 清单来自 ENV-SUMMARY.csv。兼容旧布局 <fid>-<node>.csv；
+	// 同一节点跨相位的多份 CSV 按行拼接成一条曲线。
+	type triple struct{ phase, node string }
+	triples := []triple{}
 	if env, ok := s.readFile(s.campPath(cid, path.Join("monitors", "ENV-SUMMARY.csv"))); ok {
 		if rows, e := csv.NewReader(strings.NewReader(env)).ReadAll(); e == nil && len(rows) > 1 {
 			for _, r := range rows[1:] {
-				if len(r) >= 3 && strings.TrimSpace(r[0]) == fid && strings.TrimSpace(r[2]) != "" {
-					node := strings.TrimSpace(r[2])
-					if !contains(nodes, node) {
-						nodes = append(nodes, node)
+				cols := make([]string, len(r))
+				for i, v := range r {
+					cols[i] = strings.TrimSpace(v)
+				}
+				if len(cols) >= 3 && cols[0] == fid && cols[2] != "" {
+					t := triple{phase: cols[1], node: cols[2]}
+					found := false
+					for _, x := range triples {
+						if x == t {
+							found = true
+							break
+						}
+					}
+					if !found {
+						triples = append(triples, t)
 					}
 				}
 			}
 		}
 	}
+	if len(triples) == 0 {
+		for _, n := range []string{"node1", "node2", "esrally"} {
+			triples = append(triples, triple{node: n})
+		}
+	}
 	series := []any{}
-	for _, node := range nodes {
-		name := fmt.Sprintf("%s-%s.csv", fid, node)
-		txt, ok := s.readFile(s.campPath(cid, path.Join("monitors", name)))
-		if !ok {
-			continue
+	byNode := map[string]int{} // node → series 下标
+	for _, t := range triples {
+		names := []string{}
+		if t.phase != "" {
+			names = append(names, fmt.Sprintf("%s-%s-%s.csv", fid, t.phase, t.node))
 		}
-		rows, e := csv.NewReader(strings.NewReader(txt)).ReadAll()
-		if e != nil || len(rows) < 2 {
-			continue
-		}
-		header := rows[0]
-		data := []any{}
-		for _, r := range rows[1:] {
-			if len(r) != len(header) {
+		names = append(names, fmt.Sprintf("%s-%s.csv", fid, t.node)) // 旧布局兜底
+		for _, name := range names {
+			txt, ok := s.readFile(s.campPath(cid, path.Join("monitors", name)))
+			if !ok {
 				continue
 			}
-			row := map[string]any{}
-			for i, k := range header {
-				if f, e := strconv.ParseFloat(strings.TrimSuffix(r[i], "%"), 64); e == nil {
-					row[k] = f
-				} else {
-					row[k] = r[i]
+			rows, e := csv.NewReader(strings.NewReader(txt)).ReadAll()
+			if e != nil || len(rows) < 2 {
+				continue
+			}
+			header := rows[0]
+			data := []any{}
+			for _, r := range rows[1:] {
+				if len(r) != len(header) {
+					continue
+				}
+				row := map[string]any{}
+				for i, k := range header {
+					if f, e := strconv.ParseFloat(strings.TrimSuffix(r[i], "%"), 64); e == nil {
+						row[k] = f
+					} else {
+						row[k] = r[i]
+					}
+				}
+				data = append(data, row)
+				if len(data) >= 5000 {
+					break
 				}
 			}
-			data = append(data, row)
-			if len(data) >= 5000 {
-				break
+			if idx, seen := byNode[t.node]; seen {
+				// 同节点跨相位：拼行
+				cur := series[idx].(map[string]any)
+				cur["rows"] = append(cur["rows"].([]any), data...)
+			} else {
+				byNode[t.node] = len(series)
+				series = append(series, map[string]any{
+					"node": t.node, "file": name, "header": header, "rows": data,
+				})
 			}
+			break // 一个 (相位, 节点) 命中一份文件即可
 		}
-		series = append(series, map[string]any{
-			"node": node, "file": name, "header": header, "rows": data,
-		})
 	}
 	sendJSON(w, 200, map[string]any{
 		"cid": cid, "fid": fid, "series": series, "interval": 5,

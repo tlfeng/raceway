@@ -128,6 +128,104 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(p['series'][0]['node'], 'n1')
         self.assertEqual(p['series'][0]['rows'][1]['bench_cpu'], 31.5)
 
+    def test_phase_qualified_files_concat_per_node(self):
+        """真实布局：<fid>-<相位>-<node>.csv（load-monitor 按相位分 tag）。
+
+        同节点跨相位的多份 CSV 拼成一条曲线；旧行为按 <fid>-<node>.csv 找不到文件，
+        真机上整个监控卡永远"该场次没有监控 CSV"——这里钉住文件名解析。
+        """
+        write_campaign(self.root, 'mon-camp2',
+                       env=(ENV_HEADER
+                            + 'r-x-r1,wq,n1,1.1.1.1,2,0,0,0,0,0,OK\n'
+                            + 'r-x-r1,q,n1,1.1.1.1,2,0,0,0,0,0,OK\n'))
+        mon = os.path.join(self.root, 'campaigns', 'mon-camp2', 'monitors')
+        with open(os.path.join(mon, 'r-x-r1-wq-n1.csv'), 'w', encoding='utf-8') as f:
+            f.write('ts,cpu_usr,cpu_steal,bench_cpu,load1\n100,10,0,30,2\n105,20,0,31,2\n')
+        with open(os.path.join(mon, 'r-x-r1-q-n1.csv'), 'w', encoding='utf-8') as f:
+            f.write('ts,cpu_usr,cpu_steal,bench_cpu,load1\n110,30,0,32,2\n')
+        code, p = C.api_monitor(self.st, 'mon-camp2', 'r-x-r1')
+        self.assertEqual(code, 200)
+        self.assertEqual(len(p['series']), 1)
+        self.assertEqual([r['cpu_usr'] for r in p['series'][0]['rows']], [10.0, 20.0, 30.0])
+
+    def _race_json(self, root, cid, name):
+        with open(os.path.join(root, 'campaigns', cid, 'results', name), 'w', encoding='utf-8') as f:
+            json.dump({'results': {'op_metrics': [
+                {'operation': 'bulk', 'task': 'index-append',
+                 'throughput': {'unit': 'docs/s', 'median': 8067.8},
+                 'latency': {'unit': 'ms', 'mean': 1.0}},
+                {'operation': 'knn', 'task': 'knn-search-10-100',
+                 'throughput': {'unit': 'ops/s', 'median': 32.28},
+                 'latency': {'unit': 'ms', 'mean': 24.3, '50_0': 23.86, '99_0': 33.03}},
+            ]}}, f)
+
+
+class RaceMetricsTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.st = make_state(self.root)
+
+    def test_race_detail_reads_results_op_metrics(self):
+        """新版 rally 指标在 results.op_metrics（顶层为空）——钉住取数路径。"""
+        write_campaign(self.root, 'rm-camp', plan='a-geo-r1\ta-conf\tgeo\t1\trecall\t30\n')
+        d = os.path.join(self.root, 'campaigns', 'rm-camp', 'results')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'a-geo-r1-wq-race.json'), 'w', encoding='utf-8') as f:
+            json.dump({'results': {'op_metrics': [
+                {'operation': 'bulk', 'task': 'index-append',
+                 'throughput': {'unit': 'docs/s', 'median': 100.0},
+                 'latency': {'unit': 'ms', '50_0': 9.0, '99_0': 19.0}},
+            ]}}, f)
+        code, p = C.api_race_detail(self.st, 'rm-camp', 'a-geo-r1')
+        self.assertEqual(code, 200)
+        self.assertEqual(len(p['metrics']), 1)
+        m = p['metrics'][0]
+        self.assertEqual(m['task'], 'index-append')
+        self.assertEqual(m['throughput'], 100.0)
+        self.assertEqual(m['lat_p50'], 9.0)
+        self.assertEqual(m['lat_p99'], 19.0)
+
+
+class CampaignResultTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.st = make_state(self.root)
+
+    def test_speedview_rows_verdicts_and_metrics(self):
+        write_campaign(self.root, 'sv-camp',
+                       plan='a-geo-r1\ta-conf\tgeo\t1\trecall\t30\n'
+                            'b-geo-r1\tb-conf\tgeo\t1\trecall\t30\n',
+                       races='| a-geo-r1 | VALID | OK | 60s |\n'
+                             '| a-geo-r1 | VALID | OK | 58s |\n'
+                             '| b-geo-r1 | FAIL | OK | 60s |\n')
+        d = os.path.join(self.root, 'campaigns', 'sv-camp', 'results')
+        os.makedirs(d, exist_ok=True)
+        for fid, tput in (('a-geo-r1', 100.0), ('b-geo-r1', 200.0)):
+            with open(os.path.join(d, '%s-wq-race.json' % fid), 'w', encoding='utf-8') as f:
+                json.dump({'results': {'op_metrics': [
+                    {'operation': 'bulk', 'task': 'index-append',
+                     'throughput': {'unit': 'docs/s', 'median': tput}},
+                    {'operation': 'knn', 'task': 'knn-10',
+                     'throughput': {'unit': 'ops/s', 'median': tput / 10},
+                     'latency': {'unit': 'ms', '50_0': 5.0, '99_0': 9.0}},
+                ]}}, f)
+        code, p = C.api_campaign_result(self.st, 'sv-camp')
+        self.assertEqual(code, 200)
+        by = {r['fid']: r for r in p['rows']}
+        # 判定取最后一次出现（重试覆盖旧判定）
+        self.assertEqual(by['a-geo-r1']['verdict'], 'VALID')
+        self.assertEqual(by['b-geo-r1']['verdict'], 'FAIL')
+        self.assertEqual(by['a-geo-r1']['metrics'][0]['throughput'], 100.0)
+        # 最弱查询任务口径在 mock 前端，后端只供全量指标
+        self.assertEqual(len(by['a-geo-r1']['metrics']), 2)
+
+    def test_verdict_defaults_pending_without_races(self):
+        write_campaign(self.root, 'sv-pend', plan='a-geo-r1\tc\tgeo\t1\trecall\t30\n')
+        code, p = C.api_campaign_result(self.st, 'sv-pend')
+        self.assertEqual(code, 200)
+        self.assertEqual(p['rows'][0]['verdict'], 'PENDING')
+        self.assertEqual(p['rows'][0]['metrics'], [])
+
 
 class LogfileTests(unittest.TestCase):
     def setUp(self):
@@ -221,6 +319,51 @@ class ReportTests(unittest.TestCase):
         code, p = C.api_report(self.st, 'rep-camp', 'html')
         self.assertEqual(code, 200)
         self.assertIn('<!doctype html>', p['text'])
+
+
+class ComposeRefreshTest(unittest.TestCase):
+    """bootstrap refresh=1 的车表重读：车定义文件变化在控制台无需重启即可见。
+
+    语义契约：读不到/空文件 → **保留上一次车表** + 报 problem（刷新是改善操作，
+    不该比不刷更糟）；解析出车 → 直接替换（校验问题照常上屏）。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='raceway-refresh-')
+        self.cars_file = os.path.join(self.root, 'cars.conf')
+        self.st = make_state(self.root)
+        self.st.args.cars_file = self.cars_file
+        with open(self.cars_file, 'w', encoding='utf-8') as f:
+            f.write('carA ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0\n')
+        self.st.reload_cars()
+
+    def test_reload_picks_up_new_car(self):
+        with open(self.cars_file, 'w', encoding='utf-8') as f:
+            f.write('carA ENGINE_NAME=easysearch\n\ncarB ENGINE_NAME=elasticsearch\n')
+        self.st.reload_cars()
+        self.assertEqual([a.name for a in self.st.cars], ['carA', 'carB'])
+        self.assertEqual(self.st.problems, [])
+
+    def test_reload_keeps_old_table_on_empty_file(self):
+        """半写状态（空文件）→ 旧车表继续可用，不被打瘫。"""
+        with open(self.cars_file, 'w', encoding='utf-8') as f:
+            f.write('')
+        self.st.reload_cars()
+        self.assertEqual([a.name for a in self.st.cars], ['carA'])
+        self.assertTrue(any('保持上一次' in m for _, m in self.st.problems))
+
+    def test_reload_keeps_old_table_on_missing_file(self):
+        os.remove(self.cars_file)
+        self.st.reload_cars()
+        self.assertEqual([a.name for a in self.st.cars], ['carA'])
+        self.assertTrue(any('重读失败' in m for _, m in self.st.problems))
+
+    def test_refresh_catalog_stays_usable(self):
+        C.refresh_catalog()
+        self.assertIn('geo', C.TRACK_CATALOG)
+        self.assertEqual(C.TRACK_CATALOG['geo']['name'], 'geo')
+        # 变体随基座一起重建
+        self.assertIn('geo-codec-zstd-sr', C.TRACK_CATALOG)
 
 
 if __name__ == '__main__':

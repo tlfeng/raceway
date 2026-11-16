@@ -167,7 +167,22 @@ def run(payload):
                 fail('导出产物缺 manifest.json，拒绝发布')
             os.replace(staging / 'out', export_root)
             shutil.rmtree(staging, ignore_errors=True)
-            return {'tag': tag, 'campaigns': cids,
+            # manifest 摘要给控制台直接展示关键统计（数字埋在 log 里没人看）
+            summary = {}
+            try:
+                with open(export_root / 'manifest.json', encoding='utf-8') as f:
+                    m = json.load(f)
+                for k in ('generated_utc', 'races_scanned', 'segments_scanned',
+                          'bench_run', 'bench_metric', 'bench_env', 'system_rows'):
+                    if m.get(k) is not None:
+                        summary[k] = m[k]
+                orphans = m.get('monitors_orphan_fids') or {}
+                if orphans:
+                    summary['monitors_orphan_cids'] = len(orphans)
+                    summary['monitors_orphan_fids'] = sum(len(v) for v in orphans.values())
+            except (OSError, ValueError):
+                pass
+            return {'tag': tag, 'campaigns': cids, 'summary': summary,
                     'log': (r1.stdout + r2.stdout).strip()[-2000:]}
         except BaseException:
             if staging.exists():
