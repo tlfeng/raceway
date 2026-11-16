@@ -2284,6 +2284,107 @@ def api_apply(st, body):
     return 200, {'result': out, 'rc': rc}
 
 
+def _err_body(e):
+    """do_GET/serve-rpc 的兜底错误体，保持与旧内联实现一致的 'Type: msg' 形状。"""
+    return (500, 'application/json',
+            json.dumps({'error': '%s: %s' % (type(e).__name__, e)}, ensure_ascii=False),
+            'no-store')
+
+
+def _route_get_core(st, path, q):
+    """GET 路由核心：不碰 socket，只返回 (code, ctype, body, cache)。
+
+    与 do_POST 的 _post_core 一起构成 serve 的纯路由层，供 HTTP Handler 和
+    serve-rpc（Go 后端逐请求转发）共用，保证两条路径的接口契约完全一致。
+    静态资源与 '/' 由 Go 侧原生服务；这里保留仅为让 Python serve 继续自洽。
+    """
+    if path == '/':
+        web_page = os.path.join(_WEB_DIR, 'index.html')
+        if os.path.isfile(web_page):
+            # 新前端（web/ 目录，Preact+HTM 轻量实现）；no-store 保证改版即生效
+            with open(web_page, encoding='utf-8') as f:
+                return 200, 'text/html; charset=utf-8', f.read(), 'no-store'
+        # 兜底：web/ 未随仓库同步时仍可用内联旧页
+        return 200, 'text/html; charset=utf-8', _PAGE, 'no-store'
+    if path in _WEB_STATIC:
+        local = os.path.join(_WEB_DIR, _WEB_STATIC[path])
+        if os.path.isfile(local):
+            with open(local, encoding='utf-8') as f:
+                return 200, _WEB_MIME[path], f.read(), 'public, max-age=300'
+        return 404, 'text/plain', '前端文件缺失: ' + path, 'no-store'
+    if path == '/api/bootstrap':
+        return 200, 'application/json', json.dumps({
+            'cars': [{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars],
+            'problems': st.problems, 'ds_tiers': DS_TIERS,
+            # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
+            'tracks': [dict(v, name=k) for k, v in TRACK_CATALOG.items()],
+            'track_groups': TRACK_GROUPS,
+            'base_tracks': sorted(BASE_TRACKS),
+            'codec_tokens': CODEC_TOKENS,
+            'token_label': TOKEN_LABEL,
+            'token_codec': TOKEN_CODEC,
+            'ssh': st.args.ssh or '', 'root': st.args.root,
+            'cars_file': st.args.cars_file,
+            'kibana_url': st.args.kibana_url,
+            'csrf_token': st.csrf_token,
+            'results_root': st.src.root,
+        }, ensure_ascii=False), 'no-store'
+    if path == '/api/history':
+        return 200, 'application/json', json.dumps(st.history().to_dict(), ensure_ascii=False), 'no-store'
+    if path == '/echarts.min.js':
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'echarts.min.js')
+        if os.path.isfile(local):
+            with open(local, encoding='utf-8') as f:
+                return 200, 'application/javascript; charset=utf-8', f.read(), 'public, max-age=86400'
+        return 404, 'text/plain', ('echarts.min.js 未随仓库分发（与 bench-compose.py 同目录放置后刷新）'
+                                   '—— 趋势图不可用，表格不受影响'), 'no-store'
+    if path == '/api/campaigns':
+        code, payload = api_campaigns(st)
+    elif path == '/api/queue':
+        code, payload = api_queue(st, (q.get('cid') or [''])[0])
+    elif path == '/api/logtail':
+        code, payload = api_logtail(st, (q.get('cid') or [''])[0], (q.get('n') or ['50'])[0])
+    elif path == '/api/exports':
+        code, payload = api_exports(st)
+    elif path == '/api/trend':
+        code, payload = api_trend(st, q)
+    else:
+        return 404, 'text/plain', 'not found', 'no-store'
+    return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
+
+
+def _post_core(st, path, body):
+    """POST 路由核心：body 已由调用方解析为 dict，这里只做分发与错误映射。
+
+    沿用旧 do_POST 的错误语义：SystemExit→400、其它异常→500（transport 层的
+    415/坏 JSON 校验仍留在 do_POST，serve-rpc 侧由 Go 保证 Content-Type）。
+    """
+    try:
+        if path == '/api/render':
+            code, payload = api_render(st, body)
+        elif path == '/api/preview':
+            code, payload = api_preview(st, body)
+        elif path == '/api/start':
+            code, payload = api_start(st, body)
+        elif path == '/api/stop':
+            code, payload = api_stop(st, body)
+        elif path == '/api/compare':
+            code, payload = api_compare(st, body)
+        elif path == '/api/doctor':
+            code, payload = api_doctor(st)
+        elif path == '/api/tracks':
+            code, payload = api_tracks(st)
+        elif path == '/api/apply':
+            code, payload = api_apply(st, body)
+        else:
+            code, payload = 404, {'error': 'not found'}
+    except SystemExit as e:
+        code, payload = 400, {'error': str(e)}
+    except Exception as e:  # 远端命令失败等，页面要能看到原因
+        code, payload = 500, {'error': '%s: %s' % (type(e).__name__, e)}
+    return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -2343,77 +2444,10 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         st = self.server.state
         try:
-            self._route_get(u.path, q, st)
+            code, ctype, body, cache = _route_get_core(st, u.path, q)
         except Exception as e:  # 参数/远端失败等，页面要能看到原因而不是断连
-            self._send(500, 'application/json',
-                       json.dumps({'error': '%s: %s' % (type(e).__name__, e)},
-                                  ensure_ascii=False))
-
-    def _route_get(self, path, q, st):
-        if path == '/':
-            web_page = os.path.join(_WEB_DIR, 'index.html')
-            if os.path.isfile(web_page):
-                # 新前端（web/ 目录，Preact+HTM 轻量实现）；no-store 保证改版即生效
-                with open(web_page, encoding='utf-8') as f:
-                    self._send(200, 'text/html; charset=utf-8', f.read(), cache='no-store')
-            else:
-                # 兜底：web/ 未随仓库同步时仍可用内联旧页
-                self._send(200, 'text/html; charset=utf-8', _PAGE)
-        elif path in _WEB_STATIC:
-            local = os.path.join(_WEB_DIR, _WEB_STATIC[path])
-            if os.path.isfile(local):
-                with open(local, encoding='utf-8') as f:
-                    self._send(200, _WEB_MIME[path], f.read(), cache='public, max-age=300')
-            else:
-                self._send(404, 'text/plain', '前端文件缺失: ' + path)
-        elif path == '/api/bootstrap':
-            self._send(200, 'application/json', json.dumps({
-                'cars': [{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars],
-                'problems': st.problems, 'ds_tiers': DS_TIERS,
-                # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
-                'tracks': [dict(v, name=k) for k, v in TRACK_CATALOG.items()],
-                'track_groups': TRACK_GROUPS,
-                'base_tracks': sorted(BASE_TRACKS),
-                'codec_tokens': CODEC_TOKENS,
-                'token_label': TOKEN_LABEL,
-                'token_codec': TOKEN_CODEC,
-                'ssh': st.args.ssh or '', 'root': st.args.root,
-                'cars_file': st.args.cars_file,
-                'kibana_url': st.args.kibana_url,
-                'csrf_token': st.csrf_token,
-                'results_root': st.src.root,
-            }, ensure_ascii=False))
-        elif path == '/api/history':
-            cov = st.history()
-            self._send(200, 'application/json', json.dumps(cov.to_dict(), ensure_ascii=False))
-        elif path == '/api/campaigns':
-            code, payload = api_campaigns(st)
-            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
-        elif path == '/api/queue':
-            code, payload = api_queue(st, (q.get('cid') or [''])[0])
-            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
-        elif path == '/api/logtail':
-            code, payload = api_logtail(st, (q.get('cid') or [''])[0],
-                                        (q.get('n') or ['50'])[0])
-            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
-        elif path == '/api/exports':
-            code, payload = api_exports(st)
-            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
-        elif path == '/api/trend':
-            code, payload = api_trend(st, q)
-            self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
-        elif path == '/echarts.min.js':
-            local = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'echarts.min.js')
-            if os.path.isfile(local):
-                with open(local, encoding='utf-8') as f:
-                    self._send(200, 'application/javascript; charset=utf-8', f.read(),
-                               cache='public, max-age=86400')
-            else:
-                self._send(404, 'text/plain',
-                           'echarts.min.js 未随仓库分发（与 bench-compose.py 同目录放置后刷新）'
-                           '—— 趋势图不可用，表格不受影响')
-        else:
-            self._send(404, 'text/plain', 'not found')
+            code, ctype, body, cache = _err_body(e)
+        self._send(code, ctype, body, cache)
 
     def do_POST(self):
         st = self.server.state
@@ -2428,30 +2462,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, 'application/json', '{"error":"bad json or length"}')
         if not isinstance(body, dict):
             return self._send(400, 'application/json', '{"error":"JSON object required"}')
-        try:
-            if self.path == '/api/render':
-                code, payload = api_render(st, body)
-            elif self.path == '/api/preview':
-                code, payload = api_preview(st, body)
-            elif self.path == '/api/start':
-                code, payload = api_start(st, body)
-            elif self.path == '/api/stop':
-                code, payload = api_stop(st, body)
-            elif self.path == '/api/compare':
-                code, payload = api_compare(st, body)
-            elif self.path == '/api/doctor':
-                code, payload = api_doctor(st)
-            elif self.path == '/api/tracks':
-                code, payload = api_tracks(st)
-            elif self.path == '/api/apply':
-                code, payload = api_apply(st, body)
-            else:
-                code, payload = 404, {'error': 'not found'}
-        except SystemExit as e:
-            code, payload = 400, {'error': str(e)}
-        except Exception as e:  # 远端命令失败等，页面要能看到原因
-            code, payload = 500, {'error': '%s: %s' % (type(e).__name__, e)}
-        self._send(code, 'application/json', json.dumps(payload, ensure_ascii=False))
+        code, ctype, out, cache = _post_core(st, self.path, body)
+        self._send(code, ctype, out, cache)
 
 
 def cmd_serve(args):
@@ -2500,10 +2512,44 @@ def cmd_serve(args):
         srv.server_close()
 
 
+def cmd_serve_rpc(args):
+    """Go 后端逐请求转发的 RPC 入口（strangler 模式的 Python 侧）。
+
+    命令行参数与 `serve` 完全一致（由 main() 的默认推导保证语义相同）；
+    请求描述从 stdin 读入：{method, path, query, body, csrf_token}。
+    复用与 serve 同一套 _route_get_core/_post_core，故两条路径契约一致。
+    每次调用重建 ComposeState —— 无常驻状态，Go 侧保持空闲低内存。
+    """
+    req = json.loads(sys.stdin.read() or '{}')
+    method = (req.get('method') or 'GET').upper()
+    path = req.get('path') or '/'
+    q = req.get('query') or {}
+    body = req.get('body') or {}
+    st = ComposeState(args)
+    if req.get('csrf_token'):
+        st.csrf_token = req['csrf_token']
+    if method == 'GET':
+        try:
+            code, ctype, out, cache = _route_get_core(st, path, q)
+        except Exception as e:
+            code, ctype, out, cache = _err_body(e)
+    elif method == 'POST':
+        if not isinstance(body, dict):
+            code, ctype, out, cache = (400, 'application/json',
+                                       '{"error":"JSON object required"}', 'no-store')
+        else:
+            code, ctype, out, cache = _post_core(st, path, body)
+    else:
+        code, ctype, out, cache = (405, 'application/json',
+                                   '{"error":"method not allowed"}', 'no-store')
+    sys.stdout.write(json.dumps(
+        {'code': code, 'ctype': ctype, 'body': out, 'cache': cache}, ensure_ascii=False))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['cars', 'gen', 'preview', 'start', 'serve'])
+    ap.add_argument('cmd', choices=['cars', 'gen', 'preview', 'start', 'serve', 'serve-rpc'])
     ap.add_argument('--cars-file', default=None, help='车定义文件（本地路径；--ssh 时为远端路径）')
     ap.add_argument('--cars', default=None,
                     help='只用这些车（逗号分隔）；缺省用车定义文件里的全部')
@@ -2569,7 +2615,7 @@ def main(argv=None):
                 if _leg != args.cars_file and os.path.isfile(_leg):
                     args.cars_file = _leg
             if not os.path.isfile(args.cars_file):
-                if args.cmd == 'serve':
+                if args.cmd in ('serve', 'serve-rpc'):
                     # serve 是五合一控制台：进度/历史/趋势/入库板块不依赖车定义，
                     # 起服务别被车定义卡死 —— ComposeState 降级为空车表并在页面提示。
                     print('警告：本地车定义 %s 不存在 —— 排程板块不可用'
@@ -2586,7 +2632,7 @@ def main(argv=None):
                            posixpath.join(args.root, 'schedules', 'dimsweep-cars.conf')))
 
     {'cars': cmd_cars, 'gen': cmd_gen, 'preview': cmd_preview,
-     'start': cmd_start, 'serve': cmd_serve}[args.cmd](args)
+     'start': cmd_start, 'serve': cmd_serve, 'serve-rpc': cmd_serve_rpc}[args.cmd](args)
 
 
 if __name__ == '__main__':
