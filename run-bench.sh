@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # run-bench.sh —— 性能编排（配置 × 赛道 × 轮次，在压测机上运行；单入口，esrally 风格）
-#   ./run-bench.sh <geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
+#   ./run-bench.sh <geo|geo-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
 #   ./run-bench.sh list                          # 列可用赛道/配置模板/近期 campaign
 #   ./run-bench.sh --help                        # 用法页（赛道、三种编排、前置条件）
 #
@@ -53,7 +53,7 @@ declare -F track_params >/dev/null 2>&1 \
 
 # 赛道/模式名单：用法提示、参数校验、文件头注释三处共用这一份（WHAT_ARGS）。
 # 收敛成一份后，文案与实际 case 的漂移由 tests/test_codec_variants.py 挡住。
-WHAT_ARGS='geo|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list'
+WHAT_ARGS='geo|geo-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list'
 
 # 用法页：./run-bench.sh --help —— 压测机是纯命令行环境，参数、赛道清单、前置条件、
 # 产物在哪全在这一页里，不用去翻源码。
@@ -206,7 +206,7 @@ else
 fi
 
 if [ "$WHAT" = list ]; then
-  echo "可用赛道: geo gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk geonames-upsert codec both all ds"
+  echo "可用赛道: geo geo-enc gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk geonames-upsert codec both all ds"
   echo "  单跑某个压缩变体：<赛道>-codec-<def|zstd|bc>[-sr]（如 geo-codec-zstd-sr、geo-codec-bc）"
   echo
   echo "赛道 → 定义目录 → 现在能不能跑："
@@ -228,6 +228,7 @@ fi
 
 case "$WHAT" in
   geo)  TRACKS=(geo);;
+  geo-enc) TRACKS=(geo-enc);;        # geonames 加密变体（encrypted_store:true 走 --track-params）
   *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道；压缩档走 --track-params）
   gdef|gzstd|gbc) TRACKS=("$WHAT");; # 仍认的短名别名（= geo-codec-*）
   hnsw) TRACKS=(hnsw);;

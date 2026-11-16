@@ -122,9 +122,9 @@ track_canonical() { # <短 id> → 规范 id
   esac; }
 track_is_variant() { # <id> → 是变体则 0
   case "$(track_canonical "$1")" in *-codec-*) return 0;; *) return 1;; esac; }
-track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀）
+track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀；geo-enc 是 geonames 的加密变体）
   local c; c=$(track_canonical "$1")
-  case "$c" in *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
+  case "$c" in geo-enc) echo geo;; *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
 track_dir() { # <赛道/变体 id> → 目录
   local c; c=$(track_canonical "$1")
   case "$c" in
@@ -142,6 +142,7 @@ track_dir() { # <赛道/变体 id> → 目录
       # 向量量化族四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
       # 量化档走 --track-params（vector_index_type）。
       echo "$ROOT/tracks/hv1024x";;
+    geo-enc) echo "$ROOT/tracks/geonames";;  # 加密变体走同一定版目录，encrypted_store 经 --track-params 选通
     geo) echo "$ROOT/tracks/geonames";;
     hnsw) echo "$ROOT/tracks/hnsw";;
     hv1024) echo "$ROOT/tracks/hv1024";;
@@ -238,6 +239,9 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   # {% if source_reuse is defined and source_reuse %}）。
   # ⚠️ source_reuse 只在开的时候传：写 false 会被 Jinja 当成非空字符串（真值）→ 反而打开
   #    Easysearch 专有设置，必须不传。
+  # 加密变体：index.json 的 encrypted_store 条件块写入 index.store.type=encrypted +
+  # index.encryption.profile=index（只 Easysearch 认；写 false 会被 Jinja 当真值，必须不传才关）。
+  [ "$1" = "geo-enc" ] && p="${p:+$p,}encrypted_store:true"
   local comp sr
   comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
   [ -n "$comp" ] && p="${p:+$p,}index_codec:$comp"
@@ -263,6 +267,9 @@ track_assert_storage_params() { # <赛道id>
   fi
   if [ "$sr" = "true" ] && ! grep -q 'source_reuse' "$idx"; then
     die "$id: $idx 没有 source_reuse 条件块 —— source_reuse 会静默失效"
+  fi
+  if [ "$id" = "geo-enc" ] && ! grep -q 'encrypted_store' "$idx"; then
+    die "$id: $idx 没有 encrypted_store 条件块 —— 加密变体会静默跑成明文基座"
   fi
   if [ -n "$q" ] && ! grep -q 'vector_index_type' "$idx"; then
     die "$id: $idx 没有 vector_index_type 条件块 —— 量化档会静默失效（该臂跑成 hnsw 基座）"
