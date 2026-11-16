@@ -101,15 +101,17 @@ class ComposeSnapshot:
     camp_prefix: str
     digest: str
     est_total_min: int
+    test_mode: bool = False
 
     def payload(self):
         return {'tag': self.tag, 'schedule': self.schedule, 'cars': self.cars_text,
                 'what': self.what, 'ds_hours': self.ds_hours,
-                'camp_prefix': self.camp_prefix, 'digest': self.digest}
+                'camp_prefix': self.camp_prefix, 'digest': self.digest,
+                'test_mode': self.test_mode}
 
 
 def make_snapshot(cars, rows, tag, est_map, est_default, recall, what, ds_hours=0,
-                  camp_prefix=None):
+                  camp_prefix=None, test_mode=False):
     ds_hours = integer(ds_hours, 'DS_HOURS', 0, 8760)
     prefix = safe_name(camp_prefix or 'jdk3', 'campaign 前缀')
     if not rows:
@@ -120,7 +122,7 @@ def make_snapshot(cars, rows, tag, est_map, est_default, recall, what, ds_hours=
     seed = {'cars': [list(a) for a in cars], 'rows': rows,
             'est': {tk: est_map.get(tk, est_default) for _, tk, _ in rows},
             'est_default': est_default, 'recall': recall, 'what': what,
-            'ds_hours': ds_hours, 'camp_prefix': prefix}
+            'ds_hours': ds_hours, 'camp_prefix': prefix, 'test_mode': bool(test_mode)}
     tag = safe_name(tag or ('compose-' + hashlib.sha256(canonical_json(seed).encode('utf-8')).hexdigest()[:20]))
     schedule = render_schedule(rows, cars, tag, est_map, est_default, recall)
     cars_text = render_cars(cars, tag)
@@ -128,10 +130,11 @@ def make_snapshot(cars, rows, tag, est_map, est_default, recall, what, ds_hours=
     if back != list(rows):
         raise ValueError('渲染结果与生成序不一致')
     material = {'tag': tag, 'schedule': schedule, 'cars': cars_text, 'what': what,
-                'ds_hours': ds_hours, 'camp_prefix': prefix}
+                'ds_hours': ds_hours, 'camp_prefix': prefix, 'test_mode': bool(test_mode)}
     digest = hashlib.sha256(canonical_json(material).encode('utf-8')).hexdigest()
     return ComposeSnapshot(tuple(cars), tuple(rows), tag, schedule, cars_text, what,
-                           ds_hours, prefix, digest, est_total_min(rows, est_map, est_default))
+                           ds_hours, prefix, digest, est_total_min(rows, est_map, est_default),
+                           bool(test_mode))
 
 # ============================================================ 纯函数（可测）
 
@@ -358,6 +361,14 @@ def build_catalog():
 TRACK_CATALOG = build_catalog()
 
 
+def refresh_catalog():
+    """重建赛道清单（控制台「刷新清单」用）：刷新从 tracks/ 定义文件读出的部分
+    （如 engines_of 的引擎支持）。基座清单 BASE_TRACKS 仍以代码为准 —— 新增赛道
+    要进编排目录走代码定版；临时赛道在编排页用「自定义」字段即可起跑。"""
+    global TRACK_CATALOG
+    TRACK_CATALOG = build_catalog()
+
+
 def track_est_map():
     """赛道 → est 分钟。排程里没单独指定的赛道用它。"""
     return {k: v['est'] for k, v in TRACK_CATALOG.items()}
@@ -486,7 +497,8 @@ def files():
     tag = p['tag']
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', tag):
         fail('非法 tag')
-    material = {k: p[k] for k in ('tag', 'schedule', 'cars', 'what', 'ds_hours', 'camp_prefix')}
+    material = {k: p[k] for k in ('tag', 'schedule', 'cars', 'what', 'ds_hours',
+                                  'camp_prefix', 'test_mode')}
     digest = hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True,
                                       separators=(',', ':')).encode()).hexdigest()
     if digest != p['digest']:
@@ -574,6 +586,8 @@ try:
         env = dict(os.environ, SCHEDULE_FILE=str(d / (p['tag'] + '.conf')),
                    CARS_FILE=str(d / (p['tag'] + '-cars.conf')), DS_HOURS=str(p['ds_hours']),
                    CAMP_ID=cid, CAMP_PREFIX=p['camp_prefix'], COMPOSE_DIGEST=p['digest'], DRY='0')
+        if p.get('test_mode'):
+            env['RALLY_TEST_MODE'] = '1'
         # runner exec 快照前后 PID 不变；锁路径必须与本次解析的 RESULTS_ROOT 相同。
         env.pop('RACEWAY_SNAPSHOT_ROOT', None)
         env.pop('RACEWAY_SOURCE_DIR', None)
@@ -1033,6 +1047,27 @@ class ComposeState:
         self._hist_at = 0.0
         self._hist_lock = threading.Lock()
 
+    def reload_cars(self):
+        """重读车定义文件并重建车表（控制台「刷新清单」用；调用方持有 st.lock）。
+
+        与 __init__ 的差异：读不到文件**保留上一次车表**继续用（页面上报一条 problem），
+        不把排程板块打瘫 —— 刷新是改善操作，不该比不刷更糟。
+        """
+        try:
+            text = read_cars_file(self.args)
+        except (OSError, SystemExit) as e:
+            self.problems = [('error', '车定义重读失败: %s —— 保留上次车表继续用' % e)]
+            return
+        cars = parse_cars(text)
+        problems = validate_cars(cars)
+        if not cars:
+            # 一行车都没有：维持旧表（可能只是文件写了一半），等用户改好再刷
+            self.problems = list(problems) + [('error',
+                '车定义重读后为空: %s —— 车表保持上一次的内容' % self.args.cars_file)]
+            return
+        self.cars = tuple(cars)
+        self.problems = problems
+
     def history(self, max_age=30):
         """指标库覆盖表（带 TTL 缓存，避免每次点按钮都打一次 ES）。
 
@@ -1094,7 +1129,8 @@ def api_snapshot(st, body):
                              integer(body.get('est_default', DEFAULT_EST), 'est 默认分钟', 1),
                              recall != 'norecall', body.get('what') or what_for(tracks),
                              body.get('ds_hours', getattr(st.args, 'ds_hours', 0)),
-                             body.get('camp_prefix') or getattr(st.args, 'camp_prefix', None))
+                             body.get('camp_prefix') or getattr(st.args, 'camp_prefix', None),
+                             bool(body.get('test_mode')))
     expected_digest = body.get('digest')
     if expected_digest is not None and expected_digest != snapshot.digest:
         raise ValueError('矩阵或历史覆盖已变更，摘要与预览不一致；请重新预览后起跑')
@@ -1230,6 +1266,16 @@ def api_logtail(st, cid, n):
         return 400, {'error': why}
     n = max(1, min(int(n or 50), 400))
     return 200, {'lines': st.src.tail(cid, 'PROGRESS.txt', n)}
+
+
+def api_mutex(st):
+    """集群占用预检：runner 的 .runner.lock 是否空闲（与 start 前的互斥检查同源）。
+
+    本地模式毫秒级；--ssh 模式一次远端调用。供编排页起跑前探一眼，避免白填矩阵。
+    """
+    with st.lock:
+        why = remote_mutex_check(st.args)
+    return 200, {'free': why is None, 'why': why}
 
 
 def api_stop(st, body):
@@ -1498,6 +1544,10 @@ def api_apply(st, body):
     export = (body.get('export') or '').strip()
     es = (body.get('es') or '').strip()
     auth = (body.get('auth') or '').strip()
+    # 口令留空时回落 console.conf 的 apply.auth：真身只在服务端使用，不下发浏览器。
+    # 配置里的 es/insecure/drop 默认值由 bootstrap 下发、前端预先填好，这里不再重复兜底。
+    if not auth:
+        auth = load_console_config(st.args.root)['apply'].get('auth', '')
     insecure = bool(body.get('insecure'))
     drop = bool(body.get('drop'))
     try:
@@ -1672,6 +1722,36 @@ def api_sidecar(st, cid, fid):
                  'has_plan': listing is not None, 'attempts_dir_probe': attempts is not None}
 
 
+def _race_op_metrics(race):
+    """race.json → 逐任务指标行。
+
+    新版 rally 的指标在 results.op_metrics（顶层 op_metrics 是空的）；
+    兼容旧布局。吞吐取 median（缺失回 mean），延迟取 p50/p99（rally 的 50_0/99_0）。
+    """
+    ops = []
+    if isinstance(race, dict):
+        res = race.get('results')
+        if isinstance(res, dict):
+            ops = res.get('op_metrics') or []
+        if not ops:
+            ops = race.get('op_metrics') or []
+    out = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        tput = op.get('throughput') if isinstance(op.get('throughput'), dict) else {}
+        lat = op.get('latency') if isinstance(op.get('latency'), dict) else {}
+        out.append({
+            'task': op.get('task') or op.get('operation') or '?',
+            'throughput': tput.get('median', tput.get('mean')),
+            'tput_unit': tput.get('unit'),
+            'lat_p50': lat.get('50_0'),
+            'lat_p99': lat.get('99_0'),
+            'lat_unit': lat.get('unit'),
+        })
+    return out
+
+
 def api_race_detail(st, cid, fid):
     """场次详情抽屉：PLAN 行 + RACES 判定 + sidecar 身份 + 逐任务指标 + 产物清单。"""
     why = check_cid(cid)
@@ -1701,13 +1781,9 @@ def api_race_detail(st, cid, fid):
             race = json.loads(text)
         except ValueError:
             continue
-        for op in (race.get('op_metrics') or []):
-            metrics.append({
-                'phase': ph, 'task': op.get('operation') or op.get('name') or '?',
-                'throughput': (op.get('throughput') or {}).get('mean') if isinstance(op.get('throughput'), dict) else op.get('throughput'),
-                'latency': (op.get('latency') or {}).get('mean') if isinstance(op.get('latency'), dict) else op.get('latency'),
-                'unit': (op.get('throughput') or {}).get('unit') if isinstance(op.get('throughput'), dict) else None,
-            })
+        for m in _race_op_metrics(race):
+            m['phase'] = ph
+            metrics.append(m)
     artifacts = []
     for name in ('%s-wq.md' % fid, '%s-wq-race.json' % fid,
                  '%s-wq-sidecar.json' % fid, '%s-expected-tasks.json' % fid):
@@ -1718,46 +1794,103 @@ def api_race_detail(st, cid, fid):
 
 
 def api_monitor(st, cid, fid):
-    """读某场次的每节点 5 秒时序 CSV（monitors/<fid>-<node>.csv）。"""
+    """读某场次的每节点 5 秒时序 CSV（monitors/<fid>-<相位>-<node>.csv）。
+
+    load-monitor 按相位分 tag 采集，文件名带相位段（如 <fid>-wq-<node>.csv）；
+    (相位, 节点) 清单来自 ENV-SUMMARY.csv 的行。兼容旧布局 <fid>-<node>.csv。
+    同一节点跨相位的多份 CSV 按行拼接成一条曲线（相位边界在曲线上自然过渡）。
+    """
     why = check_cid(cid)
     if why:
         return 400, {'error': why}
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,159}', fid or ''):
         return 400, {'error': '非法场次 id'}
     env_text = st.src.read_abs(posixpath.join(st.src.root, cid, 'monitors', 'ENV-SUMMARY.csv')) or ''
-    nodes = []
+    triples = []   # (phase, node)，保序去重 —— 文件名按它拼
     for line in env_text.splitlines()[1:]:
-        cols = line.split(',')
-        if len(cols) >= 3 and cols[0].strip() == fid and cols[2].strip():
-            if cols[2] not in nodes:
-                nodes.append(cols[2].strip())
-    if not nodes:
-        # 退化：按 campaign 的 vm 名约定给几个常见节点名探测
-        nodes = ['node1', 'node2', 'esrally']
-    series = []
-    for node in nodes:
-        name = '%s-%s.csv' % (fid, node)
-        text = st.src.read_abs(posixpath.join(st.src.root, cid, 'monitors', name))
-        if not text:
-            continue
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            continue
-        header = lines[0].split(',')
-        rows = []
-        for ln in lines[1:5001]:
-            cells = ln.split(',')
-            if len(cells) != len(header):
+        cols = [c.strip() for c in (line.split(',') + [''] * 11)[:11]]
+        if cols[0] == fid and cols[2]:
+            if (cols[1], cols[2]) not in triples:
+                triples.append((cols[1], cols[2]))
+    if not triples:
+        # 退化：无 ENV-SUMMARY（旧 campaign）→ 按常见节点名探测旧布局文件
+        triples = [('', n) for n in ('node1', 'node2', 'esrally')]
+    series_by_node = {}
+    node_order = []
+    for phase, node in triples:
+        candidates = []
+        if phase:
+            candidates.append('%s-%s-%s.csv' % (fid, phase, node))
+        candidates.append('%s-%s.csv' % (fid, node))   # 旧布局兜底
+        for name in candidates:
+            text = st.src.read_abs(posixpath.join(st.src.root, cid, 'monitors', name))
+            if not text:
                 continue
-            row = {}
-            for k, v in zip(header, cells):
-                try:
-                    row[k] = float(v) if v not in ('', '-') else None
-                except ValueError:
-                    row[k] = v
-            rows.append(row)
-        series.append({'node': node, 'file': name, 'header': header, 'rows': rows})
-    return 200, {'cid': cid, 'fid': fid, 'series': series, 'interval': 5}
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            s = series_by_node.get(node)
+            if s is None:
+                s = {'node': node, 'file': name, 'header': lines[0].split(','), 'rows': []}
+                series_by_node[node] = s
+                node_order.append(node)
+            for ln in lines[1:5001]:
+                cells = ln.split(',')
+                if len(cells) != len(s['header']):
+                    continue
+                row = {}
+                for k, v in zip(s['header'], cells):
+                    try:
+                        row[k] = float(v) if v not in ('', '-') else None
+                    except ValueError:
+                        row[k] = v
+                s['rows'].append(row)
+            break   # 一个 (相位, 节点) 命中一份文件即可
+    return 200, {'cid': cid, 'fid': fid,
+                 'series': [series_by_node[n] for n in node_order], 'interval': 5}
+
+
+def api_campaign_result(st, cid):
+    """场内速览：一场 campaign 的页级结论 —— 每场次判定 + 逐任务吞吐/延迟。
+
+    纯本地文件聚合（PLAN.tsv 判定行 / RACES.md / results/<fid>-wq-race.json），
+    跑完一场不用去翻对比页就能看到"谁强谁弱、弱在哪个任务"。
+    verdict 取 RACES 里该 fid 最后一次出现的判定（重试不 Grove 旧判定）。
+    """
+    why = check_cid(cid)
+    if why:
+        return 400, {'error': why}
+    plan = st.src.read_abs(posixpath.join(st.src.root, cid, 'PLAN.tsv')) or ''
+    races_text = st.src.read_abs(posixpath.join(st.src.root, cid, 'RACES.md')) or ''
+    verdicts = {}
+    for ln in races_text.splitlines():
+        parts = [c.strip() for c in ln.split('|')]
+        if len(parts) >= 4 and parts[1] and parts[1] not in ('场次', '试图', 'attempt'):
+            verdicts[parts[1]] = parts[2]   # 后出现覆盖先出现 = 最新尝试
+    rows = []
+    for line in plan.splitlines()[1:]:
+        cols = line.split('\t')
+        if len(cols) < 3 or not cols[0].strip():
+            continue
+        fid = cols[0].strip()
+        metrics = []
+        for ph in ('wq', 'w', 'q'):
+            text = st.src.read_abs(posixpath.join(st.src.root, cid, 'results',
+                                                 '%s-%s-race.json' % (fid, ph)))
+            if not text:
+                continue
+            try:
+                race = json.loads(text)
+            except ValueError:
+                continue
+            for m in _race_op_metrics(race):
+                m['phase'] = ph
+                metrics.append(m)
+        rows.append({'fid': fid,
+                     'track': cols[2].strip() if len(cols) > 2 else '',
+                     'round': cols[3].strip() if len(cols) > 3 else '',
+                     'verdict': verdicts.get(fid, 'PENDING'), 'metrics': metrics})
+    return 200, {'cid': cid, 'rows': rows}
 
 
 def api_logfile(st, cid, rel, n, q):
@@ -1871,6 +2004,57 @@ def api_report(st, cid, fmt):
     return 200, {'cid': cid, 'format': fmt, 'text': md}
 
 
+# ------------------------------------------------- 控制台配置文件（console.conf）
+# 控制台的可调默认值放在 raceway 根的 console.conf（真身 gitignore，模板
+# console.conf.example 随库分发）。没有这个文件控制台照常用 —— 一切落到内置默认。
+#   extlink.<名称> = <URL>          外部结果入口的链接清单（可含中文/空格名称）
+#   apply.es       = <URL>          结果入库默认 ES 地址
+#   apply.auth     = user:pass      入库口令（只在服务端使用，绝不回传浏览器）
+#   apply.insecure = 0|1            自签证书 --insecure 的默认值
+#   apply.drop     = 0|1            --drop 的默认值（仍要页面二次确认）
+# 口令类键放配置文件与放 vm-bench.env 同一威胁模型：文件只留在跑控制台的那台机器上。
+_CONSOLE_CONF_KEYS = ('es', 'auth', 'insecure', 'drop')
+
+
+def load_console_config(root):
+    """raceway 根的 console.conf → {'ext_links': [...], 'apply': {...}, 'file': bool}。
+
+    行式 KEY=VALUE，# 注释；extlink.<名称> 的名称可含空格（取第一个点之后的全部）。
+    缺文件/空文件返回空结构，调用方自行落内置默认。
+    """
+    out = {'ext_links': [], 'apply': {}, 'file': False}
+    if not root:
+        return out
+    try:
+        with open(os.path.join(root, 'console.conf'), encoding='utf-8') as f:
+            text = f.read()
+    except OSError:
+        return out
+    out['file'] = True
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, _, v = line.partition('=')
+        k = k.strip()
+        v = v.strip()
+        if k[:8].lower() == 'extlink.' and k[8:].strip() and v:
+            out['ext_links'].append({'name': k[8:].strip(), 'url': v})
+        elif '.' in k:
+            ns, _, key = k.partition('.')
+            if ns.lower() == 'apply' and key.lower() in _CONSOLE_CONF_KEYS and v:
+                out['apply'][key.lower()] = v
+    return out
+
+
+def console_config_defaults(cc):
+    """bootstrap 下发版：ext_links 原样，apply 只给非敏感键；auth 只报存在与否。"""
+    return {'ext_links': cc['ext_links'],
+            'apply_defaults': {k: v for k, v in cc['apply'].items() if k != 'auth'},
+            'apply_auth_configured': bool(cc['apply'].get('auth')),
+            'console_conf': cc['file']}
+
+
 def _err_body(e):
     """do_GET/serve-rpc 的兜底错误体，保持与旧内联实现一致的 'Type: msg' 形状。"""
     return (500, 'application/json',
@@ -1903,7 +2087,16 @@ def _route_get_core(st, path, q):
                 cache = 'no-store' if path == '/legacy' else 'public, max-age=300'
                 return 200, mime, f.read(), cache
         return 404, 'text/plain', '前端文件缺失: ' + path, 'no-store'
+    if path == '/api/mutex':
+        code, payload = api_mutex(st)
+        return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
     if path == '/api/bootstrap':
+        # refresh=1：重读车定义文件 + 重建赛道清单（控制台「刷新清单」按钮）。
+        # st.lock 内串行；失败不回滚（reload_cars 自带"保留旧表"语义）。
+        if (q.get('refresh') or [''])[0]:
+            with st.lock:
+                st.reload_cars()
+                refresh_catalog()
         return 200, 'application/json', json.dumps({
             'cars': [{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars],
             'problems': st.problems, 'ds_tiers': DS_TIERS,
@@ -1919,6 +2112,7 @@ def _route_get_core(st, path, q):
             'kibana_url': st.args.kibana_url,
             'csrf_token': st.csrf_token,
             'results_root': st.src.root,
+            **console_config_defaults(load_console_config(st.args.root)),
         }, ensure_ascii=False), 'no-store'
     if path == '/api/history':
         return 200, 'application/json', json.dumps(st.history().to_dict(), ensure_ascii=False), 'no-store'
@@ -1952,6 +2146,8 @@ def _route_get_core(st, path, q):
         code, payload = api_race_detail(st, (q.get('cid') or [''])[0], (q.get('fid') or [''])[0])
     elif path == '/api/monitor':
         code, payload = api_monitor(st, (q.get('cid') or [''])[0], (q.get('fid') or [''])[0])
+    elif path == '/api/campaign-result':
+        code, payload = api_campaign_result(st, (q.get('cid') or [''])[0])
     elif path == '/api/logfile':
         code, payload = api_logfile(st, (q.get('cid') or [''])[0], (q.get('file') or [''])[0],
                                     (q.get('n') or ['200'])[0], (q.get('q') or [''])[0])
