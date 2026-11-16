@@ -83,10 +83,8 @@ const TABS = [
   { id: 'progress', num: '②', label: '运行进度', title: '运行进度' },
   { id: 'history', num: '③', label: '历史与结果', title: '历史与结果' },
   { id: 'trend', num: '④', label: '趋势', title: '指标趋势' },
-  { id: 'ops', num: '⑤', label: '赛道与入库', title: '赛道与入库' },
-  { id: 'tracks', num: '⑥', label: '赛道文件', title: '赛道文件管理' },
-  { id: 'detail', num: '⑦', label: '场次详情', title: '场次详情 / 身份 / 监控 / 日志' },
-  { id: 'report', num: '⑧', label: '报告与导出', title: '报告导出 / 一键生成导出' },
+  { id: 'ops', num: '⑤', label: '赛道与入库', title: '赛道与导出' },
+  { id: 'detail', num: '⑥', label: '场次详情', title: '场次详情 / 身份 / 监控 / 日志' },
 ];
 
 function App() {
@@ -137,7 +135,7 @@ function App() {
   const goHash = useRef(null);
   function setTab(id) {
     setTabRaw(id);
-    if (id === 'progress' || id === 'history' || id === 'detail' || id === 'report') loadCampaigns();
+    if (id === 'progress' || id === 'history' || id === 'detail') loadCampaigns();
     if (goHash.current) goHash.current(id, (id === 'progress' || id === 'detail') ? curCid : null);
   }
 
@@ -151,7 +149,7 @@ function App() {
         if (!valid) return;
         setTabRaw(tab);
         if (cid) setCurCid(cid);
-        if (tab === 'progress' || tab === 'history' || tab === 'detail' || tab === 'report') loadCampaigns(cid || undefined);
+        if (tab === 'progress' || tab === 'history' || tab === 'detail') loadCampaigns(cid || undefined);
       });
     return () => { goHash.current = null; };
   }, []);
@@ -247,15 +245,10 @@ function App() {
           ${tab === 'history' && html`
             <${HistoryView} boot=${boot} camps=${camps} reload=${loadCampaigns}
               onView=${(cid) => { setCurCid(cid); setTab('progress'); }}
-              onReorder=${reorderCamp} />`}
+              onReorder=${reorderCamp} EX=${EX} curCid=${curCid} />`}
           ${tab === 'trend' && html`<${TrendView} boot=${boot} />`}
-          ${tab === 'ops' && html`<${OpsView} setToast=${toast} />`}
-          ${tab === 'tracks' && EX && html`<${EX.TrackFilesView} />`}
+          ${tab === 'ops' && html`<${OpsView} camps=${camps} />`}
           ${tab === 'detail' && EX && html`<${EX.DetailView} camps=${camps} curCid=${curCid} setCurCid=${setCurCid} />`}
-          ${tab === 'report' && EX && html`<div>
-            <${EX.ReportView} camps=${camps} curCid=${curCid} setCurCid=${setCurCid} />
-            <${EX.ExportGenView} camps=${camps} />
-          </div>`}
         </div>
       </div>
     </div>
@@ -743,7 +736,7 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
 }
 
 // ==================== ③ 历史与结果 ====================
-function HistoryView({ boot, camps, reload, onView, onReorder }) {
+function HistoryView({ boot, camps, reload, onView, onReorder, EX, curCid }) {
   const [filter, setFilter] = useState('');
   // 两场对比
   const [cmpA, setCmpA] = useState(''), [cmpB, setCmpB] = useState('');
@@ -807,6 +800,8 @@ function HistoryView({ boot, camps, reload, onView, onReorder }) {
         <details class="fold"><summary>原始文本输出（复制进报告用）</summary>
           <pre class="out light" style="max-height:320px">${cmpOut.text}</pre></details>`}
     </div>
+
+    ${EX && html`<${EX.ReportView} camps=${camps} curCid=${curCid} />`}
 
     <div class="card">
       <div class="card-title">全部 campaign<div class="spacer"></div>
@@ -991,7 +986,7 @@ function TrendTable({ res }) {
 }
 
 // ==================== ⑤ 赛道与入库 ====================
-function OpsView() {
+function OpsView({ camps }) {
   const [tracksOut, setTracksOut] = useState('（未运行）');
   const [exports, setExports] = useState([]);
   const [expInfo, setExpInfo] = useState('（先刷新导出清单）');
@@ -1041,6 +1036,8 @@ function OpsView() {
         <button class="btn btn-secondary btn-sm" onClick=${doTracks}>刷新赛道清单</button></div>
       <pre class="out light" style="max-height:420px">${tracksOut}</pre>
     </div>
+    ${EX && html`<${EX.TrackFilesView} />`}
+    ${EX && html`<${EX.ExportGenView} camps=${camps} />`}
     <div class="card">
       <div class="card-title">结果入库（exports/ → ES；bench-apply 预检不过不发任何请求，退出码 0=成功 1=有拒收 2=预检失败）</div>
       <div class="row">
