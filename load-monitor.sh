@@ -117,6 +117,7 @@ start_sampler() { # <tag>；不覆盖仍活跃的同 tag 文件
 
 _loop() { # <csv> <tag>
   local csv="$1" tag="$2" dev mb10
+  local deadline=$(( SECONDS + ${MON_PROBE_DEADLINE:-0} ))   # >0 仅 probe 模式：到点自退，不依赖外部 kill（20261116 外部 kill 未遂卡死 45min 的教训）
   dev=$(diskdev); dev=${dev%[0-9]*}; dev=${dev%p}; dev=${dev##*/}
   mb10=$(( 1048576 * INTERVAL / 10 ))   # 0.1MB/s 分辨率的除数（防整除截断吞掉小流量）
   echo "ts,cpu_usr,cpu_sys,cpu_steal,load1,mem_avail_gb,swpin_s,disk_rw_mbs,net_rx_mbs,net_tx_mbs,bench_cpu,foreign_cpu" > "$csv"
@@ -130,6 +131,7 @@ _loop() { # <csv> <tag>
   n0=$(awk -F'[: ]+' '/:/{if($2!="lo") {rx+=$3; tx+=$11}} END{print rx, tx}' /proc/net/dev)
   p0=$(mktemp); p1=$(mktemp); load_snapshot "$p0"
   while true; do
+    [ "$deadline" -gt 0 ] && [ "$SECONDS" -ge "$deadline" ] && exit 0
     sleep "$INTERVAL"
     c1=$(cpu_line)
     read -r _ u n sy id iow irq sirq st _ _ <<< "$c1"
@@ -175,11 +177,16 @@ join_delta() {
 }
 
 probe() { # <seconds>，只管理自己刚创建的子进程
-  local sec="${1:-6}" csv pid rc
+  local sec="${1:-6}" csv pid rc i
   [[ "$sec" =~ ^[1-9][0-9]*$ ]] || return 1
   csv=$(mktemp --suffix=.csv) || return 1
-  MON_INTERVAL=1 bash "$(readlink -f "$0")" _loop "$csv" probe & pid=$!
-  sleep $((sec + 2)); kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # _loop 带 MON_PROBE_DEADLINE 自死限，这里的 kill 只是提前收尾：TERM 重试 3 次仍不退则 -KILL 兜底，
+  # 且绝不让 probe 自身悬在 wait 上（20261116 曾因一次 kill 未遂把 precheck 卡住 45min）
+  MON_INTERVAL=1 MON_PROBE_DEADLINE=$((sec + 4)) bash "$(readlink -f "$0")" _loop "$csv" probe & pid=$!
+  sleep $((sec + 2))
+  for i in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; kill -TERM "$pid" 2>/dev/null; sleep 1; done
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
   summary_quiet "$csv"; rc=$?
   rm -f "$csv"
   return "$rc"
