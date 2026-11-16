@@ -410,7 +410,7 @@ class TestCampaignSummaries(unittest.TestCase):
     def test_summary_from_parts(self):
         # 第 3/4 列已经是**去重后的场次数**（远端 awk / 本地 field_counts 同一口径），
         # 这里不再减表头：减 2 会把"2 场 + 一次重试"算成 3。
-        s = Q._summary_from_parts('c1', '1770000000', '4', '2', '1', '1',
+        s = Q._summary_from_parts('c1', '1770000000', '4', '2', '1', '2',
                                   '[2026-10-20 11:00:00] campaign 结束: 2/2 场有效。')
         self.assertEqual(s['cid'], 'c1')
         self.assertEqual(s['total'], 4)
@@ -422,15 +422,26 @@ class TestCampaignSummaries(unittest.TestCase):
         self.assertEqual(Q._summary_from_parts('c3', None, None, None, None, None, '')['mtime'], 0)
 
     def test_ended_needs_end_line_after_last_header(self):
-        """收尾判定：结束行数 ≥ 起跑头行数才算完 —— runner 收尾后还有
-        「已停集群并清理数据」等后继行，不能只看最后一行。"""
-        # 1 次起跑 + 1 次结束 → 已结束（哪怕最后一行是清理信息）
-        s = Q._summary_from_parts('c1', '1', '0', '0', '1', '1',
+        """收尾判定：结束行必须出现在**最后一次**起跑头之后（行号比较）——
+        与 build_campaign / close-campaign.sh 同语义。
+
+        行数比较的旧判据在"续跑 + 手工整理补结束行"的 campaign 上永远判
+        未结束（启动头行数 > 结束行行数），与 close 的"已有结束行"结论互相
+        矛盾 —— 这里钉住位置法。
+        """
+        # 起跑头行 1、结束行行 2 → 已结束（哪怕最后一行是清理信息）
+        s = Q._summary_from_parts('c1', '1', '0', '0', '1', '2',
                                   '[…] 已停集群并清理数据（安装与 jdk.bundled* 归档保留）')
         self.assertTrue(s['ended'])
-        # 重启过 2 次但只收尾 1 次 → 运行中
-        s2 = Q._summary_from_parts('c2', '1', '0', '0', '2', '1', 'x')
+        # 最后一次起跑头（行 5）在旧结束行（行 2）之后 → 运行中
+        s2 = Q._summary_from_parts('c2', '1', '0', '0', '5', '2', 'x')
         self.assertFalse(s2['ended'])
+        # 被杀（没有结束行）→ 运行中
+        s3 = Q._summary_from_parts('c3', '1', '0', '0', '1', '0', 'x')
+        self.assertFalse(s3['ended'])
+        # 续跑 + 手工整理（多启动头、结束行在最后）→ 已结束
+        s4 = Q._summary_from_parts('c4', '1', '0', '0', '5', '6', 'x')
+        self.assertTrue(s4['ended'])
 
     def test_local_summaries_sorted_and_counted(self):
         self._camp('a-old', True, [('a-geo-r1', 'VALID'), ('a-geo-r2', 'VALID')])
@@ -461,6 +472,18 @@ class TestCampaignSummaries(unittest.TestCase):
         sums = Q.campaign_summaries(Q.Source(self.root))
         self.assertTrue(all(s['ended'] for s in sums))
         self.assertEqual(Q.pick_active(sums), 'a-old')
+        # 没收尾但进度文件已停滞超 ACTIVE_STALE_SECS → 不算活跃，跳过；
+        # 全都无活跃时回退"最新的当历史用"（c-stale 按 mtime 排最前）——
+        # 页面侧仍会显示它的 stale 警告，只是默认位不再被它抢走
+        self._camp('c-stale', False, [('c-geo-r1', 'VALID')])
+        stale = time.time() - (Q.ACTIVE_STALE_SECS + 600)
+        os.utime(os.path.join(self.root, 'c-stale', 'PROGRESS.txt'), (stale, stale))
+        sums = Q.campaign_summaries(Q.Source(self.root))
+        self.assertFalse(sums[0]['ended'])
+        # 有一个更新的"活跃" campaign 时，遗留者被跳过
+        self._camp('d-fresh', False, [('d-geo-r1', 'VALID')])
+        sums = Q.campaign_summaries(Q.Source(self.root))
+        self.assertEqual(Q.pick_active(sums), 'd-fresh')
 
     def test_remote_script_bash_syntax(self):
         bash = shutil.which('bash')
@@ -489,8 +512,8 @@ class TestCampaignSummaries(unittest.TestCase):
         r = rows['a-old']
         self.assertEqual(r[2], '2')    # 去重后的场次数（2 场 + 1 次重试 = 2）
         self.assertEqual(r[3], '2')    # VALID 场次数
-        self.assertEqual(r[4], '1')    # 起跑头行数
-        self.assertEqual(r[5], '1')    # 结束行数
+        self.assertEqual(r[4], '1')    # 最后一次起跑头的行号
+        self.assertEqual(r[5], '2')    # 结束行的行号（结束行在起跑头之后 → ended）
         self.assertIn('campaign 结束', r[6])
 
     def test_field_counts_dedupes_retries(self):

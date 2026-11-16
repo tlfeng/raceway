@@ -619,7 +619,8 @@ ibs_deploy_engine() { # <engine>
     *) return 1;;
   esac
   PROGSTEP "  ibs 部署 $eng ($FULL_VER) 开始（约 5-8 分钟，节点 $NODE_RANGE）..."
-  ( cd "$IBS_ROOT" && python3 -m ops.deploy $tflag $vflag -n "$NODE_RANGE" --yes ) \
+  # timeout 兜底防挂死：正常 5-8 分钟，超 25 分钟判失败 —— 卡住的部署不能拖死整个 campaign
+  ( cd "$IBS_ROOT" && timeout 1500 python3 -m ops.deploy $tflag $vflag -n "$NODE_RANGE" --yes ) \
     > "$CAMP_DIR/logs/ibs-deploy-$eng.log" 2>&1 9>&-
   rc=$?
   if [ $rc -eq 0 ]; then
@@ -634,7 +635,7 @@ ibs_deploy_engine() { # <engine>
 ibs_wipe2() { # <engine> —— 冷重启（停服→清 data/logs→重启→ES admin 自愈）
   local eng="$1" rc
   PROGSTEP "  ibs wipe $(svc2_of "$eng")（$NNODES 节点并行）..."
-  ( cd "$IBS_ROOT" && python3 -m ops.clean wipe "$(svc2_of "$eng")" --yes ) \
+  ( cd "$IBS_ROOT" && timeout 600 python3 -m ops.clean wipe "$(svc2_of "$eng")" --yes ) \
     > "$CAMP_DIR/logs/ibs-wipe-$eng.log" 2>&1 9>&-
   rc=$?
   if [ $rc -eq 0 ]; then PROGSTEP "  ibs wipe 完成"
@@ -648,7 +649,7 @@ ibs_ready_wait() { # <engine> <timeout_sec> <logfile>
   local deadline=$((SECONDS + tmo))
   : > "$logf"
   while [ $SECONDS -lt $deadline ]; do
-    if ( cd "$IBS_ROOT" && python3 -m ops.status gate "$(svc2_of "$eng")" --json ) >> "$logf" 2>&1 9>&-; then
+    if ( cd "$IBS_ROOT" && timeout 120 python3 -m ops.status gate "$(svc2_of "$eng")" --json ) >> "$logf" 2>&1 9>&-; then
       return 0
     fi
     sleep 10
@@ -690,7 +691,7 @@ ensure_engine() { # <engine>
   fi
   # uninstall/集群卡点按 ip.txt 主机名前缀解析角色节点，切换引擎时先对齐到目标，否则报"没有角色节点"
   ibs_sync_ip "$eng"
-  ( cd "$IBS_ROOT" && python3 -m ops.clean uninstall "$svc" --yes ) \
+  ( cd "$IBS_ROOT" && timeout 600 python3 -m ops.clean uninstall "$svc" --yes ) \
     > "$CAMP_DIR/logs/ibs-uninstall-$eng.log" 2>&1 9>&-
   ibs_deploy_engine "$eng"
 }
@@ -1476,6 +1477,7 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   timeout "$TMO" "$RALLY" race --pipeline=benchmark-only \
     --target-hosts="$HOSTS" --track-path="$track" --challenge=full \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
+    ${RALLY_TEST_MODE:+--test-mode} \
     --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
     --report-format=markdown --report-file="$rep" > "$rlog" 2>&1 9>&- || rc=$?
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid full race FAILED rc=$rc（尾部: $(tail -2 "$rlog" | head -1)）"
