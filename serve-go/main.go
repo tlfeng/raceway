@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // 静态资源白名单：URL 路径 → 仓库内相对路径 / MIME（与 bench-compose.py 的 _WEB_STATIC 一致）。
@@ -42,6 +43,12 @@ type server struct {
 	allowed []string // Host 白名单：127.0.0.1:port / localhost:port / [::1]:port
 	origins []string // Origin 白名单：http://<allowed>
 	port    int
+
+	// 只读混合档：启动后从 python bootstrap 惰性拉一次并缓存，用于把本地
+	// /api/logtail 交给 Go 原生处理（无 ssh、无 ES、无重推导）；其余仍委派。
+	bsOnce      sync.Once
+	resultsRoot string
+	ssh         string
 }
 
 // newCSRFToken 生成与 Python secrets.token_urlsafe(32) 同字符集（base64url 无填充）的令牌。
@@ -147,8 +154,15 @@ func (s *server) serveStatic(w http.ResponseWriter, path string) (handled bool) 
 	return true
 }
 
-// delegate 调用 python serve-rpc：stdin 传请求描述，stdout 收 {code,ctype,body,cache}。
-func (s *server) delegate(w http.ResponseWriter, method, path string, q url.Values, body json.RawMessage) {
+type rpcResp struct {
+	Code  int    `json:"code"`
+	Ctype string `json:"ctype"`
+	Body  string `json:"body"`
+	Cache string `json:"cache"`
+}
+
+// runRPC 调用 python serve-rpc：stdin 传请求描述，stdout 收 {code,ctype,body,cache}。
+func (s *server) runRPC(method, path string, q url.Values, body json.RawMessage) (rpcResp, error) {
 	if body == nil {
 		body = json.RawMessage("{}")
 	}
@@ -167,19 +181,16 @@ func (s *server) delegate(w http.ResponseWriter, method, path string, q url.Valu
 	cmd.Stdin = bytes.NewReader(in)
 	out, err := cmd.Output()
 	if err != nil {
-		sendJSON(w, 500, map[string]string{"error": fmt.Sprintf("python serve-rpc 失败: %v", err)})
-		return
+		return rpcResp{}, fmt.Errorf("python serve-rpc 失败: %w", err)
 	}
-	var resp struct {
-		Code  int    `json:"code"`
-		Ctype string `json:"ctype"`
-		Body  string `json:"body"`
-		Cache string `json:"cache"`
-	}
+	var resp rpcResp
 	if e := json.Unmarshal(out, &resp); e != nil {
-		sendJSON(w, 500, map[string]string{"error": fmt.Sprintf("serve-rpc 响应无效: %v", e)})
-		return
+		return rpcResp{}, fmt.Errorf("serve-rpc 响应无效: %w", e)
 	}
+	return resp, nil
+}
+
+func writeRPC(w http.ResponseWriter, resp rpcResp) {
 	code := resp.Code
 	if code == 0 {
 		code = 500
@@ -188,6 +199,130 @@ func (s *server) delegate(w http.ResponseWriter, method, path string, q url.Valu
 	w.Header().Set("Content-Type", resp.Ctype)
 	w.WriteHeader(code)
 	io.WriteString(w, resp.Body)
+}
+
+func (s *server) delegate(w http.ResponseWriter, method, path string, q url.Values, body json.RawMessage) {
+	resp, err := s.runRPC(method, path, q, body)
+	if err != nil {
+		sendJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeRPC(w, resp)
+}
+
+// bootstrapCache 惰性拉取一次 /api/bootstrap，缓存 results_root 与 ssh 模式，
+// 供本地只读 logtail 判定能否走 Go 原生分支。失败则留空 → logtail 自动回落委派。
+func (s *server) bootstrapCache() {
+	s.bsOnce.Do(func() {
+		resp, err := s.runRPC("GET", "/api/bootstrap", nil, nil)
+		if err != nil || resp.Code != 200 {
+			return
+		}
+		var b struct {
+			ResultsRoot string `json:"results_root"`
+			SSH         string `json:"ssh"`
+		}
+		if json.Unmarshal([]byte(resp.Body), &b) == nil {
+			s.resultsRoot = b.ResultsRoot
+			s.ssh = b.SSH
+		}
+	})
+}
+
+var cidRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// nativeLogtail 复刻 api_logtail 的本地分支（无 ssh、无 ES、无推导）：
+// 读 results_root/<cid>/PROGRESS.txt 的最后 n 行。仅当可安全本地处理时返回 handled=true；
+// ssh 模式、非法 cid、非数字 n 一律 handled=false 交由 serve-rpc，保证错误响应与 Python 逐字一致。
+func (s *server) nativeLogtail(w http.ResponseWriter, q url.Values) (handled bool) {
+	s.bootstrapCache()
+	if s.ssh != "" || s.resultsRoot == "" {
+		return false // 远端读取或 results_root 未知：委派
+	}
+	cid := ""
+	if v := q.Get("cid"); v != "" {
+		cid = v
+	} else if v := q["cid"]; len(v) > 0 {
+		cid = v[0]
+	}
+	if !cidRe.MatchString(cid) {
+		return false // 非法 cid → 委派，沿用 Python 的 %r 报错文案
+	}
+	// n 必须可解析为 int（Python: int(n or 50)），否则委派让 Python 抛其原生错误。
+	nStr := q.Get("n")
+	var n int
+	if nStr == "" {
+		n = 50
+	} else if parsed, err := strconv.Atoi(nStr); err != nil {
+		return false
+	} else {
+		n = parsed
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 400 {
+		n = 400
+	}
+	base := filepath.Clean(s.resultsRoot)
+	f := filepath.Clean(filepath.Join(base, cid, "PROGRESS.txt"))
+	// 纵深防御：解析后的路径必须仍在 results_root 之内（cid 正则已排除 '/'，双保险）。
+	if f != base && !strings.HasPrefix(f, base+string(os.PathSeparator)) {
+		return false
+	}
+	data, err := os.ReadFile(f)
+	var tail string
+	if err == nil {
+		// 对齐 Python 文本模式：通用换行 \r\n / \r → \n
+		text := strings.ReplaceAll(string(data), "\r\n", "\n")
+		text = strings.ReplaceAll(text, "\r", "\n")
+		lines := pyReadlines(text) // 每行保留结尾 '\n'（末行无换行则保留为无换行元素）
+		if len(lines) > n {
+			lines = lines[len(lines)-n:]
+		}
+		tail = strings.Join(lines, "")
+	}
+	body := tailJSON(tail)
+	writeSecurity(w, "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(body)
+	return true
+}
+
+// pyReadlines 复刻 Python 文本 readlines()：按 '\n' 切分并保留每行结尾的 '\n'；
+// 仅末尾无换行的残段作为不带 '\n' 的最后一个元素（不产生尾随空串元素）。
+func pyReadlines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, s[start:i+1])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
+}
+
+// tailJSON 生成与 Python json.dumps({'lines': tail}, ensure_ascii=False) 逐字节一致的
+// 对象：冒号后单空格、不转义 <>& 与非 ASCII。logtail 响应只有这一个键，故手写拼装。
+func tailJSON(tail string) []byte {
+	var v bytes.Buffer
+	enc := json.NewEncoder(&v)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(tail) // 产出带引号与转义的 JSON 字符串，末尾含换行
+	val := bytes.TrimRight(v.Bytes(), "\n")
+	buf := make([]byte, 0, len(val)+12)
+	buf = append(buf, `{"lines": `...)
+	buf = append(buf, val...)
+	buf = append(buf, '}')
+	return buf
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +335,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.serveStatic(w, path) {
+			return
+		}
+		if path == "/api/logtail" && s.nativeLogtail(w, u.Query()) {
 			return
 		}
 		s.delegate(w, "GET", path, u.Query(), nil)
