@@ -145,6 +145,33 @@ class H(BaseHTTPRequestHandler):
             with open(ECHARTS, encoding='utf-8') as f:
                 return self._send(200, 'application/javascript; charset=utf-8', f.read())
         q = parse_qs(u.query)
+        if p == '/api/assets':
+            return self._json(200, {'available': True, 'pkg_dir': '/opt/raceway/pkg',
+                                    'deps': [
+                                        {'car': 'jdk25', 'engine': 'easysearch', 'ver': '2.5.0',
+                                         'build': '3015', 'pkg': '/opt/raceway/pkg/easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz',
+                                         'pkg_stat': {'exists': True, 'size': 734003200, 'mtime': 1762500000},
+                                         'jdk_mapped': False, 'jdk_pkg': None},
+                                        {'car': 'jdk26', 'engine': 'easysearch', 'ver': '2.5.0',
+                                         'build': '3015', 'pkg': '/opt/raceway/pkg/easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz',
+                                         'pkg_stat': {'exists': True, 'size': 734003200, 'mtime': 1762500000},
+                                         'jdk_pkg': '/opt/raceway/pkg/openjdk-26_linux-x64_bin.tar.gz', 'jdk_mapped': True,
+                                         'jdk_stat': {'exists': True, 'size': 209715200, 'mtime': 1750000000}}],
+                                    'pkg_files': [
+                                        {'name': 'easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz', 'size': 734003200, 'mtime': 1762500000, 'exists': True},
+                                        {'name': 'openjdk-26_linux-x64_bin.tar.gz', 'size': 209715200, 'mtime': 1750000000, 'exists': True},
+                                        {'name': 'agent-patched-1.18.15.jar', 'size': 1048576, 'mtime': 1740000000, 'exists': True}],
+                                    'bundles': [{'key': 'BUNDLE_EZ3015', 'path': '/opt/raceway/pkg/easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz',
+                                                 'exists': True, 'size': 734003200, 'mtime': 1762500000}]})
+        if p == '/api/cluster-status':
+            return self._json(200, {'available': True, 'driver': 'esrally-185',
+                                    'engine': ['2.5.0-3015'], 'up': False,
+                                    'nodes': [{'name': 'easysearch-0001', 'ip': '10.10.10.224',
+                                               'ver': '2.5.0-3015', 'port9200': True},
+                                              {'name': 'easysearch-0002', 'ip': '10.10.10.225',
+                                               'ver': '2.5.0-3015', 'port9200': True},
+                                              {'name': 'easysearch-0003', 'ip': '10.10.10.226',
+                                               'ver': '2.5.0-3015', 'port9200': False}]})
         if p == '/api/mutex':
             return self._json(200, {'free': True, 'why': None})
         if p == '/api/bootstrap':

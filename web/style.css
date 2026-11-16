@@ -346,6 +346,13 @@ span.ext-none { color: hsl(var(--muted-foreground)); border-style: dashed; borde
 .smoke-toggle input:checked + span { color: hsl(32 81% 34%); font-weight: 600; }
 .smoke-toggle small { color: hsl(var(--muted-foreground)); font-weight: 400; }
 
+.cluster-line { gap: 8px; }
+.node-dot {
+  font-size: 12px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid hsl(var(--border)); background: hsl(var(--muted));
+}
+.st-warn { color: hsl(32 81% 40%); font-weight: 600; }
+
 /* ---------- 排程实时预览栏 ---------- */
 .live-bar {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

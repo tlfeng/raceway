@@ -76,6 +76,7 @@ const ICONS = {
   detail: 'M4 4h6v16H4zM14 4h6v7h-6zM14 15h6v5h-6z',
   report: 'M6 2h9l5 5v15H6zM15 2v5h5M9 12h6M9 16h6',
   export: 'M12 3v10M8 9l4 4 4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2',
+  assets: 'M20 7h-4V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2H4a1 1 0 00-1 1v4a1 1 0 001 1h1v6a2 2 0 002 2h10a2 2 0 002-2v-6h1a1 1 0 001-1V8a1 1 0 00-1-1zM10 5h4v2h-4z',
 };
 
 // ==================== 应用根 ====================
@@ -84,6 +85,7 @@ const TABS = [
   { id: 'progress', label: '运行进度', title: '运行进度' },
   { id: 'history', label: '结果与趋势', title: '历史 · 对比 · 趋势' },
   { id: 'tracks', label: '赛道管理', title: '赛道目录与文件' },
+  { id: 'assets', label: '引擎与JDK', title: '安装包与车依赖' },
   { id: 'export', label: '导出与入库', title: '导出与入库' },
 ];
 
@@ -271,6 +273,7 @@ function App() {
               onView=${(cid) => { setCurCid(cid); setTab('progress'); }}
               onReorder=${reorderCamp} EX=${EX} curCid=${curCid} />`}
           ${tab === 'tracks' && html`<${TracksView} boot=${boot} EX=${EX} reloadBoot=${reloadBoot} />`}
+          ${tab === 'assets' && html`<${AssetsView} />`}
           ${tab === 'export' && html`<${ExportView} boot=${boot} camps=${camps} EX=${EX} />`}
         </div>
       </div>
@@ -341,6 +344,12 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
   const previewRef = useRef(null); // {key, digest} ← 实时 render 喂给 dry-run/起跑
   const [live, setLive] = useState({ busy: false, err: '', rows: 0, estTotal: 0, tag: '' });
   const [mutex, setMutex] = useState(null); // {free, why} 起跑前探集群占用
+  const [cluster, setCluster] = useState(null); // {available, engine, nodes, up}
+  useEffect(() => {
+    let alive = true;
+    getJSON('/api/cluster-status').then(({ j }) => { if (alive && j && j.available) setCluster(j); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const tracks = boot.tracks || [];
   const baseTracks = useMemo(() => tracks.filter((t) => !t.variant), [tracks]);
@@ -670,6 +679,18 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
           </div>
           ${mutex && !mutex.free ? html`<div class="warn-box" style="margin-top:6px">⚠ 集群被占用 —— ${mutex.why || 'runner 在跑'}。进度页可看是哪场；等它结束或停止后再起跑。</div>`
             : mutex && mutex.free ? html`<p class="st-ok" style="margin:4px 0 0">✓ 集群空闲（.runner.lock 未被占用）</p>` : null}
+          ${cluster && html`<div class="row cluster-line" style="margin-top:6px">
+            <span class="muted">集群</span>
+            <span class=${'mono ' + (cluster.up ? 'st-ok' : 'st-warn')}>${cluster.engine.join(' / ') || '?'}</span>
+            ${cluster.nodes.map((n) => html`<span key=${n.name} class="node-dot" title=${n.name + ' ' + n.ip + ' · 已装 ' + n.ver}>
+              ${n.name.split('-').pop()} ${n.port9200 ? '✓' : '✗'}</span>`)}
+            <span class="muted">${cluster.up ? '全部 9200 在听' : '有节点 9200 未听 —— 未起集群时起跑会自动部署'}</span>
+            <button class="btn btn-ghost btn-sm" onClick=${(e) => {
+              const self = e.target;
+              getJSON('/api/cluster-status').then(({ j }) => { if (j && j.available) setCluster(j); });
+            }}>↻</button>
+          </div>
+          <p class="card-desc" style="margin:2px 0 0">只读探活（ip.txt 已装版本 + 9200 端口）；green/卡点/冷启动以 runner 流水线为准。</p>`}
           <p class="card-desc">排程随左侧勾选实时刷新（0.35s 防抖，纯本地计算不碰集群）；起跑前仍会做互斥预检与 runner dry-run。</p>
           <div class="mini-h">排程</div>
           <pre class="out light sched-pre">${schedBox}</pre>
@@ -1588,6 +1609,108 @@ function TracksView({ boot, EX, reloadBoot }) {
       })}
     </div>
     ${EX && html`<${EX.TrackFilesView} />`}
+  `;
+}
+
+// ==================== ⑥ 引擎与 JDK（只读资产盘点 + 车依赖） ====================
+function fmtSize(n) {
+  if (n == null) return '—';
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(1) + ' GB';
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(0) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+function AssetsView() {
+  const [d, setD] = useState(null);   // {available, pkg_dir, deps, pkg_files, bundles}
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function load() {
+    setBusy(true); setErr('');
+    try {
+      const { status, j } = await getJSON('/api/assets');
+      if (status !== 200) setErr(j.error || '读取失败');
+      else setD(j);
+    } catch (e) { setErr(String(e)); }
+    setBusy(false);
+  }
+  useEffect(() => { load(); }, []);
+  if (err) return html`<div class="card"><p class="st-bad">${err}</p></div>`;
+  if (!d) return html`<div class="content"><p class="muted">读取中…</p></div>`;
+  if (!d.available) return html`<div class="content"><div class="card">
+    <div class="card-title">引擎与 JDK</div>
+    <p class="muted">${d.reason || '当前模式读不到安装包目录 —— 资产盘点在压测机本机控制台查看。'}</p>
+  </div></div>`;
+
+  const missing = d.deps.filter((r) => (r.pkg && !r.pkg_stat.exists) || (r.jdk_mapped && r.jdk_stat && !r.jdk_stat.exists));
+  const byPath = {};
+  (d.pkg_files || []).forEach((f) => { byPath[d.pkg_dir + '/' + f.name] = f; });
+
+  return html`
+    <div class="card">
+      <div class="card-title">起跑依赖（车定义 → 安装包；与 runner resolve_engine 的 die 点同口径）
+        <div class="spacer"></div>
+        <span class=${missing.length ? 'st-bad' : 'st-ok'}>${missing.length ? '✘ ' + missing.length + ' 个包缺失' : '✓ 全部在位'}</span>
+        <button class="btn btn-ghost btn-sm" onClick=${load} disabled=${busy}>↻</button>
+      </div>
+      <table class="tbl">
+        <thead><tr><th>车</th><th>引擎</th><th>引擎包（PKG_DIR）</th><th>JDK 包</th></tr></thead>
+        <tbody>
+          ${d.deps.map((r) => html`<tr key=${r.car}>
+            <td class="mono">${r.car}</td>
+            <td class="mono" style="font-size:12px">${r.engine} ${r.ver}${r.build ? '-' + r.build : ''}</td>
+            <td>${r.pkg ? html`<span class=${r.pkg_stat.exists ? 'st-ok' : 'st-bad'}>${r.pkg_stat.exists ? '✓' : '✗ 缺失'}</span>
+              <span class="mono" style="font-size:11px;word-break:break-all">${r.pkg.replace(d.pkg_dir + '/', '')}</span>` : html`<span class="st-bad">未知引擎</span>`}</td>
+            <td>${r.jdk_mapped ? (r.jdk_stat && r.jdk_stat.exists
+              ? html`<span class="st-ok">✓</span><span class="mono" style="font-size:11px"> ${r.jdk_pkg.replace(d.pkg_dir + '/', '')}</span>`
+              : html`<span class="st-bad">✗ 缺失</span><span class="mono" style="font-size:11px"> ${r.jdk_pkg.replace(d.pkg_dir + '/', '')}</span>`)
+              : html`<span class="muted">${r.jdk_pkg || '—'}（无映射，用引擎自带 JDK / 用户自管）</span>`}</td>
+          </tr>`)}
+        </tbody>
+      </table>
+      <p class="card-desc">判定口径与 runner <code>resolve_engine</code> 的 die 点一致：引擎包三规则（easysearch 带 build / es、opensearch 各自命名）+ JDK 硬编码映射（jdk-26/27）。
+        包缺失时起跑会直接报「缺安装包」—— 这里提前标红。本页只读，上传/替换仍用 scp 放进 <code>${d.pkg_dir}</code>。</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">本地包仓库（${d.pkg_dir} · ${(d.pkg_files || []).length} 个文件）</div>
+      <table class="tbl">
+        <thead><tr><th>文件</th><th class="num">大小</th><th>修改时间</th><th>被引用</th></tr></thead>
+        <tbody>
+          ${(d.pkg_files || []).map((f) => {
+            const path = d.pkg_dir + '/' + f.name;
+            const ref = d.deps.some((r) => r.pkg === path || r.jdk_pkg === path) ? '引擎/JDK'
+              : (d.bundles || []).some((b) => b.path === path) ? 'BUNDLE_*' : '—';
+            return html`<tr key=${f.name}>
+              <td class="mono" style="font-size:12px;word-break:break-all">${f.name}</td>
+              <td class="num">${fmtSize(f.size)}</td>
+              <td class="muted">${new Date(f.mtime * 1000).toLocaleDateString()}</td>
+              <td>${ref === '—' ? html`<span class="muted">—</span>` : html`<span class="badge badge-run">${ref}</span>`}</td>
+            </tr>`;
+          })}
+          ${!(d.pkg_files || []).length && html`<tr><td colspan="4" class="muted">（目录为空）</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">vm-bench.env 的 BUNDLE_* 引用（${(d.bundles || []).length} 条）
+        <div class="spacer"></div>
+        <span class="muted">runner 与 ibs 当前都没有消费这些键 —— 历史遗留，建议清理或改为注释</span></div>
+      <table class="tbl">
+        <thead><tr><th>键</th><th>文件</th><th>状态</th></tr></thead>
+        <tbody>
+          ${(d.bundles || []).map((b) => html`<tr key=${b.key}>
+            <td class="mono">${b.key}</td>
+            <td class="mono" style="font-size:11px;word-break:break-all">${b.path}</td>
+            <td>${b.exists ? html`<span class="st-ok">✓ 存在</span>` : html`<span class="st-bad">✗ 不存在</span>`}</td>
+          </tr>`)}
+          ${!(d.bundles || []).length && html`<tr><td colspan="3" class="muted">（无 BUNDLE_* 键）</td></tr>`}
+        </tbody>
+      </table>
+      <p class="card-desc">引擎包的消费方是 runner 的 <code>resolve_engine</code>（直接拼 PKG_DIR 路径）与 ibs 的
+        <code>LOCAL_PKG_DIR</code>（ibs configs/.env，未启用时部署走官方源下载）—— BUNDLE_* 键不参与。</p>
+    </div>
   `;
 }
 
