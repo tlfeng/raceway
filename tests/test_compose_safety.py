@@ -356,9 +356,8 @@ class TestServiceSafety(NoExternalCalls):
         st.csrf_token = 'token'
         st.src = types.SimpleNamespace(root='/custom/results')
         captured = []
-        h = self.handler({'Host':'127.0.0.1:8802'})
-        h._send = lambda code, kind, data: captured.append(json.loads(data))
-        h._route_get('/api/bootstrap', {}, st)
+        _code, _kind, _body, _cache = C._route_get_core(st, '/api/bootstrap', {})
+        captured.append(json.loads(_body))
         self.assertEqual(captured[0]['csrf_token'], 'token')
         self.assertNotIn('config', captured[0]['cars'][0])
         self.assertNotIn('do-not-leak', json.dumps(captured))
