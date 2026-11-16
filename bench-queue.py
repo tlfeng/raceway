@@ -908,11 +908,12 @@ def _parse_ts(s):
 # 这里一次调用/一次扫描拿全部：cid、PROGRESS.txt mtime、RACES 行数、VALID 数、
 # 最后一行（判定"是否已结束"用），细节留给点开后的 build_campaign。
 
-def _summary_from_parts(cid, mtime, raw_fields, valid_fields, n_start, n_end, last_line):
-    """摘要元组 → dict。raw_fields / valid_fields 已是**去重后的场次数**。
+def _summary_from_parts(cid, mtime, raw_fields, valid_fields, last_start, last_end, last_line):
+    """摘要元组 → dict。
 
-    「已结束」判定与 build_campaign 同语义：campaign 结束行出现在**最后一次**
-    起跑头之后才算真结束 —— 用行数近似（结束行数 ≥ 起跑头行数）。
+    「已结束」判定与 build_campaign/close-campaign.sh **同一语义**：结束行出现在
+    最后一次起跑头之后（行号比较，不是行数比较 —— 续跑/手工整理会让"启动:"行
+    多于结束行，行数比较会把已收尾的 campaign 永远判成"运行中"）。
     runner 被杀后没有结束行，标"运行中"偏安全。
     """
     try:
@@ -928,20 +929,20 @@ def _summary_from_parts(cid, mtime, raw_fields, valid_fields, n_start, n_end, la
     except (TypeError, ValueError):
         valid = 0
     try:
-        n_start = int(n_start or 0)
+        last_start = int(last_start or 0)
     except (TypeError, ValueError):
-        n_start = 0
+        last_start = 0
     try:
-        n_end = int(n_end or 0)
+        last_end = int(last_end or 0)
     except (TypeError, ValueError):
-        n_end = 0
+        last_end = 0
     last = (last_line or '').strip()
     return {
         'cid': cid,
         'mtime': mtime,
         'total': total,
         'valid': valid,
-        'ended': n_end > 0 and n_end >= n_start,
+        'ended': last_end > last_start >= 0,
         'last': last,
     }
 
@@ -975,8 +976,8 @@ def remote_summaries_script(root):
         '    END { a = 0; b = 0; for (k in all) a++; for (k in valid) b++; printf "%d %d", a, b }\n'
         '  \' "$r" 2>/dev/null)\n'
         '  raw=${counts%% *}; valid=${counts##* }\n'
-        '  ns=$(grep -c "启动:" "$p" 2>/dev/null)\n'
-        '  ne=$(grep -c "campaign 结束" "$p" 2>/dev/null)\n'
+        '  pos=$(awk \'/启动:/{s=NR} /campaign 结束/{e=NR} END{printf "%d %d", s+0, e+0}\' "$p" 2>/dev/null)\n'
+        '  ns=${pos%% *}; ne=${pos##* }\n'
         '  mt=$(stat -c %Y "$p" 2>/dev/null)\n'
         '  printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$cid" "$mt" "$raw" "$valid" "$ns" "$ne" "$last"\n'
         'done\n')
@@ -997,20 +998,19 @@ def campaign_summaries(src):
             prog_path = os.path.join(src.root, cid, 'PROGRESS.txt')
             if not os.path.isfile(prog_path):
                 continue
+            # 单遍记录「最后一次启动头 / 结束行」的**行号**（与 build_campaign、
+            # close-campaign.sh 同语义：行号比较，不是行数比较）
+            last_start = last_end = -1
             last = ''
-            n_start = n_end = 0
             try:
                 with open(prog_path, 'r', encoding='utf-8', errors='replace') as f:
-                    for line in f:
+                    for lineno, line in enumerate(f, 1):
                         if '启动:' in line:
-                            n_start += 1
+                            last_start = lineno
                         elif 'campaign 结束' in line:
-                            n_end += 1
-                with open(prog_path, 'r', encoding='utf-8', errors='replace') as f:
-                    for line in reversed(f.readlines()):
+                            last_end = lineno
                         if line.strip():
                             last = line
-                            break
             except OSError:
                 pass
             races_path = os.path.join(src.root, cid, 'RACES.md')
@@ -1024,16 +1024,25 @@ def campaign_summaries(src):
             except OSError:
                 mt = 0
             parts.append([cid, str(int(mt)), str(raw), str(valid),
-                          str(n_start), str(n_end), last.rstrip('\n')])
+                          str(last_start), str(last_end), last.rstrip('\n')])
     sums = [_summary_from_parts(*p) for p in parts]
     sums.sort(key=lambda s: (s['mtime'], s['cid']), reverse=True)
     return sums
 
 
+# 「没收尾」但进度文件停滞超这个窗口 → 视为遗留 runner（大概率已被杀），不再占据
+# 控制台的默认选中位。页面侧的 stale 警告仍会对这类 campaign 提示收尾/续跑。
+ACTIVE_STALE_SECS = 24 * 3600
+
+
 def pick_active(summaries):
-    """默认该看哪个 campaign：最新的没收尾的；全收尾了就看最新的（当历史用）。"""
+    """默认该看哪个 campaign：最新一个仍活跃的（没收尾且 mtime 在窗口内）。
+
+    全都没有活跃的（全部收尾，或没收尾的都已停滞超窗口）→ 看最新的（当历史用）。
+    """
+    now = time.time()
     for s in summaries:
-        if not s['ended']:
+        if not s.get('ended') and now - (s.get('mtime') or 0) < ACTIVE_STALE_SECS:
             return s['cid']
     return summaries[0]['cid'] if summaries else None
 

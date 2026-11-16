@@ -68,7 +68,10 @@ quiet_check() {
   local fail=0 ip out load steal bench free foreign i
   for i in "${!VM_IPS[@]}"; do
     ip="${VM_IPS[$i]}"
-    out=$(timeout 45 vm "$ip" "RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") ENGINE_MARK=$(shell_quote "$ENGINE_MARK") '$MON_DIR/load-monitor.sh' probe 6" 2>/dev/null) || { log "FAIL ${VM_NAMES[$i]}: probe 执行失败/超时"; fail=1; continue; }
+    # ⚠️ 不能写 `timeout 45 vm ...`：vm 是 bash 函数，timeout 直接 exec 找不到它（rc=127），
+    # precheck 会 100% 失败。超时兜底放**远端**（timeout 30 + probe 自身的 MON_PROBE_DEADLINE
+    # 自死限）；ssh 层挂死靠 VM_SSH_OPTS 的 ConnectTimeout/ServerAlive 兜底。
+    out=$(vm "$ip" "timeout 30 env RACEWAY_MON_DIR=$(shell_quote "$MON_DIR") ENGINE_MARK=$(shell_quote "$ENGINE_MARK") '$MON_DIR/load-monitor.sh' probe 6" 2>/dev/null) || { log "FAIL ${VM_NAMES[$i]}: probe 执行失败/超时"; fail=1; continue; }
     log "  ${VM_NAMES[$i]}: $out"
     load=$(echo "$out"    | grep -o 'load1_avg=[0-9.]*'     | cut -d= -f2)
     steal=$(echo "$out"   | grep -o 'steal_max=[0-9.]*'     | cut -d= -f2)
