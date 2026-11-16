@@ -358,3 +358,18 @@ pre.out.light { background: hsl(var(--muted)); color: hsl(var(--foreground)); }
 @media (max-width: 760px) {
   .drawer { width: 100vw; }
 }
+
+/* ---------- 扩展组件：自适应宽度 ---------- */
+.x-grow { flex: 1 1 240px; min-width: 0; max-width: 100%; }
+.input.x-grow, .select.x-grow { width: auto; }
+.x-files-grid {
+  display: grid; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+  gap: 14px; margin-top: 10px;
+}
+.x-kv-key { flex: 0 0 200px; max-width: 45%; overflow-wrap: anywhere; }
+.x-kv-val { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 820px) {
+  .x-files-grid { grid-template-columns: minmax(0, 1fr); }
+  .x-kv-key { flex-basis: 120px; }
+  .x-grow { flex-basis: 100%; }
+}

@@ -172,6 +172,38 @@ class EstSuggestTests(unittest.TestCase):
         self.assertFalse(p['available'])
 
 
+class RouteContractTests(unittest.TestCase):
+    """GET/POST 路由必须返回 (code, payload) 二元组（回归：写类 api_* 曾返回单个 dict，
+    导致赛道文件页报 'not enough values to unpack'）。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.st = make_state(self.root)
+        # remote_operation 的子 shell 会 source vm-bench.env（真实部署必有），测试里造一个
+        with open(os.path.join(self.root, 'vm-bench.env'), 'w', encoding='utf-8') as f:
+            f.write('RESULTS_ROOT=%s/campaigns\n' % self.root)
+        with open(os.path.join(self.root, 'tracks', 'a.json'), 'w', encoding='utf-8') as f:
+            f.write('{"x":1}')
+
+    def test_track_files_get_returns_tuple(self):
+        code, ctype, body, cache = C._route_get_core(self.st, '/api/track-files', {})
+        self.assertEqual(code, 200)
+        self.assertEqual(ctype, 'application/json')
+        self.assertIn('files', json.loads(body))
+
+    def test_track_file_get_returns_tuple(self):
+        code, ctype, body, cache = C._route_get_core(
+            self.st, '/api/track-file', {'path': ['a.json']})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)['path'], 'a.json')
+
+    def test_post_write_returns_tuple(self):
+        code, ctype, body, cache = C._post_core(
+            self.st, '/api/track-write', {'path': 'b.json', 'content': '{"y":2}'})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)['path'], 'b.json')
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

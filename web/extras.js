@@ -113,7 +113,7 @@
         <div class="row"><input class="input" placeholder="筛选文件名…" value=${filter}
           onInput=${(e) => setFilter(e.target.value)} style="max-width:280px" />
           <span class="muted">共 ${files.length} 个文件</span></div>
-        <div style="display:grid;grid-template-columns:minmax(220px,320px) 1fr;gap:14px;margin-top:10px">
+        <div class="x-files-grid">
           <div style="max-height:520px;overflow:auto;border:1px solid hsl(var(--border));border-radius:6px">
             ${loading ? html`<div class="muted" style="padding:12px">加载中…</div>` : null}
             ${!loading && shown.length === 0 ? html`<div class="muted" style="padding:12px">（无文件）</div>` : null}
@@ -128,8 +128,8 @@
           <div>
             ${!sel ? html`<div class="muted">选择左侧文件查看/编辑，或点「新建文件」。</div>` : html`
               <div class="row">
-                <label class="muted" style="width:56px">路径</label>
-                <input class="input mono" style="flex:1" value=${sel.path}
+                <label class="muted">路径</label>
+                <input class="input mono x-grow" value=${sel.path}
                   disabled=${!sel.isNew} placeholder="如 geonames/index.json"
                   onInput=${(e) => setSel(Object.assign({}, sel, { path: e.target.value }))} />
               </div>
@@ -170,8 +170,8 @@
         <div class="card-title">报告导出</div>
         <p class="card-desc">按 campaign 生成 Markdown / HTML 报告，口径取自 PLAN / RACES / ENV-SUMMARY。纯离线读文件，不改数据。</p>
         <div class="row">
-          <label class="muted" style="width:56px">campaign</label>
-          <select class="input" value=${cid} onInput=${(e) => setCid(e.target.value)} style="max-width:420px">
+          <label class="muted">campaign</label>
+          <select class="input x-grow" value=${cid} onInput=${(e) => setCid(e.target.value)}>
             ${camps.map((c) => html`<option key=${c.cid} value=${c.cid}>${c.cid}</option>`)}
           </select>
           <label class="muted">格式</label>
@@ -236,8 +236,8 @@
         const v = obj[k];
         if (v && typeof v === 'object') continue;
         rows.push(html`<div key=${k} class="row" style="margin:2px 0">
-          <span class="muted mono" style="width:200px">${k}</span>
-          <span class="mono" style="font-size:12px">${esc(v)}</span></div>`);
+          <span class="muted mono x-kv-key">${k}</span>
+          <span class="mono x-kv-val">${esc(v)}</span></div>`);
       }
       return rows.length ? rows : html`<div class="muted">（无标量字段）</div>`;
     }
@@ -400,14 +400,14 @@
           <select class="input" value=${file} onInput=${(e) => setFile(e.target.value)}>
             ${common.map((f) => html`<option key=${f} value=${f}>${f}</option>`)}
           </select>
-          <input class="input" placeholder="自定义相对路径…" value=${file}
-            onInput=${(e) => setFile(e.target.value)} style="max-width:240px" />
+          <input class="input x-grow" placeholder="自定义相对路径…" value=${file}
+            onInput=${(e) => setFile(e.target.value)} />
           <select class="input" value=${n} onInput=${(e) => setN(+e.target.value)}>
             <option value="100">100 行</option><option value="300">300 行</option>
             <option value="1000">1000 行</option><option value="5000">5000 行</option>
           </select>
-          <input class="input" placeholder="关键字过滤…" value=${q}
-            onInput=${(e) => setQ(e.target.value)} style="max-width:180px" />
+          <input class="input x-grow" placeholder="关键字过滤…" value=${q}
+            onInput=${(e) => setQ(e.target.value)} />
           <button class="btn btn-sm btn-primary" onClick=${load} disabled=${busy}>${busy ? '读取中…' : '读取'}</button>
           <span class="muted">匹配 ${total} 行</span>
         </div>
@@ -435,12 +435,12 @@
           <div class="card-title">场次浏览器</div>
           <p class="card-desc">逐场次看实测身份、判定详情、每节点 5s 监控曲线与全文日志；可给中途停掉的 campaign 补结束行。</p>
           <div class="row">
-            <label class="muted" style="width:56px">campaign</label>
-            <select class="input" value=${cid} onInput=${(e) => { setCid(e.target.value); setCurCid(e.target.value); }} style="max-width:420px">
+            <label class="muted">campaign</label>
+            <select class="input x-grow" value=${cid} onInput=${(e) => { setCid(e.target.value); setCurCid(e.target.value); }}>
               ${camps.map((c) => html`<option key=${c.cid} value=${c.cid}>${c.cid}</option>`)}
             </select>
             <label class="muted">场次</label>
-            <select class="input" value=${fid} onInput=${(e) => setFid(e.target.value)} style="max-width:320px">
+            <select class="input x-grow" value=${fid} onInput=${(e) => setFid(e.target.value)}>
               ${fids.map((f) => html`<option key=${f} value=${f}>${f}</option>`)}
             </select>
             <button class="btn btn-primary btn-sm" onClick=${() => setDrawer(true)} disabled=${!fid}>打开详情抽屉</button>

@@ -1551,6 +1551,28 @@ def safe_camp_rel(rel):
     return rel
 
 
+def _ok(reply):
+    """把写类 api_* 返回的 dict 包成路由层期待的 (code, payload)。
+
+    写类函数直接返回 remote_operation 的 dict（CLI bench-tools.py 直接消费），
+    而 _route_get_core / _post_core 统一按 (code, payload) 取用，故在此适配。
+    """
+    return 200, reply
+
+
+def _ok_call(fn, *a, **kw):
+    """GET 路由专用：调用写类 api_*（可能抛 SystemExit）并包成 (code, payload)。
+
+    remote_operation 失败时抛 SystemExit，而 do_GET 的 except Exception 不捕获它
+    （SystemExit 继承 BaseException），会导致连接直接断开、页面拿到空响应 —— 这里
+    先转成 ValueError，让上层按 500 JSON 正常回显原因。
+    """
+    try:
+        return 200, fn(*a, **kw)
+    except SystemExit as e:
+        raise ValueError(str(e))
+
+
 def api_track_list(st):
     with st.lock:
         return remote_operation(st.args, 'track-list')
@@ -1918,10 +1940,10 @@ def _route_get_core(st, path, q):
     elif path == '/api/trend':
         code, payload = api_trend(st, q)
     elif path == '/api/track-files':
-        code, payload = api_track_list(st)
+        code, payload = _ok_call(api_track_list, st)
     elif path == '/api/track-file':
         try:
-            code, payload = api_track_read(st, {'path': (q.get('path') or [''])[0]})
+            code, payload = _ok_call(api_track_read, st, {'path': (q.get('path') or [''])[0]})
         except ValueError as e:
             return 400, 'application/json', json.dumps({'error': str(e)}, ensure_ascii=False), 'no-store'
     elif path == '/api/sidecar':
@@ -1972,13 +1994,13 @@ def _post_core(st, path, body):
         elif path == '/api/apply':
             code, payload = api_apply(st, body)
         elif path == '/api/track-write':
-            code, payload = api_track_write(st, body)
+            code, payload = _ok(api_track_write(st, body))
         elif path == '/api/track-delete':
-            code, payload = api_track_delete(st, body)
+            code, payload = _ok(api_track_delete(st, body))
         elif path == '/api/export-gen':
-            code, payload = api_export_gen(st, body)
+            code, payload = _ok(api_export_gen(st, body))
         elif path == '/api/close':
-            code, payload = api_close(st, body)
+            code, payload = _ok(api_close(st, body))
         else:
             code, payload = 404, {'error': 'not found'}
     except SystemExit as e:
