@@ -51,7 +51,7 @@ ssh <压测机>
 cd /opt/raceway
 
 # ② 改过本地 raceway 仓库后，先同步到压测机（在本地仓库目录执行；只覆盖不删除）
-scp -r *.sh *.py *.conf vm-bench.env tracks/ kibana/ <压测机>:/opt/raceway/
+scp -r *.sh *.py *.conf vm-bench.env tracks/ kibana/ web/ <压测机>:/opt/raceway/
 
 # ③ 长任务一律 setsid nohup 后台跑，人只轮询 PROGRESS.txt（防 SSH 断连）
 # ④ 跑完把 campaign 下载回本地归档（见 §6）
@@ -471,7 +471,7 @@ OpenSearch 的 HNSW 搜索预算使用 `ef_search`，不等同于 ES 的每分�
 
 ## 14. 控制台（可选）
 
-`bench-compose.py serve` 起一个页面，三块内容合一：
+`bench-compose.py serve` 起一个页面，五块内容合一（前端在 `web/` 目录，Preact+HTM 轻量单页，必须随仓库同步；`web/index.html` 缺失时自动回退旧页面 `web/legacy.html`，`/legacy` 可直接访问）：
 
 ```bash
 python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
@@ -484,6 +484,10 @@ python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
 **② 运行进度** —— 自动选中最近一个没收尾的跑分：进度条、总场次/有效/失败/待跑卡片、剩余分钟数和预计完成时刻、当前场次与阶段、已跑多久。页面标题当状态栏（`▶ 场次 · 阶段`），切走也能瞄。`PROGRESS.txt` 的实时日志直接贴在页面上。可以一键停掉整个跑分，会二次确认，停完自动补结束行。
 
 **③ 历史与结果** —— 跑分清单、关键字筛选、复看进度与「按此重排」。两场对比显式传各自 campaign 到 A/B 取数池，支持相同车代号跨池比较；远端执行本机对比程序及 `result_selection.py` / `identity.py` 依赖，输出有效逐圈值、中位差值与极差，不解析 Markdown 报告。车代号留空会自动选择，正式比较建议明确填写。
+
+**④ 趋势** —— 跨 campaign 读 `benchmark-result-metric` 指标库，按车/赛道/指标/操作查询，echarts 折线（未随仓库分发时降级表格）。
+
+**⑤ 赛道与入库** —— 远端 `run-bench.sh list` 的赛道目录；`exports/` 导出经 `bench-apply.py` 预检后入库（预检不过不发任何请求，`--drop` 需二次确认）。
 
 不开页面的话，五个子命令是同一套能力的程序化入口：
 

@@ -33,12 +33,12 @@
 
 ```bash
 cp vm-bench.env.example vm-bench.env && vi vm-bench.env   # 填路径、凭据、阈值（真身不入库）
-scp -r *.sh *.py *.conf vm-bench.env tracks/ kibana/ 压测机:/opt/raceway/   # 脚本 + 赛道定义 + 建板工具链
+scp -r *.sh *.py *.conf vm-bench.env tracks/ kibana/ web/ 压测机:/opt/raceway/   # 脚本 + 赛道定义 + 建板工具链 + Web 控制台前端
 ./doctor.sh                                             # 新环境体检：六组只读检查，失败项给出修法
 ./run-bench.sh --dry-run geo 3 my3.conf                    # 预览排程：秒回，不碰集群
 ```
 
-**同步必须带上 `tracks/` 和 `kibana/`**，以及全部 `*.py`（对比工具依赖 `result_selection.py`、`identity.py`）。漏同步赛道定义或依赖就跑不起来。runner 从 campaign 的 `runtime/` 只读脚本快照运行，不读取同步时被覆盖的活动脚本。
+**同步必须带上 `tracks/`、`kibana/` 和 `web/`**，以及全部 `*.py`（对比工具依赖 `result_selection.py`、`identity.py`）。漏同步赛道定义或依赖就跑不起来；漏 `web/` 则 `bench-compose.py serve` 打不开页面（起服务时会明确报缺失）。`web/index.html` 缺失时会自动回退旧页面 `web/legacy.html`（也可通过 `/legacy` 直接访问）。runner 从 campaign 的 `runtime/` 只读脚本快照运行，不读取同步时被覆盖的活动脚本。
 
 节点清单从 ibs 的 `ip.txt` 推导，**不用手抄 IP**；还没规划拓扑就先跑 ibs 的一键初始化。
 

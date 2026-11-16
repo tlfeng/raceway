@@ -551,8 +551,15 @@ function HistMatrix({ hist, boot, form, setForm }) {
 function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
   const [queue, setQueue] = useState(null);
   const [tail, setTail] = useState('（空）');
-  const [auto, setAuto] = useState(true);
+  // 轮询间隔（秒）：0=手动。压测期间可调大/关掉，减少压测机上的 ssh 轮询噪声；
+  // 存 localStorage 记住选择，不用每次压测重调。
+  const [pollSec, setPollSec] = useState(() => {
+    try { const v = localStorage.getItem('raceway.pollSec'); return v == null ? 5 : Number(v); }
+    catch (e) { return 5; }
+  });
   const [notify, setNotify] = useState(false);
+  const [lastPoll, setLastPoll] = useState(null);
+  const [pollTick, setPollTick] = useState(0);  // 点「立即刷新」时 +1，重跑 effect 拉一次并重排
   const prevEnded = useRef(null);
   const timer = useRef(null);
 
@@ -574,12 +581,13 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
         ]);
         if (rq.status === 200) setQueue(rq.j);
         if (rt.status === 200) setTail(rt.j.lines || '（空）');
+        setLastPoll(new Date());
       } catch (e) { /* 网络抖动下一轮再试 */ }
-      if (alive && auto) timer.current = setTimeout(poll, 5000);
+      if (alive && pollSec > 0) timer.current = setTimeout(poll, pollSec * 1000);
     }
-    poll();
+    poll();  // 切到本页/换间隔/换 campaign 时立刻拉一次，之后按间隔排程
     return () => { alive = false; clearTimeout(timer.current); };
-  }, [curCid, auto]);
+  }, [curCid, pollSec, pollTick]);
 
   const s = (queue && queue.stats) || {};
   const run = queue && (queue.fields || []).find((f) => f.status === 'RUNNING');
@@ -633,7 +641,20 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload }) {
             <option key=${c.cid} value=${c.cid}>${c.cid}（${endState(c)} ${c.valid}/${c.total}）</option>`)}
         </select>
         <button class="btn btn-ghost btn-sm" onClick=${() => reload()}>刷新列表</button>
-        <label class="chk"><input type="checkbox" checked=${auto} onChange=${(e) => setAuto(e.target.checked)} /> 自动刷新（5s）</label>
+        <button class="btn btn-ghost btn-sm" disabled=${!curCid} onClick=${() => setPollTick((n) => n + 1)}>立即刷新</button>
+        <label class="muted">自动刷新
+          <select value=${pollSec} onChange=${(e) => {
+            const v = Number(e.target.value); setPollSec(v);
+            try { localStorage.setItem('raceway.pollSec', String(v)); } catch (err) { /* 忽略 */ }
+          }} title="压测期间可调大间隔或切手动，减少压测机上的 ssh 轮询">
+            <option value="5">每 5 秒</option>
+            <option value="15">每 15 秒</option>
+            <option value="30">每 30 秒</option>
+            <option value="60">每 60 秒</option>
+            <option value="0">手动（不自动轮询）</option>
+          </select>
+        </label>
+        ${lastPoll && html`<span class="muted">上次拉取 ${lastPoll.toLocaleTimeString()}</span>`}
         <label class="chk"><input type="checkbox" checked=${notify} onChange=${(e) => setNotify(e.target.checked)} /> 完成提醒</label>
         <div class="spacer"></div>
         <button class="btn btn-danger btn-sm" onClick=${doStop}>■ 停止该 campaign</button>

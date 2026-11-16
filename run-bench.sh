@@ -49,7 +49,7 @@ ORIGINAL_ARGS=("$@")
 # → 索引落到赛道模板的默认分片数（geonames 模板默认 5），与其余赛道的 3 不一致，
 # 而且不会报错 —— 在这里挡住，别等到数字不可比才发现。
 declare -F track_params >/dev/null 2>&1 \
-  || die "vm-bench-lib.sh 版本过旧（缺 track_params）：请把整个仓库同步到压测机（scp *.sh *.py *.conf vm-bench.env <压测机>:/opt/raceway/）"
+  || die "vm-bench-lib.sh 版本过旧（缺 track_params）：请把整个仓库同步到压测机（scp *.sh *.py *.conf vm-bench.env web/ <压测机>:/opt/raceway/）"
 
 # 赛道/模式名单：用法提示、参数校验、文件头注释三处共用这一份（WHAT_ARGS）。
 # 收敛成一份后，文案与实际 case 的漂移由 tests/test_codec_variants.py 挡住。
@@ -103,8 +103,8 @@ raceway · 压测编排入口（用法页）
   1. cp vm-bench.env.example vm-bench.env 并填写 —— 缺它连 list 都跑不动
   2. ./doctor.sh —— 六组只读体检，✘ 的先修完再起跑
      RALLY_PYTHON 必须指向 RALLY 使用的 Python 环境（wrapper 的 venv 不会回传）。
-  3. 仓库改动同步到压测机时**要带上 tracks/**（赛道定义在 git 里，漏了就跑不起来）：
-       scp -r *.sh *.py *.conf tracks/ kibana/ vm-bench.env <压测机>:/opt/raceway/
+  3. 仓库改动同步到压测机时**要带上 tracks/ 和 web/**（赛道定义 + 控制台前端，漏了就跑不起来/打不开页面）：
+       scp -r *.sh *.py *.conf tracks/ kibana/ web/ vm-bench.env <压测机>:/opt/raceway/
 EOF
 }
 

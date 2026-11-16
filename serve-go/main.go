@@ -32,6 +32,7 @@ var webStatic = map[string]struct{ file, mime string }{
 	"/web/vendor/preact.umd.js": {"vendor/preact.umd.js", "application/javascript; charset=utf-8"},
 	"/web/vendor/hooks.umd.js":  {"vendor/hooks.umd.js", "application/javascript; charset=utf-8"},
 	"/web/vendor/htm.umd.js":    {"vendor/htm.umd.js", "application/javascript; charset=utf-8"},
+	"/legacy":                   {"legacy.html", "text/html; charset=utf-8"}, // 旧页面独立入口
 }
 
 var csrfRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -128,30 +129,48 @@ func sendForbidden(w http.ResponseWriter, why string) {
 	sendJSON(w, http.StatusForbidden, map[string]string{"error": why})
 }
 
-// serveStatic 原生处理 '/'、'/web/*'、'/echarts.min.js'；文件缺失返回 handled=false 交由 Python 兜底。
+// serveStatic 原生处理 '/'、'/legacy'、'/web/*'、'/echarts.min.js'；文件缺失返回 handled=false 交由 Python 兜底。
+// '/' 优先 index.html，缺失回退 legacy.html（与 bench-compose.py _route_get_core 对齐）。
 func (s *server) serveStatic(w http.ResponseWriter, path string) (handled bool) {
 	var abs, mime, cache string
 	switch {
 	case path == "/":
-		abs, mime, cache = filepath.Join(s.repoDir, "web", "index.html"), "text/html; charset=utf-8", "no-store"
+		mime, cache = "text/html; charset=utf-8", "no-store"
+		abs = filepath.Join(s.repoDir, "web", "index.html")
+		if _, err := os.Stat(abs); err != nil {
+			if alt := filepath.Join(s.repoDir, "web", "legacy.html"); fileExists(alt) {
+				abs = alt // index 缺失 → 旧页兜底
+			} else {
+				return false // 都没有 → 委派 Python（返回 500 文案）
+			}
+		}
 	case path == "/echarts.min.js":
 		abs, mime, cache = filepath.Join(s.repoDir, "echarts.min.js"), "application/javascript; charset=utf-8", "public, max-age=86400"
 	default:
-		if st, ok := webStatic[path]; ok {
-			abs, mime, cache = filepath.Join(s.repoDir, "web", st.file), st.mime, "public, max-age=300"
-		} else {
+		st, ok := webStatic[path]
+		if !ok {
 			return false
+		}
+		abs, mime = filepath.Join(s.repoDir, "web", st.file), st.mime
+		cache = "no-store" // 仅 /legacy 会走到这里，保持一致
+		if path != "/legacy" {
+			cache = "public, max-age=300"
 		}
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
-		return false // 缺失 → 交给 Python（走内联旧页 _PAGE 或统一 404 文案）
+		return false // 缺失 → 交给 Python（统一 404/500 文案）
 	}
 	writeSecurity(w, cache)
 	w.Header().Set("Content-Type", mime)
 	w.WriteHeader(200)
 	w.Write(data)
 	return true
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 type rpcResp struct {
@@ -396,6 +415,15 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "获取工作目录失败:", err)
 		os.Exit(1)
+	}
+	// 前端都在 web/：新版优先，旧页兜底；两个都没有就起不来（与 cmd_serve 一致）。
+	if !fileExists(filepath.Join(repoDir, "web", "index.html")) &&
+		!fileExists(filepath.Join(repoDir, "web", "legacy.html")) {
+		fmt.Fprintln(os.Stderr, "找不到前端 web/index.html 或 web/legacy.html —— 同步仓库时请带上 web/ 目录")
+		os.Exit(1)
+	}
+	if !fileExists(filepath.Join(repoDir, "web", "index.html")) {
+		fmt.Fprintln(os.Stderr, "警告：web/index.html 缺失，使用旧页面 web/legacy.html（/ 与 /legacy 均可访问）")
 	}
 	csrf, err := newCSRFToken()
 	if err != nil {
