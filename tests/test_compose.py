@@ -190,7 +190,7 @@ class TestEstOverrides(unittest.TestCase):
 
 
 class TestControlConsole(unittest.TestCase):
-    """三合一控制台（serve）的纯函数与页面模板完整性。"""
+    """五合一控制台（serve）的纯函数与 web/ 前端资产完整性。"""
 
     def test_cid_whitelist(self):
         self.assertIsNone(C.check_cid('ds2e-20261022-231940'))
@@ -248,32 +248,40 @@ class TestControlConsole(unittest.TestCase):
         code, payload = C.api_compare(st, {'a': '../etc', 'b': 'y', 'car': ''})
         self.assertEqual(code, 400)
 
-    def test_page_template_has_three_tabs_and_no_format_leftovers(self):
-        # 页面改用 .replace 注入（不是 % 格式化），模板里不能残留占位符/转义
-        self.assertNotIn('%s', C._PAGE)
-        self.assertNotIn('%%', C._PAGE)
-        self.assertNotIn('__DS_TIERS__', C._PAGE)
-        for frag in ('tab-compose', 'tab-progress', 'tab-history',
-                     '/api/campaigns', '/api/queue', '/api/logtail', '/api/stop',
-                     'renderProgress', 'reorderCamp', 'doStop', 'restorePrefs'):
-            self.assertIn(frag, C._PAGE)
+    def test_web_frontend_assets_present(self):
+        """前端都在 web/：新版 + 旧页兜底 + vendored 库必须随仓库同步。"""
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        web = os.path.join(repo, 'web')
+        for rel in ('index.html', 'legacy.html', 'style.css', 'app.js',
+                    'vendor/preact.umd.js', 'vendor/hooks.umd.js', 'vendor/htm.umd.js'):
+            self.assertTrue(os.path.isfile(os.path.join(web, rel)), '缺少前端文件: ' + rel)
+        with open(os.path.join(web, 'app.js'), encoding='utf-8') as f:
+            js = f.read()
+        with open(os.path.join(web, 'index.html'), encoding='utf-8') as f:
+            page = f.read()
+        # 五个板块调用的 API 与关键交互都得在前端里（防止改版误删）
+        for frag in ('/api/bootstrap', '/api/campaigns', '/api/queue', '/api/logtail',
+                     '/api/stop', '/api/compare', '/api/doctor', '/api/trend',
+                     '/api/render', '/api/preview', '/api/start', '/api/apply',
+                     'X-Raceway-CSRF', 'raceway.compose'):
+            self.assertIn(frag, js)
+        for frag in ('preact.umd.js', 'hooks.umd.js', 'htm.umd.js', 'style.css', 'app.js'):
+            self.assertIn(frag, page)
 
-    def test_page_ids_referenced_by_js_exist(self):
-        """JS 里 getElementById 的每个 id 都必须在模板里出现（防改 HTML 漏改 JS）。"""
-        import re as _re
-        ids = set(_re.findall(r"getElementById\('([a-z]+)'\)", C._PAGE))
-        # querySelector('.carck') 等动态拼的不在此列
-        missing = [i for i in ids if ('id="%s"' % i) not in C._PAGE]
-        self.assertEqual(missing, [])
-
-    def test_page_has_compare_and_est_ui(self):
-        for frag in ('/api/compare', 'doCompare', 'est_total_min', 'hfilter', 'pnotify',
-                     'fmtMin', 'windowHint'):
-            self.assertIn(frag, C._PAGE)
-
-    def test_page_has_doctor_ui(self):
-        for frag in ('/api/doctor', 'doDoctor', '环境体检'):
-            self.assertIn(frag, C._PAGE)
+    def test_legacy_page_kept_outside_python(self):
+        """旧页面作为独立 HTML 保留；Python 源码里不再内联页面模板。"""
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, 'web', 'legacy.html'), encoding='utf-8') as f:
+            legacy = f.read()
+        for frag in ('tab-compose', 'tab-progress', 'tab-history', '/api/campaigns',
+                     '/api/queue', '/api/logtail', '/api/stop', '/api/compare',
+                     '/api/doctor', 'doStart', 'doStop', 'restorePrefs'):
+            self.assertIn(frag, legacy)
+        self.assertTrue(legacy.lstrip().startswith('<!doctype html>'))
+        self.assertTrue(legacy.rstrip().endswith('</html>'))
+        with open(os.path.join(repo, 'bench-compose.py'), encoding='utf-8') as f:
+            src = f.read()
+        self.assertNotIn('_PAGE', src, '旧页面不应再内联在 Python 源码里')
 
     def test_doctor_script_bash_syntax(self):
         """doctor.sh 必须能过 bash -n；且不硬性依赖 vm-bench.env（体检对象就是它）。"""
@@ -336,22 +344,16 @@ class TestControlConsole(unittest.TestCase):
         self.assertEqual(f0['env_verdict'], 'CONTAMINATED')
         self.assertEqual(f0['steal_max'], 3.2)
 
-    def test_page_script_parses(self):
-        """控制台页面的 <script> 必须是合法 JS（python 三引号里写 JS 很容易转义翻车）。"""
-        import re as _re
+    def test_web_app_js_parses(self):
+        """web/app.js 必须是合法 JS（HTM 模板里写错括号只会在浏览器里翻车）。"""
         import shutil
         import subprocess
-        import tempfile
         node = shutil.which('node')
         if not node:
             self.skipTest('本机没有 node，跳过 JS 语法检查')
-        m = _re.search(r'<script>(.*)</script>', C._PAGE, _re.S)
-        self.assertTrue(m, '页面里没有 <script> 块')
-        with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False,
-                                         encoding='utf-8', newline='\n') as f:
-            f.write(m.group(1))
-            path = f.name
-        p = subprocess.run([node, '--check', path], capture_output=True, text=True)
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = subprocess.run([node, '--check', os.path.join(repo, 'web', 'app.js')],
+                           capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_api_start_reports_campaign(self):
