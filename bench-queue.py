@@ -73,6 +73,8 @@ STATUS_FAILS = (
     # 场前环境/编排失败：runner 在 run_field 的最前面就会写这三行，
     # 它们恰恰是「环境坏了」的信号（停服没确认 / 清数据失败 / 任务清单生成失败）。
     'STOP-FAIL', 'CLEAN-FAIL', 'TASKS-FAIL',
+    # 加密/快照族（geo-enc / geo-snap）的场前失败：加密套件装机 / 加密就绪门 / s3 后端拉起
+    'ENC-SETUP-FAIL', 'ENC-GATE-FAIL', 'S3-BACKEND-FAIL',
 )
 KNOWN_STATUS = (STATUS_VALID, STATUS_SKIP, STATUS_DEADLINE) + STATUS_FAILS
 

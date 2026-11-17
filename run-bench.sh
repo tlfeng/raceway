@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # run-bench.sh —— 性能编排（配置 × 赛道 × 轮次，在压测机上运行；单入口，esrally 风格）
-#   ./run-bench.sh <geo|geo-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
+#   ./run-bench.sh <geo|geo-enc|geo-snap|geo-snap-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
 #   ./run-bench.sh list                          # 列可用赛道/配置模板/近期 campaign
 #   ./run-bench.sh --help                        # 用法页（赛道、三种编排、前置条件）
 #
@@ -53,7 +53,7 @@ declare -F track_params >/dev/null 2>&1 \
 
 # 赛道/模式名单：用法提示、参数校验、文件头注释三处共用这一份（WHAT_ARGS）。
 # 收敛成一份后，文案与实际 case 的漂移由 tests/test_codec_variants.py 挡住。
-WHAT_ARGS='geo|geo-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list'
+WHAT_ARGS='geo|geo-enc|geo-snap|geo-snap-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list'
 
 # 用法页：./run-bench.sh --help —— 压测机是纯命令行环境，参数、赛道清单、前置条件、
 # 产物在哪全在这一页里，不用去翻源码。
@@ -77,6 +77,9 @@ raceway · 压测编排入口（用法页）
 
 赛道（名字 → 赛道定义在哪）
   geo                    geonames 官方基座           tracks/geonames
+  geo-enc                geonames 索引加密探针（encrypted_store 走 --track-params）仅 Easysearch
+  geo-snap               geonames 加密索引 + 明文 s3 仓库快照闭环（MinIO）仅 Easysearch
+  geo-snap-enc           geonames 加密索引 + 加密仓库（s3 委托）快照闭环 仅 Easysearch
   hnsw                   96 维 200 万向量            tracks/hnsw（语料 TRACK_HNSW_BASE）
   hv1024                 1024 维 100 万向量          tracks/hv1024
   nested                 nested 文档                 tracks/nested
@@ -118,11 +121,12 @@ suggest_track() { # <错的名字> → 猜一个 id（空 = 猜不出来）
   local w="$1" c
   for c in hv1024x-codec-zstd-sr hv1024x-int8 hv1024x-bbq hv1024x-bbqdisk \
            hv1024x-os-bbq hv1024x-os-disk hv1024x-os hv1024x hv1024 geonames-upsert \
-           hnsw nested geo codec both all ds list gdef gzstd gbc; do
+           hnsw nested geo geo-enc geo-snap geo-snap-enc codec both all ds list gdef gzstd gbc; do
     [ "$w" = "$c" ] && { printf '%s' "$c"; return 0; }
   done
   for c in hv1024x-codec-zstd-sr geo-codec-zstd-sr geo-codec-def-sr geo-codec-bc-sr \
            geo-codec-zstd geo-codec-def geo-codec-bc \
+           geo-snap-enc geo-snap geo-enc \
            hv1024x-os-bbq hv1024x-os-disk hv1024x-os hv1024x-bbqdisk \
            hv1024x-int8 hv1024x-bbq hv1024x hv1024 geonames-upsert hnsw nested geo codec both all ds; do
     case "$w" in *"$c"*) printf '%s' "$c"; return 0;; esac
@@ -168,6 +172,8 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 : "${TIMEOUT_DS_W:=10800}"; : "${TIMEOUT_DS_W_HI:=14400}"; : "${TIMEOUT_DS_Q:=5400}"
 # 基础赛道超时内置默认（vm-bench.env 有键则覆盖；set -u 下缺键不再是半途 unbound 崩）
 : "${TIMEOUT_GEO_W:=14400}";  : "${TIMEOUT_GEO_Q:=5400}"
+# 快照探针族（geo-snap/geo-snap-enc）：写段之外还要走完整快照闭环（注册/快照/恢复），写超时放宽
+: "${TIMEOUT_GEO_SNAP_W:=21600}"
 : "${TIMEOUT_HNSW_W:=10800}"; : "${TIMEOUT_HNSW_Q:=5400}"
 : "${TIMEOUT_HV1024_W:=10800}"; : "${TIMEOUT_HV1024_Q:=5400}"
 : "${TIMEOUT_NESTED_W:=14400}"; : "${TIMEOUT_NESTED_Q:=5400}"
@@ -176,6 +182,17 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 : "${PKG_DIR:=$ROOT/pkg}"
 : "${RESULTS_ROOT:=$ROOT/campaigns}"
 : "${MON_DIR:=$ROOT/monitor}"
+# 快照探针族的 s3 后端（MinIO）旋钮：minio_ensure 拉起后端、enc 装机写 s3 客户端、
+# track_params 传桶名，三处共用这一份。VM 侧可达地址 = 网桥 IP（10.10.10.1）。
+: "${S3_ENDPOINT:=http://10.10.10.1:9000}"
+: "${S3_ACCESS_KEY:=raceway}"
+: "${S3_SECRET_KEY:=raceway-snap-2026}"
+: "${S3_BUCKET:=raceway-snap}"
+: "${S3_BASE_PATH:=geonames}"
+: "${MINIO_BIN:=$ROOT/bin/minio}"
+: "${MINIO_DATA_DIR:=$ROOT/minio-data}"
+: "${MINIO_ADDR:=10.10.10.1:9000}"      # 只绑网桥 IP：不把弱凭证 MinIO 暴露到公网接口
+: "${MINIO_HEALTH_SEC:=60}"
 
 # ---- 排程模式（SCHEDULE_FILE + CARS_FILE）--------------------------------------
 # 用途：维度扫描这类"高维优先 + 窗底守卫"的固定排程，逐行指定 (车, 赛道, 轮次, recall, est分钟)。
@@ -206,7 +223,7 @@ else
 fi
 
 if [ "$WHAT" = list ]; then
-  echo "可用赛道: geo geo-enc gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk geonames-upsert codec both all ds"
+  echo "可用赛道: geo geo-enc geo-snap geo-snap-enc gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk geonames-upsert codec both all ds"
   echo "  单跑某个压缩变体：<赛道>-codec-<def|zstd|bc>[-sr]（如 geo-codec-zstd-sr、geo-codec-bc）"
   echo
   echo "赛道 → 定义目录 → 现在能不能跑："
@@ -229,6 +246,8 @@ fi
 case "$WHAT" in
   geo)  TRACKS=(geo);;
   geo-enc) TRACKS=(geo-enc);;        # geonames 加密变体（encrypted_store:true 走 --track-params）
+  geo-snap|geo-snap-enc) TRACKS=("$WHAT");;
+           # geonames 快照探针族（挑战=encrypted-store-snapshot；仓库三臂见 vm-bench-lib track_params）
   *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道；压缩档走 --track-params）
   gdef|gzstd|gbc) TRACKS=("$WHAT");; # 仍认的短名别名（= geo-codec-*）
   hnsw) TRACKS=(hnsw);;
@@ -558,6 +577,7 @@ CAMPAIGN_CLOSED=0; ABORT_REASON=''; ACTIVE_MONITOR=''; MONITOR_OK=1
 _close_on_exit() {
   local rc=$?
   if [ -n "$ACTIVE_MONITOR" ]; then monitor_stop "$ACTIVE_MONITOR" || true; fi
+  minio_stop   # 快照臂的 MinIO 不留后台进程（die/中止路径也要关）
   rm -f "$CAMP_DIR/RUNNER.pid" "$CAMP_DIR/RUNNER.meta"
   [ "$CAMPAIGN_CLOSED" = 1 ] && return 0
   [ -f "$PROG" ] || return 0
@@ -786,6 +806,11 @@ cpu_affinity_assert() { # <engine>
 }
 
 # ---------- track -------------------------------------------------------------
+track_challenge() { # <赛道id> → rally 挑战名（geo-snap 族走快照探针挑战，其余派生 full）
+  case "$1" in
+    geo-snap|geo-snap-enc) echo "encrypted-store-snapshot";;
+    *) echo "full";;
+  esac; }
 prepare_hnsw() {
   # hnsw 定义已定版 tracks/hnsw/（20261112 回灌，分片 params 化默认 3）；
   # 这里只补 git 收不了的产物：语料/查询集软链（TRACK_HNSW_BASE 指向二者所在目录）。
@@ -961,7 +986,7 @@ prepare_ds_tracks() { # <赛道名...>（只处理 ds-*；混跑时其他赛道�
 track_dims() { local b; b=$(track_base "$1"); case "$b" in ds-g1920) echo 1920;; ds-j2048) echo 2048;; ds-j1536) echo 1536;; ds-j1024) echo 1024;; ds-g960) echo 960;; ds-j768) echo 768;; ds-j512) echo 512;; *) return 1;; esac; }
 track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
   geonames-upsert) echo "${TIMEOUT_UPSERT_W:-$TIMEOUT_GEO_W}";;
-  geo) echo "$TIMEOUT_GEO_W";;
+  geo) case "$1" in geo-snap|geo-snap-enc) echo "$TIMEOUT_GEO_SNAP_W";; *) echo "$TIMEOUT_GEO_W";; esac;;
   hnsw) echo "$TIMEOUT_HNSW_W";;
   hv1024) echo "$TIMEOUT_HV1024_W";;
   hv1024x*) echo "$TIMEOUT_HV1024_W";;
@@ -1082,17 +1107,123 @@ print("ENV-SUMMARY.csv: %d 行 → %s" % (len(rows), out))
 PY
 }
 
+# ---------- 快照族 s3 后端（MinIO，单节点 bin 方式拉起在压测机上）----------------
+# VM 无共享盘 → 快照仓库统一走 MinIO（明文 s3 臂 / 加密+s3 委托臂同 bucket）。
+# root 账号即业务账号（MINIO_ROOT_USER/PASSWORD = S3_ACCESS/SECRET），免 mc 建户；
+# 建桶用内联 SigV4（纯 stdlib），不依赖 mc。
+# 判活用 pgrep -x minio：MinIO server 启动时会 re-exec，$! 指向的中间进程随即退出，
+# kill -0 $! 会立刻误判死亡（jdk3-20261118-014702 try1 实测：服务活得好好的被判死）。
+minio_alive() { pgrep -x minio >/dev/null 2>&1; }
+
+minio_ensure() { # 幂等拉起 MinIO 并确保 bucket 存在；失败非 0（调用方写 S3-BACKEND-FAIL）
+  local MINIO_REUSED=0
+  if minio_alive; then
+    log "  MinIO 已在运行，复用"
+    MINIO_REUSED=1
+  fi
+  if [ "$MINIO_REUSED" = 0 ]; then
+    [ -x "$MINIO_BIN" ] || { log "  缺 MinIO 二进制: $MINIO_BIN（放 /opt/raceway/bin/minio 或设 MINIO_BIN）"; return 1; }
+    mkdir -p "$MINIO_DATA_DIR" || { log "  不能创建 MinIO 数据目录: $MINIO_DATA_DIR"; return 1; }
+    log "  MinIO 启动: $MINIO_BIN server $MINIO_DATA_DIR --address $MINIO_ADDR"
+  # 9>&-：排程互斥 fd 不能被 MinIO 继承 —— 否则 runner 退出后锁被 minio 永久持有
+    MINIO_ROOT_USER="$S3_ACCESS_KEY" MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
+      nohup "$MINIO_BIN" server "$MINIO_DATA_DIR" --address "$MINIO_ADDR" \
+      >> "$CAMP_DIR/logs/minio-server.log" 2>&1 9>&- &
+    local i
+    for i in $(seq 1 "$MINIO_HEALTH_SEC"); do
+      curl -sf --max-time 3 "$S3_ENDPOINT/minio/health/live" >/dev/null 2>&1 && break
+      minio_alive || { log "  MinIO 启动失败（见 $CAMP_DIR/logs/minio-server.log）"; return 1; }
+      sleep 1
+    done
+  fi
+  curl -sf --max-time 3 "$S3_ENDPOINT/minio/health/live" >/dev/null 2>&1 \
+    || { log "  MinIO 健康检查超时（$MINIO_HEALTH_SEC s）：$S3_ENDPOINT"; return 1; }
+  # 建桶（幂等：409 BucketAlreadyOwnedByYou 也算存在）+ 清空 base_path 下的旧数据
+  #（加密仓库重注册不清 blob：上个 campaign 的残留会让新仓库实例读不懂旧加密 blob
+  #  → "Unknown blob"/"no readable index-N" → 重试风暴打爆 spool 预算（RESOURCE_LIMIT
+  #  EXCEEDED [repository] more than [4] uploads），快照 PARTIAL。每场 race 干净起跑。）
+  if ! python3 - "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" "$S3_BUCKET" "$S3_BASE_PATH" <<'PY' 2>&1 | sed 's/^/  /'; then
+import datetime, hashlib, hmac, sys, urllib.parse, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+endpoint, access, secret, bucket, base_path = sys.argv[1:6]
+host = endpoint.split('//', 1)[1].rstrip('/')
+now = datetime.datetime.now(datetime.timezone.utc)
+amzdate = now.strftime('%Y%m%dT%H%M%SZ')
+datestamp = now.strftime('%Y%m%d')
+scope = f'{datestamp}/us-east-1/s3/aws4_request'
+payload_hash = hashlib.sha256(b'').hexdigest()
+signed = 'host;x-amz-content-sha256;x-amz-date'
+def hs(key, msg): return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+def call(method, path, query=''):
+    creq = f'{method}\n{path}\n{query}\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amzdate}\n\n{signed}\n{payload_hash}'
+    sts = f'AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{hashlib.sha256(creq.encode()).hexdigest()}'
+    k = hs(hs(hs(hs(('AWS4' + secret).encode(), datestamp), 'us-east-1'), 's3'), 'aws4_request')
+    sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+    url = f'{endpoint}{path}' + (f'?{query}' if query else '')
+    req = urllib.request.Request(url, method=method, data=b'' if method != 'GET' else None,
+        headers={'Authorization': f'AWS4-HMAC-SHA256 Credential={access}/{scope}, '
+                 f'SignedHeaders={signed}, Signature={sig}',
+                 'x-amz-date': amzdate, 'x-amz-content-sha256': payload_hash})
+    try:
+        return urllib.request.urlopen(req, timeout=30).read()
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300]
+        if method == 'PUT' and e.code == 409:
+            return b''            # bucket 已存在
+        raise SystemExit(f'{method} {path} HTTP {e.code}: {body}')
+def q(params):
+    return urllib.parse.urlencode(sorted(params.items()), quote_via=urllib.parse.quote, safe='-_.~')
+call('PUT', f'/{bucket}')
+print(f'bucket {bucket}: ok')
+prefix = f'{base_path}/'
+query = q({'list-type': '2', 'prefix': prefix})
+keys = []
+while True:
+    body = call('GET', f'/{bucket}', query)
+    root = ET.fromstring(body)
+    ns = root.tag.split('}')[0].strip('{')
+    keys += [c.text for c in root.findall(f'{{{ns}}}Contents/{{{ns}}}Key')]
+    token = root.findtext(f'{{{ns}}}NextContinuationToken')
+    if not token:
+        break
+    query = q({'list-type': '2', 'prefix': prefix, 'continuation-token': token})
+n = 0
+for key in keys:
+    call('DELETE', f'/{bucket}/{urllib.parse.quote(key, safe="/~")}')
+    n += 1
+print(f'清理 {prefix}*: 删除 {n} 个旧 blob')
+PY
+    log "  s3 建桶/清理失败: $S3_BUCKET/$S3_BASE_PATH"
+    return 1
+  fi
+  log "  MinIO 就绪: $S3_ENDPOINT（bucket $S3_BUCKET）"
+  return 0; }
+
+minio_stop() { # 只关本 runner 二进制路径拉起的实例（pid 文件不可靠：server 会 re-exec）
+  if pgrep -f "^$MINIO_BIN server" >/dev/null 2>&1; then
+    pkill -f "^$MINIO_BIN server" 2>/dev/null || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      pgrep -f "^$MINIO_BIN server" >/dev/null 2>&1 || return 0
+      sleep 1
+    done
+    pkill -9 -f "^$MINIO_BIN server" 2>/dev/null || true
+  fi
+  return 0; }
+
 # ---------- 单场压测 ----------------------------------------------------------
-expected_tasks() { # <track dir> <params> <output>；用 Rally 自身的只读模板渲染，不下载、不连集群
-  "${RALLY_PYTHON:-python3}" - "$1" "$2" "$3" <<'PY' 9>&-
+expected_tasks() { # <track dir> <params> <output> [challenge=full]；用 Rally 自身的只读模板渲染，不下载、不连集群
+  "${RALLY_PYTHON:-python3}" - "$1" "$2" "$3" "${4:-full}" <<'PY' 9>&-
 import json, pathlib, sys
 from esrally.track.loader import render_template_from_file
 from esrally.utils.opts import to_dict
-root, params, output = sys.argv[1:]
+root, params, output, want_challenge = sys.argv[1:5]
 spec = json.loads(render_template_from_file(str(pathlib.Path(root) / 'track.json'), to_dict(params) if params else {}))
 operations = {o['name']: o for o in spec.get('operations', []) if isinstance(o, dict) and 'name' in o}
 challenges = spec.get('challenges') or [spec.get('challenge')]
-full = next(c for c in challenges if c and c.get('name') == 'full')
+full = next((c for c in challenges if c and c.get('name') == want_challenge), None)
+if full is None:
+    raise ValueError('挑战不存在: %s（可用: %s）' % (want_challenge, ', '.join(sorted(c['name'] for c in challenges if c))))
 expected = {'write': [], 'query': [], 'terminal': []}
 flat = []
 def visit(tasks):
@@ -1216,12 +1347,12 @@ sys.exit(0)
 PY
 }
 
-sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> —— 每场 race 一份 sidecar
+sidecar_capture() { # <fid> <w|q> <tk> <rnd> <att> <track_dir> <track_params> [challenge] —— 每场 race 一份 sidecar
   local fid="$1" ph="$2" tk="$3" rnd="$4" att="$5" tdir="$6" tpar="$7"
   local d="$FP_DIR/$fid-$ph" eng dir ip ch
   [ -n "$FP_DIR" ] && [ -d "$FP_DIR" ] || { log "  警告: 环境指纹未就绪，跳过 sidecar $fid-$ph"; return 0; }
   eng="$ENGINE_NAME"; dir=$(eng_dir_of "$eng")
-  case "$ph" in w) ch="write-only";; q) ch="query-only";; *) ch="full";; esac
+  case "$ph" in w) ch="write-only";; q) ch="query-only";; *) ch="${8:-full}";; esac
   mkdir -p "$d"
   cp -f "$FP_DIR/host.txt" "$FP_DIR/virsh.txt" "$CAMP_DIR/PACKAGES.txt" "$d/" 2>/dev/null
   mv "$d/PACKAGES.txt" "$d/packages.txt" 2>/dev/null
@@ -1389,11 +1520,18 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   [ "$att" -gt 1 ] && fid="${fid}-try${att}"
   local track; track=$(track_dir "$tk")
   local idx; idx=$(track_index "$tk")
+  local ch; ch=$(track_challenge "$tk")
   local rep="$CAMP_DIR/results/$fid-wq.md"
   local rlog="$CAMP_DIR/logs/$fid-wq.log"
   local HOSTS; HOSTS=$(target_hosts)
   local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
   local tp; tp=$(track_params "$tk")
+  # 快照探针族：快照名按 campaign+场次唯一 —— 同仓库同名快照二次 create 会被拒
+  # （delete-repository 预清场救不了：只注销仓库不清数据），轮次/重试/跨 campaign
+  # 都要分开（fid 已含轮次与重试，CAMP_ID 区分 campaign）。曾实测：上个 campaign
+  # 的 PARTIAL 快照会让下个 campaign 的 wait-for-snapshot-create 死循环（PARTIAL
+  # 既非 FAILED 也非 SUCCESS，rally 每 2s 重查一次直到 race 超时）。
+  case "$tk" in geo-snap*) tp="${tp:+$tp,}snapshot_name:snap-${CAMP_ID}-${fid}";; esac
   local t0=$(date +%s)
 
   PROGSTEP "===== [$seq] $fid 开始 ====="
@@ -1442,6 +1580,20 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
     fi
   fi
 
+  # 2c) 加密套件装机（wipe 前：插件/keystore/yml 落盘，wipe 冷重启后生效；幂等，已装跳过）。
+  #     geo-snap 族还要配 s3 客户端（endpoint + keystore 凭证），明文臂和加密委托臂共用。
+  if track_needs_enc "$tk"; then
+    local s3args=""
+    case "$tk" in geo-snap*) s3args="--s3-endpoint $S3_ENDPOINT --s3-access $S3_ACCESS_KEY --s3-secret $S3_SECRET_KEY";; esac
+    PROGSTEP "  加密套件装机开始（幂等；geo-snap 族含 s3 客户端）..."
+    if ! ( cd "$IBS_ROOT" && timeout 900 python3 -m ops.enc setup $s3args --yes ) \
+         > "$CAMP_DIR/logs/ibs-enc-$fid.log" 2>&1; then
+      echo "| $fid | ENC-SETUP-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+      PROGSTEP "[$seq] $fid ENC-SETUP-FAIL（见 logs/ibs-enc-$fid.log）"; return 1
+    fi
+    PROGSTEP "  加密套件装机完成"
+  fi
+
   # 3) 冷启动 + 集群卡点（含端口属主）+ 堆/核断言
   ibs_wipe2 "$eng" || { echo "| $fid | COLD-START-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid COLD-START-FAIL"; return 1; }
   ibs_ready_wait "$eng" "$CLUSTER_WAIT_SEC" "$CAMP_DIR/logs/ibs-ready-$fid.log" || {
@@ -1450,12 +1602,42 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   heap_assert "$eng" "$HEAP" "$(eng_dir_of "$eng")" "$(svc2_of "$eng")" || { echo "| $fid | HEAP-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid HEAP-ASSERT-FAIL（实际堆≠声明 heap:$HEAP）"; return 1; }
   cpu_affinity_assert "$eng" || { echo "| $fid | CPU-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-ASSERT-FAIL"; return 1; }
 
-  # 4) full race（单挑战：写段 → forcemerge(1) → 查段，一次调用跑完，phase=wq）
+  # 3b) 加密就绪门：全集群 encryption status 无 UNAVAILABLE/INCONSISTENT 且有 READY
+  #     （装机在 wipe 前落盘、冷启动才生效 —— 门禁不过说明 keyring/profile 没装对）
+  if track_needs_enc "$tk"; then
+    local encout
+    encout=$(curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 30 \
+      "https://${VM_IPS[0]}:$HTTP_PORT/_encryption/status" 2>/dev/null)
+    if [ -z "$encout" ] || ! printf '%s' "$encout" | python3 -c '
+import json, sys
+d = json.dumps(json.load(sys.stdin))
+if "UNAVAILABLE" in d or "INCONSISTENT" in d: sys.exit(1)
+if "READY" not in d: sys.exit(1)' > "$CAMP_DIR/logs/enc-gate-$fid.out" 2>&1; then
+      printf '%s' "$encout" > "$CAMP_DIR/logs/enc-status-$fid.json" 2>/dev/null
+      echo "| $fid | ENC-GATE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+      PROGSTEP "[$seq] $fid ENC-GATE-FAIL（logs/enc-gate-$fid.out）"; return 1
+    fi
+    printf '%s' "$encout" > "$CAMP_DIR/results/$fid-enc-status.json"
+    PROGSTEP "  加密就绪门通过（profiles READY）"
+  fi
+
+  # 3c) 快照族 s3 后端：MinIO 幂等拉起 + 建桶（VM 侧经网桥 IP 访问）
+  case "$tk" in
+    geo-snap*)
+      if ! minio_ensure; then
+        echo "| $fid | S3-BACKEND-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+        PROGSTEP "[$seq] $fid S3-BACKEND-FAIL（MinIO 拉起/建桶失败）"; return 1
+      fi;;
+  esac
+
+  # 4) race（phase=wq）：默认单挑战 full（写+合并+查）；快照探针族走 encrypted-store-snapshot
   #    merge 的完成等待由赛道自带（force-merge 同步 API / wait-until-merges-finish）。
-  derive_full_challenge "$track" || {
-    echo "| $fid | RACE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
-    PROGSTEP "[$seq] $fid full challenge 派生失败"; return 1; }
-  if ! expected_tasks "$track" "$tp" "$CAMP_DIR/results/$fid-expected-tasks.json"; then
+  if [ "$ch" = full ]; then
+    derive_full_challenge "$track" || {
+      echo "| $fid | RACE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+      PROGSTEP "[$seq] $fid full challenge 派生失败"; return 1; }
+  fi
+  if ! expected_tasks "$track" "$tp" "$CAMP_DIR/results/$fid-expected-tasks.json" "$ch"; then
     echo "| $fid | TASKS-FAIL | precheck=$PCTAG | - |" >> "$RACES"
     PROGSTEP "[$seq] $fid 预期任务清单生成失败"; return 1
   fi
@@ -1475,14 +1657,14 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   [ -n "$_comp" ] && cdc=",codec:$_comp"
   [ -n "$_sr" ] && cdc="$cdc,source_reuse:$_sr"
   timeout "$TMO" "$RALLY" race --pipeline=benchmark-only \
-    --target-hosts="$HOSTS" --track-path="$track" --challenge=full \
+    --target-hosts="$HOSTS" --track-path="$track" --challenge="$ch" \
     ${tp:+--track-params="$tp"} --client-options="$OPTS" \
     ${RALLY_TEST_MODE:+--test-mode} \
     --user-tags="campaign:$CAMP_ID,engine:$eng,engine_ver:$FULL_VER,car:$CAR_LABEL,track:$tk,round:$rnd,nnodes:$NNODES,heap:$HEAP,jdk:$CAR_LABEL${ctag}${cdc}" \
     --report-format=markdown --report-file="$rep" > "$rlog" 2>&1 9>&- || rc=$?
   [ $rc -ne 0 ] && PROGSTEP "[$seq] $fid full race FAILED rc=$rc（尾部: $(tail -2 "$rlog" | head -1)）"
   capture_race_json "$fid" wq "$rlog"
-  sidecar_capture "$fid" wq "$tk" "$rnd" "$att" "$track" "$tp"
+  sidecar_capture "$fid" wq "$tk" "$rnd" "$att" "$track" "$tp" "$ch"
   monitor_stop "$fid-wq"
 
   # 5) recall 探针（索引在线时打；召回塌了的性能数字不作数）
@@ -1744,6 +1926,9 @@ for _pi in "${!PLAN_FIDS[@]}"; do
 done
 
 env_summary_csv   # monitors/*-summary.txt → ENV-SUMMARY.csv（benchmark-result-env/benchmark-result-metric 可直接吃）
+if pgrep -x minio >/dev/null 2>&1; then
+  minio_stop && PROGSTEP "已停 MinIO（快照后端）"
+fi
 PROGSTEP "campaign 结束: $okcnt/$total 场有效。报告: $CAMP_DIR/results/；汇总: $RACES"
 CAMPAIGN_CLOSED=1   # 自然结束行已写，EXIT trap 不再补
 if [ -n "${NOTIFY_URL:-}" ]; then

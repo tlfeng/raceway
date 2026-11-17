@@ -94,6 +94,8 @@ FAIL_STATUSES = (
     'CPU-ASSERT-FAIL', 'METRIC-NULL-FAIL', 'WRITE-FAIL', 'QUERY-FAIL',
     'SEG-ASSERT-FAIL', 'ENV-FAIL', 'RACE-FAIL',
     'STOP-FAIL', 'CLEAN-FAIL', 'TASKS-FAIL',
+    # 加密/快照族（geo-enc / geo-snap）的场前失败：加密套件装机 / 加密就绪门 / s3 后端拉起
+    'ENC-SETUP-FAIL', 'ENC-GATE-FAIL', 'S3-BACKEND-FAIL',
 )
 SKIP_STATUSES = ('SKIP', 'DEADLINE-SKIP')
 

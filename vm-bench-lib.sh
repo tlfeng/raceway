@@ -122,9 +122,9 @@ track_canonical() { # <短 id> → 规范 id
   esac; }
 track_is_variant() { # <id> → 是变体则 0
   case "$(track_canonical "$1")" in *-codec-*) return 0;; *) return 1;; esac; }
-track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀；geo-enc 是 geonames 的加密变体）
+track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀；geo-enc/geo-snap 族是 geonames 的加密/快照变体）
   local c; c=$(track_canonical "$1")
-  case "$c" in geo-enc) echo geo;; *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
+  case "$c" in geo-enc|geo-snap|geo-snap-enc) echo geo;; *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
 track_dir() { # <赛道/变体 id> → 目录
   local c; c=$(track_canonical "$1")
   case "$c" in
@@ -142,7 +142,9 @@ track_dir() { # <赛道/变体 id> → 目录
       # 向量量化族四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
       # 量化档走 --track-params（vector_index_type）。
       echo "$ROOT/tracks/hv1024x";;
-    geo-enc) echo "$ROOT/tracks/geonames";;  # 加密变体走同一定版目录，encrypted_store 经 --track-params 选通
+    geo-enc|geo-snap|geo-snap-enc)
+      # 加密/快照变体走同一定版目录：encrypted_store 与快照仓库参数都经 --track-params 选通
+      echo "$ROOT/tracks/geonames";;
     geo) echo "$ROOT/tracks/geonames";;
     hnsw) echo "$ROOT/tracks/hnsw";;
     hv1024) echo "$ROOT/tracks/hv1024";;
@@ -186,7 +188,7 @@ tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要准备 hnsw 语料/查询
 # run-bench.sh list 与 doctor.sh 共用这一份 —— 两处各写一份映射表 = 迟早漂移。
 track_availability_table() {
   local _t _d
-  for _t in geo geonames-upsert hnsw hv1024 nested \
+  for _t in geo geo-enc geo-snap geo-snap-enc geonames-upsert hnsw hv1024 nested \
             hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr \
             hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk; do
     _d=$(track_dir "$_t" 2>/dev/null || echo "");   # 变体与基座同目录（压缩/量化走 params）
@@ -215,10 +217,20 @@ track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
   esac; }
 track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
   local comp sr
+  # 加密/快照族只 Easysearch 能跑（ES 不认 index.encryption.profile / type=encrypted 仓库）
+  case "$(track_canonical "$1")" in
+    geo-enc|geo-snap|geo-snap-enc) echo "easysearch"; return 0;;
+  esac
   track_is_variant "$1" || { echo ""; return 0; }
   comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
   if [ "$sr" = "true" ] || [ "$comp" = "ZSTD" ]; then echo "easysearch"; else echo ""; fi
 }
+
+track_needs_enc() { # <id> → 0=该变体跑前须装加密套件（三插件+keyring；geo-enc / geo-snap 族）
+  case "$(track_canonical "$1")" in
+    geo-enc|geo-snap|geo-snap-enc) return 0;;
+  esac
+  return 1; }
 
 track_params() { # <id> → esrally --track-params（空 = 不传）
   # 分片口径：只有"模板类基座"需要传 —— geonames / nested / hv1024 的 index.json
@@ -242,6 +254,13 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   # 加密变体：index.json 的 encrypted_store 条件块写入 index.store.type=encrypted +
   # index.encryption.profile=index（只 Easysearch 认；写 false 会被 Jinja 当真值，必须不传才关）。
   [ "$1" = "geo-enc" ] && p="${p:+$p,}encrypted_store:true"
+  # 快照探针族：仓库参数走 encrypted-store-snapshot.json 的 p_repo_settings 三臂链
+  #（明文 s3 / 加密+s3 委托 / 默认 fs）。桶与 base_path 必须从旋钮显式传，别靠模板默认 ——
+  # 桶名在 runner 侧是 S3_BUCKET 旋钮，两边漂了快照就落到没人清理的桶里。
+  case "$1" in
+    geo-snap)      p="${p:+$p,}snapshot_repo_type:s3,snapshot_repo_bucket:${S3_BUCKET:-raceway-snap},snapshot_repo_base_path:${S3_BASE_PATH:-geonames}";;
+    geo-snap-enc)  p="${p:+$p,}snapshot_repo_delegate:s3,snapshot_repo_bucket:${S3_BUCKET:-raceway-snap},snapshot_repo_base_path:${S3_BASE_PATH:-geonames},snapshot_repo_profile:snapshot";;
+  esac
   local comp sr
   comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
   [ -n "$comp" ] && p="${p:+$p,}index_codec:$comp"
@@ -260,6 +279,16 @@ track_assert_storage_params() { # <赛道id>
   local id="$1" dir idx comp sr q
   dir=$(track_dir "$id"); idx="$dir/index.json"
   comp=$(track_compression "$id"); sr=$(track_source_reuse "$id"); q=$(track_quant "$id")
+  # 加密/快照族的守卫独立于压缩/量化（这几条变体不带压缩参数，不能被下面的早退吞掉）：
+  if [ "$id" = "geo-enc" ] && ! grep -q 'encrypted_store' "$idx"; then
+    die "$id: $idx 没有 encrypted_store 条件块 —— 加密变体会静默跑成明文基座"
+  fi
+  case "$id" in
+    geo-snap|geo-snap-enc)
+      local ch="$dir/challenges/encrypted-store-snapshot.json"
+      [ -f "$ch" ] || die "$id: 缺挑战文件 $ch（仓库没同步全 tracks/）"
+      grep -q 'p_repo_settings' "$ch" || die "$id: $ch 没有 p_repo_settings 三臂链 —— 仓库参数会静默失效";;
+  esac
   if [ -z "$comp" ] && [ "$sr" != "true" ] && [ -z "$q" ]; then return 0; fi
   [ -f "$idx" ] || die "赛道缺 index.json: $idx（$id）"
   if [ -n "$comp" ] && ! grep -q 'index_codec' "$idx"; then
@@ -267,9 +296,6 @@ track_assert_storage_params() { # <赛道id>
   fi
   if [ "$sr" = "true" ] && ! grep -q 'source_reuse' "$idx"; then
     die "$id: $idx 没有 source_reuse 条件块 —— source_reuse 会静默失效"
-  fi
-  if [ "$id" = "geo-enc" ] && ! grep -q 'encrypted_store' "$idx"; then
-    die "$id: $idx 没有 encrypted_store 条件块 —— 加密变体会静默跑成明文基座"
   fi
   if [ -n "$q" ] && ! grep -q 'vector_index_type' "$idx"; then
     die "$id: $idx 没有 vector_index_type 条件块 —— 量化档会静默失效（该臂跑成 hnsw 基座）"

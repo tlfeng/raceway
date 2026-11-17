@@ -536,7 +536,7 @@ class TestStatusVocabulary(unittest.TestCase):
     def test_every_status_runner_writes_is_known(self):
         with open(os.path.join(ROOT, 'run-bench.sh'), encoding='utf-8') as f:
             text = f.read()
-        written = set(re.findall(r'echo "\| \$fid \| ([A-Z][A-Z-]*) \|', text))
+        written = set(re.findall(r'echo "\| \$fid \| ([A-Z0-9][A-Z0-9-]*) \|', text))
         self.assertTrue(written, '没抓到任何状态写入 —— runner 的写法变了，请同步本正则')
         unknown = written - set(Q.KNOWN_STATUS)
         self.assertEqual(unknown, set(),
@@ -551,7 +551,7 @@ class TestStatusVocabulary(unittest.TestCase):
             text = f.read()
         m = re.search(r'FAIL_STATUSES = \((.*?)\)', text, re.S)
         self.assertIsNotNone(m, 'bench-history.FAIL_STATUSES 不见了')
-        hist = set(re.findall(r"'([A-Z][A-Z-]*)'", m.group(1)))
+        hist = set(re.findall(r"'([A-Z0-9][A-Z0-9-]*)'", m.group(1)))
         self.assertEqual(hist, set(Q.STATUS_FAILS),
                          'bench-history.FAIL_STATUSES 与 bench-queue.STATUS_FAILS 漂移了')
 

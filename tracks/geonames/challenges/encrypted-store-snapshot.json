@@ -1,6 +1,6 @@
 {
   "name": "encrypted-store-snapshot",
-  "description": "Easysearch 索引加密 + 快照加密全链路探针：写段烘入 index.store.type=encrypted / index.encryption.profile=index（与 encrypted-store 挑战逐项同序同预算），随后在**加密仓库**上走完整快照闭环 —— delete-snapshot-repository 预清场（忽略 404，幂等重跑）→ 注册 type=encrypted 仓库（委托 fs，location 走 --track-params）→ create-snapshot（异步）→ wait-for-snapshot-create（快照字节数/吞吐）→ 删原索引 → restore（异步）→ wait-for-recovery（恢复字节数/吞吐，恢复出的索引即原 geonames）→ 健康检查 → 查段（与 query-only 逐项同序同预算，跑在**快照恢复出的索引**上）。跑前集群须装好索引加密与 repository-encrypted（快照加密）插件并在全部节点导入 Keystore 主密钥；仓库 location 为数据节点本地路径。仅 Easysearch 可跑（ES 不认 index.encryption.profile 与 type=encrypted 仓库）。",
+  "description": "Easysearch 索引加密 + 快照加密全链路探针：写段烘入 index.store.type=encrypted / index.encryption.profile=index（与 encrypted-store 挑战逐项同序同预算），随后走完整快照闭环 —— 注册仓库（p_repo_settings 三臂：snapshot_repo_type:s3 = 原生明文 s3 仓库；snapshot_repo_delegate:s3 = type=encrypted 仓库 + s3 委托；默认 = encrypted 仓库 + fs 委托，location 走 --track-params；PUT 覆盖语义，重跑幂等）→ create-snapshot（异步，快照名须按场次唯一）→ wait-for-snapshot-create（快照字节数/吞吐）→ 删原索引 → restore（异步）→ wait-for-recovery（恢复字节数/吞吐，恢复出的索引即原 geonames）→ 健康检查 → 查段（与 query-only 逐项同序同预算，跑在**快照恢复出的索引**上）。⚠ 不用 delete-snapshot-repository 预清场：rally 2.13 的 runner 与环境里的 elasticsearch-py 8.6.1 不兼容（delete_repository(repository=…) TypeError）。跑前集群须装好索引加密与 repository-encrypted（快照加密）插件并在全部节点导入 Keystore 主密钥；加密臂的快照仓库加密 profile 可经同名参数显式指定（不传 = 套件默认 profile）。s3 臂需集群配好 s3 客户端（endpoint/path_style_access/keystore 凭证）且后端（如 MinIO）可达、bucket 已存在。仅 Easysearch 可跑（ES 不认 index.encryption.profile 与 type=encrypted 仓库）。",
   "schedule": [
         {
           "operation": "delete-index"
@@ -58,27 +58,25 @@
           }
         },
         {
-          "name": "delete-snapshot-repository",
-          "operation": {
-            "operation-type": "delete-snapshot-repository",
-            "repository": "{{snapshot_repository | default('raceway-encrypted')}}"
-          }
-        },
-        {
           "name": "create-repository",
           "operation": {
             "operation-type": "create-snapshot-repository",
             "repository": "{{snapshot_repository | default('raceway-encrypted')}}",
-            "body": {
-              "type": "encrypted",
-              "settings": {
-                "delegate_type": "{{snapshot_repo_delegate | default('fs')}}",
-                "location": "{{snapshot_repo_location | default('/tmp/raceway-snapshot-repo')}}"
-                {%- if snapshot_repo_profile is defined and snapshot_repo_profile %}
-                ,"encryption.profile": "{{snapshot_repo_profile}}"
-                {%- endif %}
+            "body": {%- set p_repo_type = 'encrypted' -%}
+            {%- set p_repo_settings = {"delegate_type": snapshot_repo_delegate | default('fs')} -%}
+            {%- if snapshot_repo_type is defined and snapshot_repo_type == 's3' -%}
+            {%- set p_repo_type = 's3' -%}
+            {%- set p_repo_settings = {"bucket": snapshot_repo_bucket | default('raceway-snap'), "base_path": snapshot_repo_base_path | default('geonames'), "path_style_access": true} -%}
+            {%- elif snapshot_repo_delegate is defined and snapshot_repo_delegate == 's3' -%}
+            {%- set _ = p_repo_settings.update({"bucket": snapshot_repo_bucket | default('raceway-snap'), "base_path": snapshot_repo_base_path | default('geonames'), "path_style_access": true}) -%}
+            {%- else -%}
+            {%- set _ = p_repo_settings.update({"location": snapshot_repo_location | default('/tmp/raceway-snapshot-repo')}) -%}
+            {%- endif -%}
+            {%- if p_repo_type != 's3' and snapshot_repo_profile is defined and snapshot_repo_profile %}{%- set _ = p_repo_settings.update({"encryption.profile": snapshot_repo_profile}) -%}{%- endif -%}
+              {
+                "type": "{{p_repo_type}}",
+                "settings": {{ p_repo_settings | tojson }}
               }
-            }
           }
         },
         {
@@ -100,6 +98,7 @@
           "operation": {
             "operation-type": "wait-for-snapshot-create",
             "repository": "{{snapshot_repository | default('raceway-encrypted')}}",
+            "snapshot": "{{snapshot_name | default('geonames-enc')}}",
             "completion-recheck-wait-period": 2
           }
         },
