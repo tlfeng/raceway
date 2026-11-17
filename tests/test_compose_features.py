@@ -366,5 +366,100 @@ class ComposeRefreshTest(unittest.TestCase):
         self.assertIn('geo-codec-zstd-sr', C.TRACK_CATALOG)
 
 
+class AssetsTests(unittest.TestCase):
+    """引擎与JDK 盘点（api_assets）：包路径判定与 runner resolve_engine 的 die 点一致，
+    缺包标红；ssh 模式整页不可用。"""
+
+    CARS = """# 注释行
+ez3015 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 CAR_LABEL=ez3015
+es819 ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819
+os24 ENGINE_NAME=opensearch ENGINE_VERSION=2.4.0 CAR_LABEL=os24
+kona25 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt/jdks/tencentkona-25.0.4 CAR_LABEL=kona25
+jdk26 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt/jdks/jdk-26 CAR_LABEL=jdk26
+"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.st = make_state(self.root)
+        # vm-bench.env：PKG_DIR 走 $ROOT 展开（真实部署的写法），附带一个 BUNDLE_* 引用
+        with open(os.path.join(self.root, 'vm-bench.env'), 'w', encoding='utf-8') as f:
+            f.write('PKG_DIR=$ROOT/pkg\n'
+                    'BUNDLE_EZ3015=$ROOT/pkg/easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz\n')
+        self.pkg = os.path.join(self.root, 'pkg')
+        os.makedirs(self.pkg)
+        self.st.cars = tuple(C.parse_cars(self.CARS))
+
+    def by_car(self, payload, name):
+        return next(d for d in payload['deps'] if d['car'] == name)
+
+    def test_ssh_mode_unavailable(self):
+        self.st.args.ssh = 'esrally'
+        code, p = C.api_assets(self.st)
+        self.assertEqual(code, 200)
+        self.assertFalse(p['available'])
+        self.assertTrue(p['reason'])
+
+    def test_easysearch_pkg_path_and_stat(self):
+        # 包已就位：路径与 resolve_engine 的 die 点一致，size/exists 来自 stat
+        pkg = os.path.join(self.pkg, 'easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz')
+        with open(pkg, 'wb') as f:
+            f.write(b'\0' * 1024)
+        code, p = C.api_assets(self.st)
+        self.assertEqual(code, 200)
+        d = self.by_car(p, 'ez3015')
+        self.assertEqual(d['pkg'], pkg)
+        self.assertTrue(d['pkg_stat']['exists'])
+        self.assertEqual(d['pkg_stat']['size'], 1024)
+        # BUNDLE_EZ3015 指向同一文件：引用 stat 同步就位
+        self.assertTrue(p['bundles'][0]['exists'])
+        # PKG_DIR 全清单收录该文件（目录不算）
+        names = [x['name'] for x in p['pkg_files']]
+        self.assertIn('easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz', names)
+
+    def test_missing_pkg_flagged_not_present(self):
+        # 包缺失 = 起跑必 die：这里 exists=False 让前端标红
+        code, p = C.api_assets(self.st)
+        d = self.by_car(p, 'ez3015')
+        self.assertFalse(d['pkg_stat']['exists'])
+        self.assertFalse(p['bundles'][0]['exists'])
+
+    def test_engine_pkg_naming_per_engine(self):
+        code, p = C.api_assets(self.st)
+        root = self.pkg
+        self.assertEqual(self.by_car(p, 'es819')['pkg'],
+                         os.path.join(root, 'elasticsearch-8.19.23-linux-x86_64.tar.gz'))
+        self.assertEqual(self.by_car(p, 'os24')['pkg'],
+                         os.path.join(root, 'opensearch-2.4.0-linux-x64.tar.gz'))
+
+    def test_jdk_hardcoded_mapping(self):
+        # /jdk-26 结尾 → PKG_DIR/openjdk-26_linux-x64_bin.tar.gz（硬编码映射）
+        jdkpkg = os.path.join(self.pkg, 'openjdk-26_linux-x64_bin.tar.gz')
+        with open(jdkpkg, 'wb') as f:
+            f.write(b'\0' * 512)
+        code, p = C.api_assets(self.st)
+        d = self.by_car(p, 'jdk26')
+        self.assertTrue(d['jdk_mapped'])
+        self.assertEqual(d['jdk_pkg'], jdkpkg)
+        self.assertTrue(d['jdk_stat']['exists'])
+        # 非 jdk-* 目录（如 TencentKona）：jdk_pkg 就是目录本身，只报告不映射
+        d = self.by_car(p, 'kona25')
+        self.assertEqual(d['jdk_pkg'], '/opt/jdks/tencentkona-25.0.4')
+        self.assertFalse(d['jdk_stat']['exists'])
+
+    def test_bundle_without_jdk_has_no_jdk_stat(self):
+        # 自带 JDK 的车：jdk_pkg=None / jdk_mapped=False，且不产出 jdk_stat（前端据此省列）
+        code, p = C.api_assets(self.st)
+        d = self.by_car(p, 'ez3015')
+        self.assertIsNone(d['jdk_pkg'])
+        self.assertFalse(d['jdk_mapped'])
+        self.assertNotIn('jdk_stat', d)
+
+    def test_route_returns_json_tuple(self):
+        code, ctype, body, cache = C._route_get_core(self.st, '/api/assets', {})
+        self.assertEqual(code, 200)
+        self.assertEqual(ctype, 'application/json')
+        self.assertTrue(json.loads(body)['available'])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
