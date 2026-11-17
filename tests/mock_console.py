@@ -163,6 +163,24 @@ class H(BaseHTTPRequestHandler):
                                         {'name': 'agent-patched-1.18.15.jar', 'size': 1048576, 'mtime': 1740000000, 'exists': True}],
                                     'bundles': [{'key': 'BUNDLE_EZ3015', 'path': '/opt/raceway/pkg/easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz',
                                                  'exists': True, 'size': 734003200, 'mtime': 1762500000}]})
+        if p == '/api/cars-file':
+            content = ('# raceway 车定义\njdk25 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 '
+                       'ENGINE_BUILD=3015 CAR_LABEL=jdk25\n'
+                       'es819 ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819\n')
+            import hashlib as _h
+            return self._json(200, {'available': True, 'path': '/opt/raceway/schedules/dimsweep-cars.conf',
+                                    'content': content,
+                                    'sha256': _h.sha256(content.encode()).hexdigest(),
+                                    'cars': [{'name': 'jdk25', 'label': 'jdk25', 'engine': 'easysearch',
+                                              'build': '3015', 'jdk_dir': ''},
+                                             {'name': 'es819', 'label': 'es819', 'engine': 'elasticsearch',
+                                              'build': '', 'jdk_dir': ''}],
+                                    'diagnostics': []})
+        if p == '/api/cars-write':
+            import hashlib as _h
+            return self._json(200, {'path': '/opt/raceway/schedules/dimsweep-cars.conf',
+                                    'sha256': _h.sha256(b'written').hexdigest(), 'unchanged': False,
+                                    'cars': [], 'problems': []})
         if p == '/api/cluster-status':
             return self._json(200, {'available': True, 'driver': 'esrally-185',
                                     'engine': ['2.5.0-3015'], 'up': False,

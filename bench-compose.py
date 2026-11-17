@@ -41,11 +41,13 @@ import importlib
 import secrets
 import json
 import os
+import pathlib
 import posixpath
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -164,7 +166,7 @@ def validate_cars(cars):
 
     - CAR_LABEL 必须唯一（重复 → 场次名冲突，runner 侧非排程模式同规则）
     - ENGINE_NAME 必填
-    - elasticsearch 车不带 JDK_DIR（用户自管 JDK 只为 easysearch 车接线）
+    - elasticsearch / opensearch 车不带 JDK_DIR（两引擎均用自带 JDK，runner 会 die）
     """
     problems = []
     seen = {}
@@ -184,9 +186,131 @@ def validate_cars(cars):
             seen[a.label] = a.name
         if not a.engine:
             problems.append(('error', '车 %s 缺 ENGINE_NAME' % a.name))
-        if a.engine == 'elasticsearch' and a.jdk_dir:
-            problems.append(('error', 'es 车 %s 不应带 JDK_DIR（用户自管 JDK 只为 easysearch 车接线）' % a.name))
+        if a.engine in ('elasticsearch', 'opensearch') and a.jdk_dir:
+            problems.append(('error', '%s 车 %s 不应带 JDK_DIR（该引擎用自带 JDK，runner 会拒绝）'
+                             % (a.engine, a.name)))
     return problems
+
+
+# 车定义配置键白名单 = runner apply_config 的键集（ARM_LABEL 是 CAR_LABEL 旧别名）
+CAR_KEYS = ('ENGINE_NAME', 'ENGINE_VERSION', 'ENGINE_BUILD', 'JDK_DIR',
+            'CAR_LABEL', 'JDK_WANT', 'ARM_LABEL')
+CAR_ENGINES = ('easysearch', 'elasticsearch', 'opensearch')
+
+
+def parse_cars_strict(text, pkg_dir=None):
+    """runner 同口径的车定义严格校验（供控制台编辑器使用）。
+
+    逐行检查 run-bench.sh apply_config/resolve_engine 会 die 的每一类问题，
+    返回 (cars, diagnostics)；diagnostics = [{line, severity, message}]，
+    line 从 1 起。pkg_dir 给定时额外检查引擎包是否在位（缺失为 warning，
+    不阻止保存 —— 允许先存草稿再补包）。
+    """
+    cars, diagnostics = [], []
+    seen_names, seen_labels = set(), {}
+
+    def bad(lineno, msg):
+        diagnostics.append({'line': lineno, 'severity': 'error', 'message': msg})
+
+    def warn(lineno, msg):
+        diagnostics.append({'line': lineno, 'severity': 'warning', 'message': msg})
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '\t' in raw or '\r' in raw or '\n' in raw.split('#', 1)[0]:
+            bad(lineno, '配置行不能含制表符/换行（runner 会拒绝）')
+        parts = line.split(None, 1)
+        name = parts[0]
+        config = parts[1] if len(parts) > 1 else ''
+        kv, unknown = {}, []
+        for tok in config.split():
+            if '=' not in tok:
+                bad(lineno, '车 %s 配置含裸 token %r（必须 KEY=VALUE，runner 会拒绝）' % (name, tok))
+                continue
+            k, _, v = tok.partition('=')
+            if k in kv:
+                bad(lineno, '车 %s 配置键重复: %s' % (name, k))
+            kv[k] = v
+            if k not in CAR_KEYS:
+                unknown.append(k)
+        if unknown:
+            bad(lineno, '车 %s 配置含未知键: %s（允许: %s；ARM_LABEL 是 CAR_LABEL 旧别名）'
+                % (name, '、'.join(unknown), ' '.join(CAR_KEYS)))
+        if 'ARM_LABEL' in kv and 'CAR_LABEL' not in kv:
+            kv['CAR_LABEL'] = kv['ARM_LABEL']   # runner: ARM_LABEL 落到 CAR_LABEL
+        engine = (kv.get('ENGINE_NAME') or '').lower()
+        label = kv.get('CAR_LABEL', name)
+        jdk = kv.get('JDK_DIR', '')
+        ver, build = kv.get('ENGINE_VERSION', ''), kv.get('ENGINE_BUILD', '')
+        try:
+            safe_name(name, '车名')
+        except ValueError as e:
+            bad(lineno, str(e))
+        if name in seen_names:
+            bad(lineno, '车名重复: %s' % name)
+        seen_names.add(name)
+        try:
+            safe_name(label, 'CAR_LABEL')
+        except ValueError as e:
+            bad(lineno, str(e))
+        if label in seen_labels:
+            bad(lineno, 'CAR_LABEL 重复: %s（%s 与 %s，runner 会拒绝）'
+                % (label, seen_labels[label], name))
+        else:
+            seen_labels[label] = name
+        if not engine:
+            bad(lineno, '车 %s 缺 ENGINE_NAME' % name)
+        elif engine not in CAR_ENGINES:
+            bad(lineno, '车 %s 未知 ENGINE_NAME: %s（可选: %s）' % (name, engine, ' | '.join(CAR_ENGINES)))
+        if engine in ('elasticsearch', 'opensearch'):
+            if build:
+                bad(lineno, '%s 车 %s 不应带 ENGINE_BUILD（该引擎没有 build 号，runner 会拒绝）' % (engine, name))
+            if jdk:
+                bad(lineno, '%s 车 %s 不应带 JDK_DIR（该引擎用自带 JDK，runner 会拒绝）' % (engine, name))
+        if engine == 'easysearch' and not ver:
+            warn(lineno, '车 %s 缺 ENGINE_VERSION —— runner 不会通过（缺安装包路径），请显式写出' % name)
+        elif engine == 'easysearch' and not build:
+            warn(lineno, '车 %s 缺 ENGINE_BUILD —— runner 默认按 3015 解析，建议显式写出' % name)
+        for key, val in (('ENGINE_VERSION', ver), ('ENGINE_BUILD', build)):
+            if val and re.search(r'[^A-Za-z0-9._:-]', val):
+                bad(lineno, '车 %s 的 %s 含非法字符（runner 只允许 A-Za-z0-9._:-）' % (name, key))
+        for key, val in (('JDK_DIR', jdk), ):
+            if val and (not val.startswith('/') or '..' in val.split('/')):
+                bad(lineno, '车 %s 的 %s 必须是安全绝对路径（runner safe_abs_path 会拒绝）' % (name, key))
+        if kv.get('JDK_WANT') and re.search(r'[^A-Za-z0-9._+\|-]', kv['JDK_WANT']):
+            bad(lineno, '车 %s 的 JDK_WANT 含非法字符（runner 会拒绝）' % name)
+        cars.append(Car(name=name, label=label, engine=engine, build=build,
+                        jdk_dir=jdk, config=config))
+
+    # 引擎包在位检查（warning：允许先存草稿再补包；runner 起跑时会 die）
+    if pkg_dir:
+        seen_pkg = set()
+        for car in cars:
+            ver = None
+            for tok in car.config.split():
+                k, _, v = tok.partition('=')
+                if k == 'ENGINE_VERSION':
+                    ver = v
+            build = car.build or ('3015' if car.engine == 'easysearch' else '')
+            if car.engine == 'easysearch' and ver:
+                pkg = os.path.join(pkg_dir, 'easysearch-%s-%s-linux-amd64-bundle.tar.gz' % (ver, build))
+            elif car.engine == 'elasticsearch' and ver:
+                pkg = os.path.join(pkg_dir, 'elasticsearch-%s-linux-x86_64.tar.gz' % ver)
+            elif car.engine == 'opensearch' and ver:
+                pkg = os.path.join(pkg_dir, 'opensearch-%s-linux-x64.tar.gz' % ver)
+            else:
+                continue
+            if pkg in seen_pkg:
+                continue
+            seen_pkg.add(pkg)
+            try:
+                if not os.path.getsize(pkg):
+                    warn(0, '引擎包存在但为空文件: %s' % pkg)
+            except OSError:
+                warn(0, '引擎包缺失（runner 起跑会报「缺安装包」）: %s' % pkg)
+    return cars, diagnostics
 
 
 def interleave(cars, tracks, rounds):
@@ -676,6 +800,40 @@ try:
                     os.unlink(tmp)
                 raise
             reply = {'path': p['path'], 'sha256': digest, 'unchanged': False}
+
+    elif mode == 'cars-write':
+        # 控制台车定义编辑器的远端写入：与 track-write 同一套原子写 + expect 语义。
+        # 路径只认 runner 启动时使用的 CARS_FILE（由调用方传入），不收任意路径。
+        fp = pathlib.Path(p['path'])
+        if fp.is_symlink() or not fp.is_absolute():
+            fail('车定义路径必须是绝对路径且不能是符号链接')
+        if fp.exists() and not fp.is_file():
+            fail('目标不是普通文件')
+        content = p['content']
+        if not isinstance(content, str):
+            fail('文件内容必须是文本')
+        old_bytes = fp.read_bytes() if fp.is_file() else None
+        new_digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        old_digest = (hashlib.sha256(old_bytes).hexdigest() if old_bytes is not None else None)
+        if old_digest == new_digest:
+            reply = {'path': p['path'], 'sha256': new_digest, 'unchanged': True}
+        else:
+            expect = p.get('expect')
+            if expect is not None and expect != old_digest:
+                fail('车定义已被他人修改，请刷新后重试（期望摘要不匹配）')
+            fd, tmp = tempfile.mkstemp(prefix='.cars-', dir=str(fp.parent))
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, fp)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+            reply = {'path': p['path'], 'sha256': new_digest, 'unchanged': False}
 
     elif mode == 'track-delete':
         fp = safe_track_path(root, p['path'])
@@ -1268,6 +1426,88 @@ def api_logtail(st, cid, n):
     return 200, {'lines': st.src.tail(cid, 'PROGRESS.txt', n)}
 
 
+def api_cars_file(st):
+    """车定义只读盘点：原文 + sha256 + runner 同口径诊断（供控制台编辑器）。"""
+    try:
+        content = read_cars_file(st.args)
+    except (OSError, SystemExit) as e:
+        return 200, {'available': False, 'path': st.args.cars_file,
+                     'reason': '车定义读取失败: %s' % e}
+    pkg_dir = None
+    try:
+        with open(os.path.join(st.args.root, 'vm-bench.env'), encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith('PKG_DIR='):
+                    pkg_dir = s.partition('=')[2].strip().strip('"').strip("'")
+                    pkg_dir = pkg_dir.replace('${ROOT}', st.args.root).replace('$ROOT', st.args.root)
+                    break
+    except OSError:
+        pass
+    cars, diagnostics = parse_cars_strict(content, pkg_dir=pkg_dir)
+    return 200, {'available': True, 'path': st.args.cars_file,
+                 'content': content,
+                 'sha256': hashlib.sha256(content.encode('utf-8')).hexdigest(),
+                 'cars': [{'name': c.name, 'label': c.label, 'engine': c.engine,
+                           'build': c.build, 'jdk_dir': c.jdk_dir} for c in cars],
+                 'diagnostics': diagnostics}
+
+
+def api_cars_write(st, body):
+    """车定义保存：runner 同口径严格校验 → 原子写（本地或经 _REMOTE）→ reload_cars。
+
+    expect = 打开编辑器时的 sha256；不匹配返回 409（已被他人修改）。
+    校验有 error 直接 400 —— 不落盘 runner 必拒的文件。
+    """
+    content = body.get('content')
+    if not isinstance(content, str):
+        raise ValueError('文件内容必须是文本')
+    expect = body.get('expect')
+    if expect is not None and not re.fullmatch(r'[0-9a-f]{64}', expect):
+        raise ValueError('expect 必须是 64 位 sha256')
+    cars, diagnostics = parse_cars_strict(content)
+    errors = [d for d in diagnostics if d['severity'] == 'error']
+    if errors:
+        return 400, {'error': '车定义有 %d 处 runner 会拒绝的问题，未保存' % len(errors),
+                     'diagnostics': diagnostics}
+    path = st.args.cars_file
+    digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    with st.lock:
+        if st.args.ssh:
+            reply = remote_operation(st.args, 'cars-write',
+                                     {'path': path, 'content': content, 'expect': expect})
+        else:
+            fp = pathlib.Path(path)
+            if fp.is_symlink() or not fp.is_absolute():
+                raise ValueError('车定义路径必须是绝对路径且不能是符号链接')
+            old_bytes = fp.read_bytes() if fp.is_file() else None
+            old_digest = (hashlib.sha256(old_bytes).hexdigest() if old_bytes is not None else None)
+            if old_digest == digest:
+                reply = {'path': path, 'sha256': digest, 'unchanged': True}
+            else:
+                if expect is not None and expect != old_digest:
+                    return 409, {'error': '车定义已被他人修改，请刷新编辑器后重试（期望摘要不匹配）'}
+                fd, tmp = tempfile.mkstemp(prefix='.cars-', dir=str(fp.parent))
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+                        f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.chmod(tmp, 0o644)
+                    os.replace(tmp, fp)
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+                reply = {'path': path, 'sha256': digest, 'unchanged': False}
+        st.reload_cars()
+    return 200, {'path': path, 'sha256': reply.get('sha256', digest),
+                 'unchanged': reply.get('unchanged', False),
+                 'cars': [{'name': c.name, 'label': c.label, 'engine': c.engine,
+                           'build': c.build, 'jdk_dir': c.jdk_dir} for c in st.cars],
+                 'problems': st.problems}
+
+
 def api_assets(st):
     """引擎安装包与 JDK 的只读盘点，并关联车定义的起跑依赖。
 
@@ -1283,6 +1523,7 @@ def api_assets(st):
         return 200, {'available': False, 'reason': 'ssh 模式下包盘点在压测机本机控制台查看'}
     envf = os.path.join(st.args.root, 'vm-bench.env')
     pkg_dir, bundles = None, []
+    config_warning = None
     try:
         with open(envf, encoding='utf-8') as f:
             for line in f:
@@ -1291,14 +1532,19 @@ def api_assets(st):
                     continue
                 k, _, v = s.partition('=')
                 k = k.strip()
-                v = v.replace('$ROOT', st.args.root).strip().strip('"').strip("'")
+                v = v.split(' #', 1)[0].strip().strip('"').strip("'")
+                v = v.replace('${ROOT}', st.args.root).replace('$ROOT', st.args.root)
+                if pkg_dir:
+                    v = v.replace('${PKG_DIR}', pkg_dir).replace('$PKG_DIR', pkg_dir)
                 if k == 'PKG_DIR':
                     pkg_dir = v
                 elif k.startswith('BUNDLE_'):
                     bundles.append({'key': k, 'path': v})
     except OSError:
-        pass
+        config_warning = '无法读取 vm-bench.env，包路径可能与实际配置不同'
     pkg_dir = pkg_dir or os.path.join(st.args.root, 'pkg')
+    if '$' in pkg_dir or not os.path.isabs(pkg_dir):
+        return 200, {'available': False, 'reason': '无法安全解析 PKG_DIR；请检查 vm-bench.env'}
 
     def stat_path(path):
         try:
@@ -1324,6 +1570,8 @@ def api_assets(st):
         build = car.build or cfg_of(car, 'ENGINE_BUILD') or ''
         jdk = cfg_of(car, 'JDK_DIR') or car.jdk_dir or ''
         if eng == 'easysearch':
+            ver = ver or '2.5.0'
+            build = build or '3015'
             pkg = os.path.join(pkg_dir, 'easysearch-%s-%s-linux-amd64-bundle.tar.gz' % (ver, build))
         elif eng == 'elasticsearch':
             pkg = os.path.join(pkg_dir, 'elasticsearch-%s-linux-x86_64.tar.gz' % ver)
@@ -1333,14 +1581,17 @@ def api_assets(st):
             pkg = None
         dep = {'car': car.name, 'engine': car.engine, 'ver': ver, 'build': build,
                'pkg': pkg, 'pkg_stat': stat_path(pkg) if pkg else {'exists': False}}
-        base = os.path.basename(jdk.rstrip('/'))
-        if base.startswith('jdk-'):
-            dep['jdk_pkg'] = os.path.join(pkg_dir, 'openjdk-%s_linux-x64_bin.tar.gz' % base[len('jdk-'):])
-            dep['jdk_mapped'] = True
-        else:
-            dep['jdk_pkg'], dep['jdk_mapped'] = (jdk or None), bool(jdk)
-        if dep.get('jdk_pkg'):
-            dep['jdk_stat'] = stat_path(dep['jdk_pkg'])
+        # JDK_DIR 是被测节点路径，不能用控制机 stat 判定它是否存在。
+        dep['jdk_dir'] = jdk or None
+        dep['jdk_node_status'] = 'unknown' if jdk else 'bundled'
+        dep['jdk_pkg'] = None
+        dep['jdk_mapped'] = False
+        if jdk.startswith('/opt/jdks/jdk-') and '/' not in jdk[len('/opt/jdks/jdk-'):]:
+            version = jdk[len('/opt/jdks/jdk-'):]
+            if version:
+                dep['jdk_pkg'] = os.path.join(pkg_dir, 'openjdk-%s_linux-x64_bin.tar.gz' % version)
+                dep['jdk_mapped'] = True
+                dep['jdk_stat'] = stat_path(dep['jdk_pkg'])
         deps.append(dep)
 
     # PKG_DIR 全清单
@@ -1355,7 +1606,7 @@ def api_assets(st):
     for b in bundles:
         b.update(stat_path(b['path']))
     return 200, {'available': True, 'pkg_dir': pkg_dir, 'deps': deps,
-                 'pkg_files': pkg_files, 'bundles': bundles}
+                 'pkg_files': pkg_files, 'bundles': bundles, 'config_warning': config_warning}
 
 
 def api_cluster_status(st):
@@ -2224,6 +2475,9 @@ def _route_get_core(st, path, q):
     if path == '/api/assets':
         code, payload = api_assets(st)
         return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
+    if path == '/api/cars-file':
+        code, payload = api_cars_file(st)
+        return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
     if path == '/api/mutex':
         code, payload = api_mutex(st)
         return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
@@ -2310,6 +2564,9 @@ def _post_core(st, path, body):
     415/坏 JSON 校验仍留在 do_POST，serve-rpc 侧由 Go 保证 Content-Type）。
     """
     try:
+        if path == '/api/cars-write':
+            code, payload = api_cars_write(st, body)
+            return code, 'application/json', json.dumps(payload, ensure_ascii=False), 'no-store'
         if path == '/api/render':
             code, payload = api_render(st, body)
         elif path == '/api/preview':

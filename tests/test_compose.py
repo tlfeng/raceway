@@ -85,7 +85,15 @@ class TestValidateCars(unittest.TestCase):
     def test_es_car_with_jdk_dir_rejected(self):
         text = CARS_TEXT.replace('CAR_LABEL=es819', 'CAR_LABEL=es819 JDK_DIR=/opt/jdks/jdk-26')
         problems = C.validate_cars(C.parse_cars(text))
-        self.assertTrue(any('es 车' in m and 'JDK_DIR' in m for s, m in problems if s == 'error'))
+        # 消息现按引擎名展开（elasticsearch 车 ...），es/opensearch 都会被拒
+        self.assertTrue(any('JDK_DIR' in m and 'elasticsearch 车' in m
+                            for s, m in problems if s == 'error'))
+
+    def test_opensearch_car_with_jdk_dir_rejected(self):
+        text = 'os-x ENGINE_NAME=opensearch ENGINE_VERSION=3.9.0 JDK_DIR=/opt/jdks/jdk-26\n'
+        problems = C.validate_cars(C.parse_cars(text))
+        self.assertTrue(any('JDK_DIR' in m and 'opensearch' in m
+                            for s, m in problems if s == 'error'))
 
     def test_missing_engine_rejected(self):
         cars = C.parse_cars('bare CAR_LABEL=x\n')
