@@ -158,10 +158,11 @@ function App() {
   }, []);
 
   const goHash = useRef(null);
-  function setTab(id) {
+  function setTab(id, cidOpt) {
+    const cid = cidOpt === undefined ? curCid : cidOpt;
     setTabRaw(id);
-    if (id === 'progress' || id === 'history' || id === 'export') loadCampaigns();
-    if (goHash.current) goHash.current(id, id === 'progress' ? curCid : null);
+    if (id === 'progress' || id === 'history' || id === 'export') loadCampaigns(cid || undefined);
+    if (goHash.current) goHash.current(id, id === 'progress' ? cid : null);
   }
 
   // 深链路由：#/progress/<cid> 之类，刷新/分享可直达；hash 变化反向切页
@@ -181,7 +182,7 @@ function App() {
 
   // 「起跑成功 → 直接带到进度页盯它」：compose 页发事件，这里接住
   useEffect(() => {
-    const onView = (e) => { setCurCid(e.detail); setTabRaw('progress'); };
+    const onView = (e) => { setCurCid(e.detail); setTab('progress', e.detail); };
     window.addEventListener('raceway-view', onView);
     return () => window.removeEventListener('raceway-view', onView);
   }, []);
@@ -270,10 +271,10 @@ function App() {
               setCurCid=${setCurCid} reload=${loadCampaigns} EX=${EX} />`}
           ${tab === 'history' && html`
             <${HistoryView} boot=${boot} camps=${camps} reload=${loadCampaigns}
-              onView=${(cid) => { setCurCid(cid); setTab('progress'); }}
+              onView=${(cid) => { setCurCid(cid); setTab('progress', cid); }}
               onReorder=${reorderCamp} EX=${EX} curCid=${curCid} />`}
           ${tab === 'tracks' && html`<${TracksView} boot=${boot} EX=${EX} reloadBoot=${reloadBoot} />`}
-          ${tab === 'assets' && html`<${AssetsView} />`}
+          ${tab === 'assets' && html`<${AssetsView} reloadBoot=${reloadBoot} />`}
           ${tab === 'export' && html`<${ExportView} boot=${boot} camps=${camps} EX=${EX} />`}
         </div>
       </div>
@@ -893,6 +894,11 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
           } else setMon(null);
         }
         if (rt.status === 200) setTail(rt.j.lines || '（空）');
+        // 场内速览随轮询刷新（纯本地文件聚合，便宜）—— 盯盘时 RUNNING 行的吞吐才会动
+        try {
+          const rr = await getJSON('/api/campaign-result?cid=' + enc);
+          if (alive && rr.status === 200) setRes(rr.j);
+        } catch (e2) { /* 下一轮再试 */ }
         setLastPoll(new Date());
       } catch (e) { /* 网络抖动下一轮再试 */ }
       scheduleNext();
@@ -1463,14 +1469,20 @@ function CompareResult({ out }) {
 }
 
 // ==================== ④ 趋势 ====================
+const TREND_KEY = 'raceway.trend';   // 上次查询条件：下次进来原样回填并自动查一次
 function TrendView({ boot }) {
-  const [car, setCar] = useState('');
-  const [track, setTrack] = useState((boot.tracks || [])[0] ? boot.tracks[0].name : '');
-  const [metric, setMetric] = useState('throughput');
-  const [task, setTask] = useState('');
+  const saved = (() => {
+    try { return JSON.parse(localStorage.getItem(TREND_KEY) || 'null'); } catch (e) { return null; }
+  })();
+  const [car, setCar] = useState(saved && saved.car != null ? saved.car : '');
+  const [track, setTrack] = useState(saved && saved.track ? saved.track
+    : ((boot.tracks || [])[0] ? boot.tracks[0].name : ''));
+  const [metric, setMetric] = useState(saved && saved.metric ? saved.metric : 'throughput');
+  const [task, setTask] = useState(saved && saved.task != null ? saved.task : '');
   const [hint, setHint] = useState('');
   const [res, setRes] = useState(null);
   const chartRef = useRef(null);
+  const chartInst = useRef(null);
 
   async function doTrend() {
     if (!car.trim()) { toast.err('请填车代号（如 jdk25 / ez3000）'); return; }
@@ -1487,12 +1499,26 @@ function TrendView({ boot }) {
         (j.direction === 'lower-better' ? '越低越好' : '越高越好'));
       setRes(j);
       renderChart(j);
+      try { localStorage.setItem(TREND_KEY, JSON.stringify(
+        { car: car.trim(), track, metric, task: task.trim() })); } catch (e) { /* 忽略 */ }
     } catch (e) { setHint('请求失败: ' + e); }
   }
+  // 上次查过就自动来一次 —— 常看趋势的人打开即见图，不用每次重填
+  useEffect(() => { if (saved && saved.car) doTrend(); }, []);
+  // resize 单监听 + 卸载时释放 echarts 实例（此前每次渲染都挂一个新 listener 会泄漏）
+  useEffect(() => {
+    const onR = () => { if (chartInst.current) chartInst.current.resize(); };
+    window.addEventListener('resize', onR);
+    return () => {
+      window.removeEventListener('resize', onR);
+      if (chartInst.current) { chartInst.current.dispose(); chartInst.current = null; }
+    };
+  }, []);
   function renderChart(j) {
     loadEcharts().then((ok) => {
-      if (!ok) return; // 表格兜底
-      const chart = echarts.init(chartRef.current);
+      if (!ok || !chartRef.current) return; // 表格兜底
+      const chart = echarts.getInstanceByDom(chartRef.current) || echarts.init(chartRef.current);
+      chartInst.current = chart;
       const legend = [], series = [], xs = new Set();
       (j.series || []).forEach((s) => {
         legend.push(s.key);
@@ -1512,16 +1538,21 @@ function TrendView({ boot }) {
         xAxis: { type: 'category', data: xarr, axisLabel: { rotate: 30, fontSize: 10 } },
         yAxis: { type: 'value', name: j.unit || '', scale: true },
         series,
-      });
-      window.addEventListener('resize', () => chart.resize());
+      }, true);
     });
   }
+  // 车代号候选：车定义里的 label 与车名（趋势的 series_key 就是 label 这一级）
+  const carOptions = [...new Set((boot.cars || [])
+    .flatMap((c) => [c.label, c.name]).filter(Boolean))];
   return html`
     <div class="card">
       <div class="card-title">指标趋势（跨 campaign，只读指标库 benchmark-result-metric）</div>
       <div class="row">
-        <input type="text" style="width:10ch" placeholder="jdk25" value=${car}
+        <input type="text" style="width:10ch" placeholder="jdk25" value=${car} list="trend-cars"
           onInput=${(e) => setCar(e.target.value)} />
+        <datalist id="trend-cars">
+          ${carOptions.map((c) => html`<option key=${c} value=${c} />`)}
+        </datalist>
         <select value=${track} onChange=${(e) => setTrack(e.target.value)}>
           ${(boot.tracks || []).map((t) => html`<option key=${t.name} value=${t.name}>${t.name}</option>`)}
         </select>
@@ -1535,7 +1566,8 @@ function TrendView({ boot }) {
           onInput=${(e) => setTask(e.target.value)} />
         <button class="btn btn-primary btn-sm" onClick=${doTrend}>查趋势</button>
       </div>
-      <p class="card-desc">每个点 = 一场 campaign 的一次有效测量；同车多 build 会分线（series_key 带 build）。</p>
+      <p class="card-desc">每个点 = 一场 campaign 的一次有效测量；同车多 build 会分线（series_key 带 build）。
+        查询条件会记住，下次打开自动重现。</p>
       <p class="muted">${hint}</p>
       <div id="trchart" ref=${chartRef}></div>
       <${TrendTable} res=${res} />
@@ -1644,6 +1676,12 @@ function CarsEditorDrawer({ onClose, onSaved }) {
     setBusy(false);
   }
   useEffect(() => { load(); }, []);
+  // Esc 关闭编辑器（backdrop 点击之外的第二条出路）
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   // 前端即时校验（与服务端同规则的最小子集，仅提示；最终以服务端为准）
   const draftDiag = (() => {
