@@ -128,7 +128,7 @@ run_field 0 geo 1 1 && exit 8
                 continue
             with self.subTest(track=source.name):
                 target = self.d / source.name
-                shutil.copytree(source, target, ignore=shutil.ignore_patterns('documents*', 'queries*', 'truth*', '__pycache__'))
+                shutil.copytree(source, target, ignore=shutil.ignore_patterns('documents*', 'queries*', 'truth*', '__pycache__', '._*', '.DS_Store'))
                 # 只在临时副本派生 full，绝不改仓库赛道。
                 self.shell('derive_full_challenge "%s"\n' % target)
                 full_source = (target / 'challenges/full.json').read_text()
@@ -166,7 +166,7 @@ run_field 0 geo 1 1 && exit 8
                            'esrally.utils': types.ModuleType('esrally.utils'),
                            'esrally.utils.opts': opts}
                 output = target / 'expected.json'
-                with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['expected', str(target), '', str(output)]):
+                with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['expected', str(target), '', str(output), 'full']):
                     try:
                         exec(compile(code, '<expected_tasks>', 'exec'), {})
                     except json.JSONDecodeError as exc:

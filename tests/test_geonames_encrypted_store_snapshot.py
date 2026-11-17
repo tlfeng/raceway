@@ -3,8 +3,8 @@
 """geonames encrypted-store-snapshot 挑战（索引加密 + 快照加密全链路）回归闸门
 
 背景：`tracks/geonames/challenges/encrypted-store-snapshot.json` 在 encrypted-store
-（索引加密读写探针）之上加**加密仓库快照闭环**：delete-snapshot-repository 预清场
-（幂等重跑）→ 注册 type=encrypted 仓库（委托 fs）→ create-snapshot（异步）→
+（索引加密读写探针）之上加**加密仓库快照闭环**：注册仓库（PUT 覆盖语义，
+幂等重跑）→ create-snapshot（异步）→
 wait-for-snapshot-create（快照字节数/吞吐）→ 删原索引 → restore（异步）→
 wait-for-recovery（恢复字节数/吞吐）→ 健康检查 → 查段跑在恢复出的索引上。
 
@@ -33,7 +33,6 @@ ENC_SETTINGS = {
 }
 
 SNAP_PHASE = [
-    'delete-snapshot-repository',
     'create-repository',
     'create-snapshot',
     'wait-for-snapshot-create',
@@ -163,19 +162,57 @@ class EncryptedStoreSnapshotChallengeTest(unittest.TestCase):
         """5 个快照族任务的 repository 引用必须同源；create/restore 的 snapshot 名必须同源。"""
         src = _read(CHALLENGE)
         repo_expr = '{{snapshot_repository | default(\'raceway-encrypted\')}}'
-        self.assertEqual(src.count(repo_expr), 5,
-                         'repository 占位不是 5 处（4 个任务 + body 不引用 repo）')
+        self.assertEqual(src.count(repo_expr), 4,
+                         'repository 占位不是 4 处（create/create-snapshot/wait/restore + body 不引用 repo）')
         snap_expr = '{{snapshot_name | default(\'geonames-enc\')}}'
-        self.assertEqual(src.count(snap_expr), 2,
-                         'snapshot 名占位必须是 create-snapshot / restore-snapshot 各 1 处')
+        self.assertEqual(src.count(snap_expr), 3,
+                         'snapshot 名占位必须是 create-snapshot / wait-for-snapshot-create / restore-snapshot 各 1 处'
+                         '（wait-for-snapshot-create 缺 snapshot 参数会被 rally mandatory 拒掉）')
 
     def test_create_repository_body(self):
-        """注册的是 type=encrypted 仓库：委托类型/location 走参数（遮罩后为 X）。"""
-        t = task_by_name(self.doc, 'create-repository')[0]['operation']
-        self.assertEqual(t['body']['type'], 'encrypted', '仓库 type 必须是 encrypted（快照加密）')
-        st = t['body']['settings']
-        self.assertEqual(st.get('delegate_type'), 'X')
-        self.assertEqual(st.get('location'), 'X')
+        """注册仓库 body 三臂切换（p_repo_settings 链）：明文 s3 / 加密+s3 委托 / 默认加密+fs。"""
+        src = _read(CHALLENGE)
+        self.assertIn('{{ p_repo_settings | tojson }}', src)
+        self.assertIn('"type": "{{p_repo_type}}"', src)
+        self.assertIn("{%- set p_repo_type = 'encrypted' -%}", src)
+        self.assertIn("{%- set p_repo_type = 's3' -%}", src)
+        self.assertIn("{%- if snapshot_repo_type is defined and snapshot_repo_type == 's3' -%}", src)
+        self.assertIn("{%- elif snapshot_repo_delegate is defined and snapshot_repo_delegate == 's3' -%}", src)
+        self.assertIn('"delegate_type": snapshot_repo_delegate | default(\'fs\')', src)
+        self.assertIn('"location": snapshot_repo_location | default(\'/tmp/raceway-snapshot-repo\')', src)
+        # s3 仓库（明文臂与加密委托臂）必须 path_style_access:true（MinIO 无虚拟主机域名）
+        self.assertEqual(src.count('"path_style_access": true'), 2)
+        # profile 只对加密臂生效（明文 s3 仓库没有加密可言）
+        self.assertIn("{%- if p_repo_type != 's3' and snapshot_repo_profile is defined and snapshot_repo_profile %}", src)
+
+    def test_create_repository_body_render_arms(self):
+        """真 jinja2 渲染三个臂：仓库 type/settings 逐键正确（没装 jinja2 的环境 skip）。"""
+        try:
+            import jinja2
+        except ImportError:
+            self.skipTest('没装 jinja2（起跑赛道机器上会真正执行）')
+        tpl = jinja2.Environment().from_string(_read(CHALLENGE))
+
+        def body_of(**params):
+            doc = json.loads(tpl.render(**params))
+            return [t for t in doc['schedule']
+                    if t.get('name') == 'create-repository'][0]['operation']['body']
+
+        self.assertEqual(body_of(), {'type': 'encrypted',
+                                     'settings': {'delegate_type': 'fs',
+                                                  'location': '/tmp/raceway-snapshot-repo'}})
+        self.assertEqual(body_of(snapshot_repo_type='s3'),
+                         {'type': 's3',
+                          'settings': {'bucket': 'raceway-snap', 'base_path': 'geonames',
+                                       'path_style_access': True}})
+        self.assertEqual(body_of(snapshot_repo_delegate='s3', snapshot_repo_profile='snapshot'),
+                         {'type': 'encrypted',
+                          'settings': {'delegate_type': 's3', 'bucket': 'raceway-snap',
+                                       'base_path': 'geonames', 'path_style_access': True,
+                                       'encryption.profile': 'snapshot'}})
+        self.assertEqual(body_of(snapshot_repo_location='/data/snap'),
+                         {'type': 'encrypted',
+                          'settings': {'delegate_type': 'fs', 'location': '/data/snap'}})
 
     def test_profile_is_optional_conditional(self):
         """encryption.profile 只在显式传 snapshot_repo_profile 时渲染（2.5.1 硬化版需要）。"""
@@ -183,8 +220,8 @@ class EncryptedStoreSnapshotChallengeTest(unittest.TestCase):
         hits = re.findall(r'snapshot_repo_profile', src)
         self.assertEqual(len(hits), 3,
                          'snapshot_repo_profile 应恰好出现 3 次（if 守卫 2 次 + 值 1 次）')
-        self.assertIn('{%- if snapshot_repo_profile is defined and snapshot_repo_profile %}', src)
-        self.assertIn('"encryption.profile": "{{snapshot_repo_profile}}"', src)
+        self.assertIn('{%- if p_repo_type != \'s3\' and snapshot_repo_profile is defined and snapshot_repo_profile %}', src)
+        self.assertIn('"encryption.profile": snapshot_repo_profile', src)
 
     def test_snapshot_and_restore_are_async_with_followup_waits(self):
         """快照/恢复都异步发（wait-for-completion=false）+ 显式等待任务收口（吞吐才有数据）。"""
@@ -200,10 +237,15 @@ class EncryptedStoreSnapshotChallengeTest(unittest.TestCase):
             waits = task_by_name(self.doc, wait)
             self.assertEqual(len(waits), 1, '缺显式等待任务 %s' % wait)
 
-    def test_pre_clean_before_register(self):
-        """delete-snapshot-repository 必须先于 create-repository（重跑幂等；其自身 ignore 404）。"""
-        self.assertLess(self.ops.index('delete-snapshot-repository'),
-                        self.ops.index('create-repository'))
+    def test_no_delete_repository_op(self):
+        """禁用 delete-snapshot-repository：rally 2.13 runner 传 repository=…，而环境里的
+        elasticsearch-py 8.6.1 已把该参数改名 name（实测 TypeError），会把整场炸成
+        RACE-FAIL。幂等改由两点保证：PUT 重注册仓库=覆盖语义；快照名按场次唯一
+        （run-bench 的 snapshot_name:snap-$fid）。"""
+        src_txt = _read(CHALLENGE)
+        self.assertNotIn('"operation-type": "delete-snapshot-repository"', src_txt)
+        self.assertLess(self.ops.index('create-repository'),
+                        self.ops.index('create-snapshot'))
 
     def test_delete_index_before_restore(self):
         """原索引必须先删再恢复（恢复同名索引会被拒）。"""
