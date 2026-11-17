@@ -344,6 +344,7 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
   const previewRef = useRef(null); // {key, digest} ← 实时 render 喂给 dry-run/起跑
   const [live, setLive] = useState({ busy: false, err: '', rows: 0, estTotal: 0, tag: '' });
   const [mutex, setMutex] = useState(null); // {free, why} 起跑前探集群占用
+  const [carsEditor, setCarsEditor] = useState(false);
   const [cluster, setCluster] = useState(null); // {available, engine, nodes, up}
   useEffect(() => {
     let alive = true;
@@ -503,6 +504,8 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
     <div class="card">
       <div class="card-title">排程矩阵
         <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" onClick=${() => setCarsEditor(true)}
+          title="在 Web 里编辑车定义文件（runner 同口径校验，保存后车表立即刷新）">编辑车定义</button>
         <button class="btn btn-ghost btn-sm" onClick=${() => reloadBoot && reloadBoot()}
           title="重读车定义文件与 tracks/ 定义（车表变了、引擎支持变了都从这里拿最新）">↻ 刷新车与赛道</button>
       </div>
@@ -699,6 +702,8 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
         </div>
       </div>
     </div>
+    ${carsEditor && html`<${CarsEditorDrawer} onClose=${() => setCarsEditor(false)}
+      onSaved=${() => reloadBoot && reloadBoot(true)} />`}
   `;
 }
 
@@ -1612,6 +1617,114 @@ function TracksView({ boot, EX, reloadBoot }) {
   `;
 }
 
+// ==================== 车定义编辑器（runner 同口径校验 + 原子保存） ====================
+function CarsEditorDrawer({ onClose, onSaved }) {
+  const [info, setInfo] = useState(null);   // {path, content, sha256, diagnostics}
+  const [draft, setDraft] = useState('');
+  const [diag, setDiag] = useState([]);
+  const [busy, setBusy] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [conflict, setConflict] = useState(false);
+  const [loadedSha, setLoadedSha] = useState('');
+
+  async function load() {
+    setBusy(true); setConflict(false);
+    try {
+      const { status, j } = await getJSON('/api/cars-file');
+      if (status !== 200 || !j.available) {
+        setInfo({ path: j ? j.path : '', reason: (j && (j.reason || j.error)) || '读取失败' });
+        setDiag(j ? j.diagnostics || [] : []);
+        return;
+      }
+      setInfo({ path: j.path });
+      setDraft(j.content);
+      setLoadedSha(j.sha256);
+      setDiag(j.diagnostics || []);
+    } catch (e) { setInfo({ path: '', reason: String(e) }); }
+    setBusy(false);
+  }
+  useEffect(() => { load(); }, []);
+
+  // 前端即时校验（与服务端同规则的最小子集，仅提示；最终以服务端为准）
+  const draftDiag = (() => {
+    const out = [];
+    const labels = {}, names = {};
+    draft.split('\n').forEach((raw, i) => {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) return;
+      const lineno = i + 1;
+      const parts = line.split(/\s+/);
+      const name = parts[0];
+      const config = parts.slice(1).join(' ');
+      names[name] = (names[name] || 0) + 1;
+      const kv = {};
+      config.split(/\s+/).filter(Boolean).forEach((tok) => {
+        const eq = tok.indexOf('=');
+        if (eq <= 0) { out.push({ line: lineno, severity: 'error', message: '裸 token（必须 KEY=VALUE）: ' + tok }); return; }
+        const k = tok.slice(0, eq);
+        kv[k] = tok.slice(eq + 1);
+        if (!['ENGINE_NAME', 'ENGINE_VERSION', 'ENGINE_BUILD', 'JDK_DIR', 'CAR_LABEL', 'JDK_WANT', 'ARM_LABEL'].includes(k))
+          out.push({ line: lineno, severity: 'error', message: '未知键 ' + k });
+      });
+      const label = kv.CAR_LABEL || kv.ARM_LABEL || name;
+      labels[label] = (labels[label] || 0) + 1;
+      const eng = (kv.ENGINE_NAME || '').toLowerCase();
+      if (!eng) out.push({ line: lineno, severity: 'error', message: '缺 ENGINE_NAME' });
+      if ((eng === 'elasticsearch' || eng === 'opensearch') && (kv.ENGINE_BUILD || kv.JDK_DIR))
+        out.push({ line: lineno, severity: 'error', message: eng + ' 不应带 ENGINE_BUILD/JDK_DIR' });
+    });
+    Object.entries(labels).forEach(([l, n]) => { if (n > 1) out.push({ line: 0, severity: 'error', message: 'CAR_LABEL 重复: ' + l }); });
+    Object.entries(names).forEach(([l, n]) => { if (n > 1) out.push({ line: 0, severity: 'error', message: '车名重复: ' + l }); });
+    return out;
+  })();
+  const draftErrors = draftDiag.filter((x) => x.severity === 'error');
+
+  async function save() {
+    if (draftErrors.length) { toast.err('先修正 ' + draftErrors.length + ' 处 runner 会拒绝的问题'); return; }
+    if (!confirm('保存车定义到 ' + (info ? info.path : '') + '？\n保存后车表立即刷新；正在编排的勾选若引用被删除的车会被裁掉。')) return;
+    setSaving(true); setConflict(false);
+    const { status, j } = await postJSON('/api/cars-write', { content: draft, expect: loadedSha });
+    setSaving(false);
+    if (status === 409) { setConflict(true); toast.err('车定义已被他人修改 —— 点「重新加载」拿最新内容'); return; }
+    if (status !== 200) { toast.err((j && j.error) || '保存失败'); if (j && j.diagnostics) setDiag(j.diagnostics); return; }
+    setLoadedSha(j.sha256);
+    toast.ok('车定义已保存，车表已刷新（' + (j.cars || []).length + ' 车）');
+    setDiag((j.problems || []).map((p) => ({ line: 0, severity: p[0] === 'error' ? 'error' : 'warning', message: p[1] })));
+    onSaved && onSaved(j);
+  }
+
+  return html`<div class="drawer-backdrop" onClick=${onClose}>
+    <div class="drawer" onClick=${(e) => e.stopPropagation()}>
+      <div class="drawer-head">
+        <b>车定义</b>
+        <span class="muted mono" style="font-size:12px">${info ? info.path : ''}</span>
+        <span class="spacer"></span>
+        ${loadedSha ? html`<span class="muted mono" style="font-size:11px">sha ${loadedSha.slice(0, 10)}…</span>` : null}
+        <button class="btn btn-ghost btn-sm" onClick=${load} disabled=${busy}>重新加载</button>
+        <button class="btn btn-ghost btn-sm" onClick=${onClose}>✕ 关闭</button>
+      </div>
+      <div class="drawer-body">
+        ${busy && html`<p class="muted">读取中…</p>`}
+        ${!busy && info && info.reason ? html`<div class="warn-box">⚠ ${info.reason}</div>
+          <p class="muted">编辑器不可用 —— 请在压测机上直接编辑该文件。</p>` : null}
+        ${!busy && info && !info.reason ? html`<div>
+          ${conflict && html`<div class="warn-box">⚠ 内容已被他人修改。点「重新加载」会覆盖你这里的草稿，请先复制重要修改。</div>`}
+          ${draftErrors.length ? html`<div class="warn-box">✘ ${draftErrors.length} 处问题（保存会被拒绝）：
+            ${draftErrors.slice(0, 6).map((x, i) => html`<div key=${i}>${x.line ? '行 ' + x.line + '：' : ''}${x.message}</div>`)}
+            ${draftErrors.length > 6 ? html`<div>…还有 ${draftErrors.length - 6} 条</div>` : null}</div>` : null}
+          <textarea class="textarea mono" style="width:100%;height:52vh;font-size:12.5px;line-height:1.55"
+            value=${draft} onInput=${(e) => setDraft(e.target.value)} spellcheck=${false}></textarea>
+          <div class="row" style="margin-top:8px">
+            <button class="btn btn-primary" onClick=${save} disabled=${saving || draftErrors.length}>
+              ${saving ? '保存中…' : '保存并刷新车表'}</button>
+            <span class="muted">保存走严格校验（runner 同口径）+ 原子写；配置文件仍是唯一数据源。</span>
+          </div>
+        </div>` : null}
+      </div>
+    </div>
+  </div>`;
+}
+
 // ==================== ⑥ 引擎与 JDK（只读资产盘点 + 车依赖） ====================
 function fmtSize(n) {
   if (n == null) return '—';
@@ -1621,7 +1734,8 @@ function fmtSize(n) {
   return n + ' B';
 }
 
-function AssetsView() {
+function AssetsView({ reloadBoot }) {
+  const [carsEditor, setCarsEditor] = useState(false);
   const [d, setD] = useState(null);   // {available, pkg_dir, deps, pkg_files, bundles}
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -1642,7 +1756,8 @@ function AssetsView() {
     <p class="muted">${d.reason || '当前模式读不到安装包目录 —— 资产盘点在压测机本机控制台查看。'}</p>
   </div></div>`;
 
-  const missing = d.deps.filter((r) => (r.pkg && !r.pkg_stat.exists) || (r.jdk_mapped && r.jdk_stat && !r.jdk_stat.exists));
+  const missing = d.deps.filter((r) => r.pkg && !r.pkg_stat.exists);
+  const jdkMissing = d.deps.filter((r) => r.jdk_mapped && r.jdk_stat && !r.jdk_stat.exists);
   const byPath = {};
   (d.pkg_files || []).forEach((f) => { byPath[d.pkg_dir + '/' + f.name] = f; });
 
@@ -1650,7 +1765,10 @@ function AssetsView() {
     <div class="card">
       <div class="card-title">起跑依赖（车定义 → 安装包；与 runner resolve_engine 的 die 点同口径）
         <div class="spacer"></div>
-        <span class=${missing.length ? 'st-bad' : 'st-ok'}>${missing.length ? '✘ ' + missing.length + ' 个包缺失' : '✓ 全部在位'}</span>
+        <span class=${missing.length ? 'st-bad' : 'st-ok'}>${missing.length ? '✘ ' + missing.length + ' 个引擎包缺失' : '✓ 引擎包在位'}</span>
+        ${jdkMissing.length ? html`<span class="st-warn">⚠ ${jdkMissing.length} 个 JDK 控制机包缺失</span>` : null}
+        <button class="btn btn-ghost btn-sm" onClick=${() => setCarsEditor(true)}
+          title="在 Web 里编辑车定义文件（runner 同口径校验，保存后车表立即刷新）">编辑车定义</button>
         <button class="btn btn-ghost btn-sm" onClick=${load} disabled=${busy}>↻</button>
       </div>
       <table class="tbl">
@@ -1661,16 +1779,20 @@ function AssetsView() {
             <td class="mono" style="font-size:12px">${r.engine} ${r.ver}${r.build ? '-' + r.build : ''}</td>
             <td>${r.pkg ? html`<span class=${r.pkg_stat.exists ? 'st-ok' : 'st-bad'}>${r.pkg_stat.exists ? '✓' : '✗ 缺失'}</span>
               <span class="mono" style="font-size:11px;word-break:break-all">${r.pkg.replace(d.pkg_dir + '/', '')}</span>` : html`<span class="st-bad">未知引擎</span>`}</td>
-            <td>${r.jdk_mapped ? (r.jdk_stat && r.jdk_stat.exists
-              ? html`<span class="st-ok">✓</span><span class="mono" style="font-size:11px"> ${r.jdk_pkg.replace(d.pkg_dir + '/', '')}</span>`
-              : html`<span class="st-bad">✗ 缺失</span><span class="mono" style="font-size:11px"> ${r.jdk_pkg.replace(d.pkg_dir + '/', '')}</span>`)
-              : html`<span class="muted">${r.jdk_pkg || '—'}（无映射，用引擎自带 JDK / 用户自管）</span>`}</td>
+            <td>${!r.jdk_dir ? html`<span class="muted">引擎自带 JDK</span>` : html`
+              <span class="mono" style="font-size:11px">节点路径 ${r.jdk_dir}</span><br/>
+              <span class="muted">节点安装状态：未检查</span>
+              ${r.jdk_mapped ? html`<br/><span class=${r.jdk_stat && r.jdk_stat.exists ? 'st-ok' : 'st-warn'}>
+                ${r.jdk_stat && r.jdk_stat.exists ? '控制机安装包在位' : '控制机安装包缺失（节点未安装时需要）'}</span>
+                <span class="mono" style="font-size:11px"> ${r.jdk_pkg}</span>` : html`<br/><span class="muted">非自动安装路径，请在节点自行确认</span>`}`}</td>
           </tr>`)}
         </tbody>
       </table>
-      <p class="card-desc">判定口径与 runner <code>resolve_engine</code> 的 die 点一致：引擎包三规则（easysearch 带 build / es、opensearch 各自命名）+ JDK 硬编码映射（jdk-26/27）。
-        包缺失时起跑会直接报「缺安装包」—— 这里提前标红。本页只读，上传/替换仍用 scp 放进 <code>${d.pkg_dir}</code>。</p>
+      ${d.config_warning ? html`<div class="warn-box">⚠ ${d.config_warning}</div>` : null}
+      <p class="card-desc">引擎包路径按 runner 的命名规则推导；节点 JDK 未检查。JDK 控制机安装包仅在节点缺少对应路径、且支持自动安装时需要。本页只读，实际部署来源以 ibs 配置与运行日志为准。</p>
     </div>
+    ${carsEditor && html`<${CarsEditorDrawer} onClose=${() => setCarsEditor(false)}
+      onSaved=${() => reloadBoot && reloadBoot(true)} />`}
 
     <div class="card">
       <div class="card-title">本地包仓库（${d.pkg_dir} · ${(d.pkg_files || []).length} 个文件）</div>

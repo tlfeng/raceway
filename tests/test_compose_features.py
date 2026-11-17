@@ -441,10 +441,13 @@ jdk26 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt
         self.assertTrue(d['jdk_mapped'])
         self.assertEqual(d['jdk_pkg'], jdkpkg)
         self.assertTrue(d['jdk_stat']['exists'])
-        # 非 jdk-* 目录（如 TencentKona）：jdk_pkg 就是目录本身，只报告不映射
+        # 非 jdk-* 目录（如 TencentKona）：被测节点自管路径，控制机 stat 不适用 ——
+        # 只报告 jdk_dir 与"未检查"状态，不产出 jdk_pkg/jdk_stat（避免误报缺失）
         d = self.by_car(p, 'kona25')
-        self.assertEqual(d['jdk_pkg'], '/opt/jdks/tencentkona-25.0.4')
-        self.assertFalse(d['jdk_stat']['exists'])
+        self.assertEqual(d['jdk_dir'], '/opt/jdks/tencentkona-25.0.4')
+        self.assertFalse(d['jdk_mapped'])
+        self.assertIsNone(d['jdk_pkg'])
+        self.assertEqual(d['jdk_node_status'], 'unknown')
 
     def test_bundle_without_jdk_has_no_jdk_stat(self):
         # 自带 JDK 的车：jdk_pkg=None / jdk_mapped=False，且不产出 jdk_stat（前端据此省列）
@@ -459,6 +462,114 @@ jdk26 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015 JDK_DIR=/opt
         self.assertEqual(code, 200)
         self.assertEqual(ctype, 'application/json')
         self.assertTrue(json.loads(body)['available'])
+
+
+class AssetInventoryTests(unittest.TestCase):
+    def test_defaults_and_node_jdk_are_distinct(self):
+        with tempfile.TemporaryDirectory() as root:
+            st = make_state(root)
+            with open(os.path.join(root, 'vm-bench.env'), 'w', encoding='utf-8') as f:
+                f.write('PKG_DIR=$ROOT/pkg\nBUNDLE_EZ=$PKG_DIR/example.tar.gz # note\n')
+            st.cars = tuple(C.parse_cars(
+                'a ENGINE_NAME=easysearch JDK_DIR=/opt/jdks/jdk-26\n'
+                'b ENGINE_NAME=easysearch JDK_DIR=/opt/jdks/kona25\n'))
+            _, data = C.api_assets(st)
+            a, b = data['deps']
+            self.assertTrue(a['pkg'].endswith('easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz'))
+            self.assertEqual(a['jdk_node_status'], 'unknown')
+            self.assertFalse(a['jdk_stat']['exists'])
+            self.assertEqual(b['jdk_dir'], '/opt/jdks/kona25')
+            self.assertFalse(b['jdk_mapped'])
+            self.assertEqual(data['bundles'][0]['path'], os.path.join(root, 'pkg', 'example.tar.gz'))
+
+    def test_missing_env_and_remote_mode_are_explicit(self):
+        with tempfile.TemporaryDirectory() as root:
+            st = make_state(root)
+            _, data = C.api_assets(st)
+            self.assertTrue(data['config_warning'])
+            st.args.ssh = 'example'
+            _, data = C.api_assets(st)
+            self.assertFalse(data['available'])
+
+
+class StrictCarsTests(unittest.TestCase):
+    """runner 同口径的车定义严格校验：apply_config/resolve_engine 会 die 的都要标 error。"""
+
+    def test_unknown_key_and_bare_token_are_errors(self):
+        cars, diag = C.parse_cars_strict('a ENGINE_NAME=easysearch FOO=1\n'
+                                         'b ENGINE_NAME=easysearch bare\n')
+        msgs = [d['message'] for d in diag if d['severity'] == 'error']
+        self.assertTrue(any('未知键: FOO' in m for m in msgs))
+        self.assertTrue(any('裸 token' in m for m in msgs))
+
+    def test_opensearch_with_jdk_dir_is_error(self):
+        cars, diag = C.parse_cars_strict(
+            'os ENGINE_NAME=opensearch ENGINE_VERSION=3.9.0 JDK_DIR=/opt/jdks/jdk-26\n')
+        self.assertTrue(any('JDK_DIR' in d['message'] and d['severity'] == 'error' for d in diag))
+
+    def test_es_with_build_is_error(self):
+        cars, diag = C.parse_cars_strict(
+            'x ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 ENGINE_BUILD=9\n')
+        self.assertTrue(any('ENGINE_BUILD' in d['message'] and d['severity'] == 'error' for d in diag))
+
+    def test_easysearch_default_build_is_warning_not_error(self):
+        cars, diag = C.parse_cars_strict('a ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0\n')
+        errs = [d for d in diag if d['severity'] == 'error']
+        self.assertEqual(errs, [])
+        self.assertTrue(any('ENGINE_BUILD' in d['message'] for d in diag if d['severity'] == 'warning'))
+
+    def test_duplicate_label_is_error(self):
+        cars, diag = C.parse_cars_strict(
+            'a ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 CAR_LABEL=same\n'
+            'b ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 CAR_LABEL=same\n')
+        self.assertTrue(any('CAR_LABEL 重复' in d['message'] and d['severity'] == 'error'
+                            for d in diag))
+
+    def test_arm_label_alias_is_accepted(self):
+        cars, diag = C.parse_cars_strict('a ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ARM_LABEL=aa\n'
+                                         'b ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 CAR_LABEL=bb\n')
+        self.assertEqual([d for d in diag if d['severity'] == 'error'], [])
+        self.assertEqual(cars[0].label, 'aa')
+
+
+class CarsWriteTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='raceway-cars-write-')
+        self.cars_file = os.path.join(self.root, 'cars.conf')
+        with open(self.cars_file, 'w', encoding='utf-8') as f:
+            f.write('carA ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 CAR_LABEL=aa\n')
+        self.st = make_state(self.root)
+        self.st.args.cars_file = self.cars_file
+        self.st.reload_cars()
+        self.st.args.cars_file = self.cars_file
+        import hashlib
+        self.sha0 = hashlib.sha256(open(self.cars_file, 'rb').read()).hexdigest()
+        self.new_text = 'carB ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 CAR_LABEL=bb\n'
+
+    def test_write_rejects_runner_fatal_file(self):
+        code, p = C.api_cars_write(self.st, {'content': 'a ENGINE_NAME=easysearch FOO=1\n'})
+        self.assertEqual(code, 400)
+        self.assertTrue(any(d['severity'] == 'error' for d in p['diagnostics']))
+        # 未落盘
+        with open(self.cars_file, encoding='utf-8') as f:
+            self.assertIn('carA', f.read())
+
+    def test_write_conflict_returns_409(self):
+        code, p = C.api_cars_write(self.st, {'content': self.new_text, 'expect': '0' * 64})
+        self.assertEqual(code, 409)
+        # 旧内容未被覆盖
+        with open(self.cars_file, encoding='utf-8') as f:
+            self.assertIn('carA', f.read())
+
+    def test_write_atomic_and_reloads(self):
+        code, p = C.api_cars_write(self.st, {'content': self.new_text, 'expect': self.sha0})
+        self.assertEqual(code, 200)
+        self.assertFalse(p['unchanged'])
+        self.assertEqual([c.name for c in self.st.cars], ['carB'])
+        with open(self.cars_file, encoding='utf-8') as f:
+            self.assertEqual(f.read(), self.new_text)
+        # 同目录临时文件已清理
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith('.cars-')], [])
 
 
 if __name__ == '__main__':
