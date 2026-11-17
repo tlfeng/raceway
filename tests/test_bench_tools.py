@@ -120,6 +120,48 @@ class CliTests(unittest.TestCase):
             after = f.read()
         self.assertEqual(before, after)
 
+    def test_result_json(self):
+        # 场内速览：逐场次判定行（PLAN × RACES 聚合，纯本地文件）
+        p = self.run_tool('result', 'camp1')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        self.assertEqual(data['cid'], 'camp1')
+        self.assertEqual(data['rows'][0]['fid'], 'a-geo-r1')
+        self.assertEqual(data['rows'][0]['verdict'], 'VALID')
+
+    def test_mutex_json(self):
+        # 本地互斥预检：fixture 没有 runner 持锁 → 空闲
+        p = self.run_tool('mutex')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(json.loads(p.stdout)['free'])
+
+    def test_stop_requires_yes(self):
+        # 杀进程操作必须显式 --yes（与页面二次确认同口径）
+        p = self.run_tool('stop', 'camp1')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('--yes', p.stderr)
+        self.assertEqual(p.stderr.count('--yes'), 1)  # 不重复打印
+
+    def test_cars_validate(self):
+        # runner 同口径校验：好文件 ok=true 退出 0；坏文件 ok=false 退出 1 且有行号
+        good = os.path.join(self.root, 'cars-good.conf')
+        with open(good, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('ez1 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 '
+                    'ENGINE_BUILD=3010 JDK_DIR=/opt/jdks/jdk21 CAR_LABEL=ez1\n'
+                    'es1 ENGINE_NAME=elasticsearch\n')
+        p = self.run_tool('cars-validate', '--cars-file', good)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(json.loads(p.stdout)['ok'])
+
+        bad = os.path.join(self.root, 'cars-bad.conf')
+        with open(bad, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('os1 ENGINE_NAME=opensearch ENGINE_BUILD=99\n')
+        p = self.run_tool('cars-validate', '--cars-file', bad)
+        self.assertEqual(p.returncode, 1)
+        data = json.loads(p.stdout)
+        self.assertFalse(data['ok'])
+        self.assertTrue(any(d['severity'] == 'error' for d in data['diagnostics']))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

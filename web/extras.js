@@ -305,10 +305,76 @@
       </div>`;
     }
 
+    let ECHARTS_PROMISE = null;
+    function loadEchartsX() {
+      if (window.echarts) return Promise.resolve(true);
+      if (!ECHARTS_PROMISE) {
+        ECHARTS_PROMISE = new Promise((res) => {
+          const s = document.createElement('script');
+          s.src = '/echarts.min.js';
+          s.onload = () => res(typeof window.echarts !== 'undefined');
+          s.onerror = () => res(false);
+          document.head.appendChild(s);
+        });
+      }
+      return ECHARTS_PROMISE;
+    }
+    // canvas 不解析 CSS 变量 —— 主题色在渲染时解析成具体值（解析失败回退浅灰）。
+    // 本项目变量是组件式定义（--border: 214.3 31.8% 91.4%），要包一层 hsl()
+    function cssColor(name, fallback) {
+      try {
+        const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        if (!v) return fallback;
+        return /^\d/.test(v) ? 'hsl(' + v + ')' : v;
+      } catch (e) { return fallback; }
+    }
+
     function MonitorChart({ series, field }) {
       const ref = useRef(null);
+      const inst = useRef(null);
+      const [mode, setMode] = useState('waiting'); // 'waiting' → 'echarts' | 'svg'
+      useEffect(() => { loadEchartsX().then((ok) => setMode(ok ? 'echarts' : 'svg')); }, []);
+      // echarts 主路径：hover 看数值、图例点选隐藏节点、滚轮/拖拽缩放 —— 排查 steal 峰值必备
       useEffect(() => {
-        if (!ref.current || !series || !series.length) return;
+        if (mode !== 'echarts' || !ref.current || !series || !series.length) return;
+        const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#0891b2', '#ea580c'];
+        const xs = [];
+        (series[0].rows || []).forEach((r) => {
+          xs.push(r.ts != null ? String(r.ts) : '');
+        });
+        const legend = [], lines = [];
+        series.forEach((s, idx) => {
+          legend.push(s.node);
+          lines.push({
+            name: s.node, type: 'line', showSymbol: false,
+            data: (s.rows || []).map((r) => (typeof r[field] === 'number' ? r[field] : null)),
+            itemStyle: { color: colors[idx % colors.length] },
+            lineStyle: { width: 1.5, color: colors[idx % colors.length] },
+          });
+        });
+        if (!xs.length) return;
+        const border = cssColor('--border', '#e4e4e7');
+        const axisText = cssColor('--muted-foreground', '#71717a');
+        const chart = window.echarts.getInstanceByDom(ref.current)
+          || window.echarts.init(ref.current);
+        inst.current = chart;
+        chart.setOption({
+          animation: false,
+          tooltip: { trigger: 'axis', textStyle: { fontSize: 11 } },
+          legend: { data: legend, top: 0, right: 0, textStyle: { fontSize: 10, color: axisText },
+            itemWidth: 12, itemHeight: 8 },
+          grid: { left: 44, right: 8, top: 20, bottom: 18 },
+          xAxis: { type: 'category', data: xs, axisLabel: { show: false },
+            axisTick: { show: false }, axisLine: { lineStyle: { color: border } } },
+          yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: border } },
+            axisLabel: { fontSize: 10, color: axisText } },
+          dataZoom: [{ type: 'inside' }],
+          series: lines,
+        }, true);
+      }, [series, field, mode]);
+      // SVG 兜底：仓库没带 echarts.min.js 时退回原折线（只读，无数值提示）
+      useEffect(() => {
+        if (mode !== 'svg' || !ref.current || !series || !series.length) return;
         const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#0891b2', '#ea580c'];
         const maxPts = 600;
         const W = ref.current.clientWidth || 720, H = 200;
@@ -344,14 +410,19 @@
         });
         svg.push('</svg>');
         ref.current.innerHTML = svg.join('');
-      }, [series, field]);
-      return html`<div ref=${ref}></div>`;
+      }, [series, field, mode]);
+      // 卸载时释放 echarts 实例（进度页/抽屉反复挂载，别泄漏 canvas）
+      useEffect(() => () => {
+        if (inst.current) { inst.current.dispose(); inst.current = null; }
+      }, []);
+      return html`<div ref=${ref} style=${mode === 'svg' ? '' : 'height:200px'}></div>`;
     }
 
     function RaceDetailDrawer({ cid, fid, onClose }) {
       const [detail, setDetail] = useState(null);
       const [monitor, setMonitor] = useState(null);
       const [sub, setSub] = useState('身份');
+      const [logFile, setLogFile] = useState(null);   // 产物点击 → 日志页签预填该路径
       const [busy, setBusy] = useState(false);
       useEffect(() => {
         if (!cid || !fid) return;
@@ -364,6 +435,12 @@
           setBusy(false);
         }).catch((e) => { toast.err(String(e)); setBusy(false); });
       }, [cid, fid]);
+      // Esc 关闭抽屉（backdrop 点击之外的第二条出路）
+      useEffect(() => {
+        const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [onClose]);
 
       return html`<div class="drawer-backdrop" onClick=${onClose}>
         <div class="drawer" onClick=${(e) => e.stopPropagation()}>
@@ -393,8 +470,13 @@
                   <td class="num">${m.lat_p50 != null ? fmtN(m.lat_p50) : '—'}</td>
                   <td class="num">${m.lat_p99 != null ? fmtN(m.lat_p99) : '—'} <small>${m.lat_p99 != null ? esc(m.lat_unit || '') : ''}</small></td></tr>`)}
               </tbody></table>` : html`<div class="muted">（无 race.json 指标）</div>`}
-              <div class="section-h">产物</div>
-              ${detail.artifacts && detail.artifacts.length ? detail.artifacts.map((a) => html`<div key=${a} class="mono" style="font-size:12px">${a}</div>`) : html`<div class="muted">（无）</div>`}
+              <div class="section-h">产物（点文件名直接在日志页签里看内容）</div>
+              ${detail.artifacts && detail.artifacts.length ? detail.artifacts.map((a) => html`
+                <div key=${a} class="mono" style="font-size:12px">
+                  <a href="#" style="text-decoration:none"
+                    title="在日志页签打开 ${a}"
+                    onClick=${(e) => { e.preventDefault(); setLogFile(a); setSub('日志'); }}>${a}</a>
+                </div>`) : html`<div class="muted">（无）</div>`}
             </div>` : null}
             ${sub === '监控' && monitor ? html`<div>
               ${!monitor.series || !monitor.series.length ? html`<div class="muted">该场次没有监控 CSV。</div>` : html`
@@ -406,17 +488,18 @@
                   </div>` : null;
                 })}`}
             </div>` : null}
-            ${sub === '日志' ? html`<${LogViewer} cid=${cid} initial=${(detail && detail.progress || []).join('\n')} />` : null}
+            ${sub === '日志' ? html`<${LogViewer} cid=${cid} initialFile=${logFile}
+              initial=${logFile ? '' : (detail && detail.progress || []).join('\n')} />` : null}
           </div>
         </div>
       </div>`;
     }
 
     // ---------- ⑪ 日志全文查看 ----------
-    function LogViewer({ cid, initial }) {
+    function LogViewer({ cid, initial, initialFile }) {
       const common = ['PROGRESS.txt', 'RACES.md', 'STATE.txt', 'PLAN.tsv',
         'monitors/ENV-SUMMARY.csv'];
-      const [file, setFile] = useState('PROGRESS.txt');
+      const [file, setFile] = useState(initialFile || 'PROGRESS.txt');
       const isCustom = !common.includes(file);
       const [n, setN] = useState(300);
       const [q, setQ] = useState('');
@@ -436,6 +519,13 @@
         setBusy(false);
       }
       useEffect(() => { if (cid) load(); }, [cid, file]);
+      // 抽屉里点产物切过来时，跟随目标文件（initialFile 只在点击时变化，改 file 自动触发 load）
+      useEffect(() => { if (initialFile) setFile(initialFile); }, [initialFile]);
+      function copyAll() {
+        navigator.clipboard && navigator.clipboard.writeText(text || '').then(
+          () => toast.ok('日志已复制到剪贴板'),
+          () => toast.err('复制失败（浏览器拒绝了剪贴板访问）'));
+      }
       return html`<div>
         <div class="row">
           <select class="input" value=${isCustom ? '__custom' : file}
@@ -444,58 +534,21 @@
             <option value="__custom">自定义路径…</option>
           </select>
           ${isCustom && html`<input class="input x-grow" placeholder="相对路径，如 monitors/ENV-SUMMARY.csv" value=${file}
-            onInput=${(e) => setFile(e.target.value)} />`}
+            onInput=${(e) => setFile(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') load(); }} />`}
           <select class="input" value=${n} onInput=${(e) => setN(+e.target.value)}>
             <option value="100">100 行</option><option value="300">300 行</option>
             <option value="1000">1000 行</option><option value="5000">5000 行</option>
           </select>
-          <input class="input x-grow" placeholder="关键字过滤…" value=${q}
-            onInput=${(e) => setQ(e.target.value)} />
+          <input class="input x-grow" placeholder="关键字过滤…（回车即读）" value=${q}
+            onInput=${(e) => setQ(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') load(); }} />
           <button class="btn btn-sm btn-primary" onClick=${load} disabled=${busy}>${busy ? '读取中…' : '读取'}</button>
+          <button class="btn btn-sm btn-ghost" onClick=${copyAll}
+            title="复制当前显示的全部日志文本">复制</button>
           <span class="muted">匹配 ${total} 行</span>
         </div>
         <pre class="mono" style="max-height:420px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:8px">${text}</pre>
-      </div>`;
-    }
-
-    // ---------- ⑫ 场次浏览器（身份卡 / 抽屉 / 日志 / 收尾 的入口页） ----------
-    function DetailView({ camps, curCid, setCurCid }) {
-      const [cid, setCid] = useState(curCid || (camps[0] && camps[0].cid) || '');
-      const [fids, setFids] = useState([]);
-      const [fid, setFid] = useState('');
-      const [drawer, setDrawer] = useState(false);
-      const [sub, setSub] = useState('场次');
-      useEffect(() => { if (!cid && camps[0]) setCid(camps[0].cid); }, [camps]);
-      useEffect(() => {
-        if (!cid) return;
-        getJSON('/api/queue?cid=' + encodeURIComponent(cid)).then(({ j }) => {
-          const list = (j.fields || []).map((f) => f.fid).filter(Boolean);
-          setFids(list); setFid((prev) => list.includes(prev) ? prev : (list[0] || ''));
-        });
-      }, [cid]);
-      return html`<div>
-        <div class="card">
-          <div class="card-title">场次浏览器</div>
-          <p class="card-desc">逐场次看实测身份、判定详情、每节点 5s 监控曲线与全文日志；可给中途停掉的 campaign 补结束行。</p>
-          <div class="row">
-            <label class="muted">campaign</label>
-            <select class="input x-grow" value=${cid} onInput=${(e) => { setCid(e.target.value); setCurCid(e.target.value); }}>
-              ${camps.map((c) => html`<option key=${c.cid} value=${c.cid}>${c.cid}</option>`)}
-            </select>
-            <label class="muted">场次</label>
-            <select class="input x-grow" value=${fid} onInput=${(e) => setFid(e.target.value)}>
-              ${fids.map((f) => html`<option key=${f} value=${f}>${f}</option>`)}
-            </select>
-            <button class="btn btn-primary btn-sm" onClick=${() => setDrawer(true)} disabled=${!fid}>打开详情抽屉</button>
-          </div>
-          <div class="drawer-tabs" style="border-top:1px solid hsl(var(--border));border-bottom:none;padding:8px 0 0">
-            ${['场次', '日志', '收尾'].map((t) => html`<button key=${t}
-              class=${'btn btn-sm ' + (sub === t ? 'btn-primary' : 'btn-ghost')} onClick=${() => setSub(t)}>${t}</button>`)}
-          </div>
-        </div>
-        ${sub === '日志' && cid ? html`<div class="card"><div class="card-title">日志全文</div><${LogViewer} cid=${cid} /></div>` : null}
-        ${sub === '收尾' && cid ? html`<div class="card"><div class="card-title">campaign 收尾</div><${CloseCard} cid=${cid} /></div>` : null}
-        ${drawer && cid && fid ? html`<${RaceDetailDrawer} cid=${cid} fid=${fid} onClose=${() => setDrawer(false)} />` : null}
       </div>`;
     }
 
@@ -596,41 +649,6 @@
       </div>`;
     }
 
-    // ---------- ⑭ est 自动校准：给 compose 表单注入估算建议按钮 ----------
-    function EstSuggestBar({ form, setForm }) {
-      const [suggestions, setSuggestions] = useState({});
-      const [busy, setBusy] = useState(false);
-      async function calibrate() {
-        const tracks = (form.tracks || []).concat(
-          form.custom ? form.custom.split(/[\s,]+/).filter(Boolean) : []);
-        if (!tracks.length) { toast.err('先选赛道'); return; }
-        setBusy(true);
-        const out = {};
-        await Promise.all(tracks.map(async (t) => {
-          try {
-            const { j } = await getJSON('/api/est-suggest?track=' + encodeURIComponent(t));
-            if (j.available) out[t] = j.suggest;
-          } catch (e) {}
-        }));
-        setSuggestions(out); setBusy(false);
-        if (!Object.keys(out).length) { toast.err('历史里没有这些赛道的可用耗时'); return; }
-        // 把建议写进 est 覆盖文本（仅填用户尚未手写的赛道）
-        const parts = (form.est || '').split(',').map((s) => s.trim()).filter(Boolean);
-        const have = new Set(parts.map((s) => s.split('=')[0]));
-        for (const [t, v] of Object.entries(out)) {
-          if (!have.has(t)) parts.push(t + '=' + v);
-        }
-        setForm((f) => Object.assign({}, f, { est: parts.join(', ') }));
-        toast.ok('已按历史中位耗时回填 ' + Object.keys(out).length + ' 条 est（可再手改）');
-      }
-      const summary = Object.keys(suggestions).map((t) => t + ':' + suggestions[t] + 'm').join(' · ');
-      return html`<div class="row">
-        <button class="btn btn-sm btn-ghost" onClick=${calibrate} disabled=${busy}>
-          ${busy ? '查询历史中…' : 'est 自动校准'}</button>
-        ${summary ? html`<span class="muted">建议 ${summary}</span>` : html`<span class="muted">按历史同赛道有效场次的中位耗时回填 est</span>`}
-      </div>`;
-    }
-
     // ---------- ⑮ 深链路由（hash） ----------
     function parseHash() {
       const m = /^#\/([a-z]+)(?:\/([^?]+))?/.exec(location.hash || '');
@@ -654,8 +672,7 @@
     window.RacewayExtras = {
       setup,
       TrackFilesView, ReportView, ExportGenView,
-      DetailView, SidecarCard, RaceDetailDrawer, MonitorChart, LogViewer, CloseCard,
-      PresetBar, EstSuggestBar,
+      SidecarCard, RaceDetailDrawer, MonitorChart, LogViewer, CloseCard, PresetBar,
       DownloadBtn, OutBox, kvRows,
       readPresets, writePresets, formSnapshot, parseHash, installHashRoute,
     };

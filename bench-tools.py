@@ -23,11 +23,16 @@ build-race-store→bench-export→bench-apply 入库。控制台新增的能力�
   python3 bench-tools.py track-del   <相对路径> [--expect sha256]
   python3 bench-tools.py export-gen  --tag TAG <cid> [<cid> ...]
   python3 bench-tools.py close       <cid> [--run] [--reason 文本]   # 默认 dry-run，--run 才真正执行
+  python3 bench-tools.py result      <cid>          # 场内速览：逐场次判定 + 逐任务吞吐/延迟
+  python3 bench-tools.py mutex                      # 集群占用预检（.runner.lock，只读）
+  python3 bench-tools.py stop        <cid> --yes    # 停止远端 runner/esrally（必须显式 --yes）
+  python3 bench-tools.py cars-validate [--cars-file F]   # 车定义 runner 同口径校验（不写盘）
 
 全局参数：--root DIR  --ssh user@host  --results-root DIR  --raw（文本原样输出）
 说明：
   - report / track-read 默认原样输出文本（便于重定向）；其余输出 JSON。加 --raw 强制原样。
   - close 默认 dry-run，必须显式 --run 才补结束行（与页面二次确认同口径）。
+  - stop 是控制台唯一杀进程的操作，必须显式 --yes（对应页面上的二次确认）。
   - 赛道文件写入带 sha256 并发校验：传 --expect 时若文件已被改动会拒绝，避免覆盖他人修改。
 """
 import argparse
@@ -87,6 +92,7 @@ def main(argv=None):
     ap.add_argument('action', choices=[
         'sidecar', 'detail', 'monitor', 'log', 'report', 'est', 'track-ls',
         'track-read', 'track-write', 'track-del', 'export-gen', 'close',
+        'result', 'mutex', 'stop', 'cars-validate',
     ])
     ap.add_argument('pos', nargs='*', help='位置参数（各动作不同，见 --help）')
     ap.add_argument('--root', default=None)
@@ -100,6 +106,9 @@ def main(argv=None):
     ap.add_argument('--file', default=None)
     ap.add_argument('--expect', default=None)
     ap.add_argument('--tag', default=None)
+    ap.add_argument('--cars-file', default=None,
+                    help='cars-validate 用：车定义文件路径（缺省同 compose 的三级回退）')
+    ap.add_argument('--yes', action='store_true', help='stop 真正执行（缺省拒绝，杀进程必须显式确认）')
     ap.add_argument('--run', action='store_true', help='close 真正执行（缺省 dry-run）')
     ap.add_argument('--reason', default='命令行收尾')
     ap.add_argument('--raw', action='store_true', help='文本原样输出')
@@ -112,6 +121,7 @@ def main(argv=None):
     st = build_state(args)
     pos = args.pos
     a = args.action
+    exit_code = None   # cars-validate 有 error 时置 1，在 except 块之外统一退出
 
     try:
         if a == 'sidecar':
@@ -257,6 +267,88 @@ def main(argv=None):
             need(pos, 1, 'close <cid> [--run]')
             emit(C.api_close(st, {'cid': pos[0], 'dry_run': not args.run,
                                   'reason': args.reason}))
+
+        elif a == 'result':
+            need(pos, 1, 'result <cid>')
+            code, payload = C.api_campaign_result(st, pos[0])
+            check(code, payload)
+            if args.raw or args.out:
+                out = []
+                for r in payload.get('rows', []):
+                    out.append('== %s (%s)' % (r.get('fid'), r.get('verdict')))
+                    for m in r.get('metrics', []):
+                        lat = ''
+                        if m.get('lat_p99') is not None:
+                            lat = ' p99=%s%s' % (m['lat_p99'], m.get('lat_unit') or '')
+                        out.append('  %s %s %s %s%s' % (m.get('phase'), m.get('task'),
+                                                        m.get('throughput'), m.get('tput_unit') or '', lat))
+                text = '\n'.join(out) + ('\n' if out else '')
+                show = maybe_write(text, args.out)
+                if show:
+                    sys.stdout.write(text)
+            else:
+                emit(payload)
+
+        elif a == 'mutex':
+            code, payload = C.api_mutex(st)
+            check(code, payload)
+            if args.raw:
+                sys.stdout.write(('free\n' if payload.get('free')
+                                  else 'busy: %s\n' % (payload.get('why') or '')))
+            else:
+                emit(payload)
+
+        elif a == 'stop':
+            need(pos, 1, 'stop <cid> --yes')
+            if not args.yes:
+                raise SystemExit('stop 会杀掉远端 runner 与 esrally 进程 —— 确认无误请加 --yes'
+                                 '（与页面二次确认同口径）')
+            code, payload = C.api_stop(st, {'cid': pos[0]})
+            check(code, payload)
+            if args.raw:
+                sys.stdout.write((payload.get('result') or '') + '\n')
+            else:
+                emit(payload)
+
+        elif a == 'cars-validate':
+            # 复用 compose 的车文件定位（env → 仓库默认 → 报错），只读不写
+            cargs = argparse.Namespace(**vars(args))
+            if cargs.cars_file is None:
+                cargs.cars_file = (os.environ.get('RACEWAY_CARS_FILE')
+                                   or os.path.join(cargs.root, 'schedules', 'dimsweep-cars.conf'))
+                if not os.path.isfile(cargs.cars_file) and not cargs.ssh:
+                    _leg = cargs.cars_file.replace('cars.conf', 'arms.conf')
+                    if os.path.isfile(_leg):
+                        cargs.cars_file = _leg
+            if not cargs.ssh and not os.path.isfile(cargs.cars_file):
+                raise SystemExit('找不到车定义文件: %s\n用 --cars-file 指定路径，'
+                                 '或设环境变量 RACEWAY_CARS_FILE 指向它。' % cargs.cars_file)
+            content = C.read_cars_file(cargs)
+            pkg_dir = None
+            try:
+                with open(os.path.join(cargs.root, 'vm-bench.env'), encoding='utf-8') as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.startswith('PKG_DIR='):
+                            pkg_dir = s.partition('=')[2].strip().strip('"').strip("'")
+                            pkg_dir = pkg_dir.replace('${ROOT}', cargs.root).replace('$ROOT', cargs.root)
+                            break
+            except OSError:
+                pass
+            cars, diagnostics = C.parse_cars_strict(content, pkg_dir=pkg_dir)
+            errors = [d for d in diagnostics if d.get('severity') == 'error']
+            reply = {'path': cargs.cars_file, 'cars': len(cars), 'ok': not errors,
+                     'diagnostics': diagnostics}
+            if args.raw:
+                for d in diagnostics:
+                    sys.stdout.write('%s 行%s: %s\n' % (d.get('severity', '?'),
+                                                       d.get('line') or '?', d.get('message')))
+                if not diagnostics:
+                    sys.stdout.write('OK: %d 车，无诊断\n' % len(cars))
+            else:
+                emit(reply)
+            if errors:
+                exit_code = 1
     except SystemExit as e:
         # 参数解析（argparse）自身的退出码 0/2 原样放行；业务错误统一加"错误:"前缀，
         # 且不重复抛给顶层（否则消息打印两遍）。
@@ -268,6 +360,8 @@ def main(argv=None):
     except (ValueError, RuntimeError) as e:
         print('错误: ' + str(e), file=sys.stderr)
         sys.exit(1)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def need(pos, n, usage):
