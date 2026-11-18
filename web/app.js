@@ -830,9 +830,26 @@ function HistMatrix({ hist, boot, form, setForm }) {
 }
 
 // ==================== ② 运行进度 ====================
+// 场次表的状态筛选：场次一多（codec 矩阵 18+ 场）想找失败/待跑的行全靠肉眼。
+// 分组口径与状态卡一致：DEGRADED 算有效，任意 *-FAIL 算失败，SKIP/DEADLINE-SKIP 算跳过。
+const STAT_F = [
+  ['ALL', '全部'], ['RUN', '运行中'], ['VALID', '有效'], ['FAIL', '失败'], ['SKIP', '跳过'], ['PEND', '待跑'],
+];
+function statMatch(code, st) {
+  switch (code) {
+    case 'RUN': return st === 'RUNNING';
+    case 'VALID': return st === 'VALID' || st === 'DEGRADED';
+    case 'FAIL': return /FAIL/.test(st);
+    case 'SKIP': return st === 'SKIP' || st === 'DEADLINE-SKIP';
+    case 'PEND': return st === 'PENDING';
+    default: return true;
+  }
+}
+
 function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
   const [queue, setQueue] = useState(null);
   const [tail, setTail] = useState('（空）');
+  const [statFilter, setStatFilter] = useState('ALL');
   // 轮询间隔（秒）：0=手动。压测期间可调大/关掉，减少压测机上的 ssh 轮询噪声；
   // 存 localStorage 记住选择，不用每次压测重调。
   const [pollSec, setPollSec] = useState(() => {
@@ -943,6 +960,7 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
 
   async function doStop() {
     if (!curCid) { toast.err('未选择 campaign'); return; }
+    if (curCamp && curCamp.ended) { toast.info('该 campaign 已停止/结束，无需停止'); return; }
     if (!confirm('确认停止 ' + curCid + '？\n将杀掉远端 runner 与 esrally 进程；campaign 目录保留，可断点续跑。')) return;
     toast.info('停止中…');
     const { status, j } = await postJSON('/api/stop', { cid: curCid });
@@ -952,6 +970,10 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
   }
 
   function endState(c) { return !c.ended ? '运行中' : (/中止/.test(c.last || '') ? '已中止' : '已结束'); }
+  // 已停止（已结束/已中止）的 campaign 不再提供停止入口 —— 没有进程可杀，点了也只会白报错
+  const curCamp = camps.find((c) => c.cid === curCid);
+  const stopDisabled = !curCid
+    || (curCamp ? curCamp.ended : !!(queue && queue.campaign === curCid && queue.ended));
   // 没收尾但进度文件长期无更新 → runner 大概率已被杀（页面标出来 + 一键处理）
   const warns = (queue && queue.warnings || []).map((w) => ({ text: w, stale: false }));
   const camp = camps.find((x) => x.cid === (queue && queue.campaign));
@@ -995,14 +1017,19 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
     ['待跑', s.pending], ['剩余约(分)', s.est_remaining_min != null ? Math.round(s.est_remaining_min) : '-'], ['预计完成', eta]];
   // 快切条：最近 20 场；当前选中的若不在其中（比如老的遗留 campaign），插到最前保证可见
   const chipCamps = camps.slice(0, 20);
-  if (curCid && !chipCamps.some((c) => c.cid === curCid)) {
-    const curCamp = camps.find((c) => c.cid === curCid);
-    if (curCamp) chipCamps.unshift(curCamp);
+  if (curCid && curCamp && !chipCamps.some((c) => c.cid === curCid)) {
+    chipCamps.unshift(curCamp);
   }
   // 警告降噪：最多直接展示 2 条（矛盾判定/STATE 冲突一多就把整张表推到视野外），
   // 其余收进折叠
   const warnHead = warns.slice(0, 2);
   const warnTail = warns.slice(2);
+
+  // 场次表状态筛选（切 campaign 不清 —— 看下一场时通常还在找同类行）
+  const allFields = (queue && queue.fields) || [];
+  const statCounts = {};
+  STAT_F.forEach(([code]) => { statCounts[code] = allFields.filter((f) => statMatch(code, f.status)).length; });
+  const fields = statFilter === 'ALL' ? allFields : allFields.filter((f) => statMatch(statFilter, f.status));
 
   // PROGRESS 行着色：一眼分清 OK / 失败 / 警告 / 相位推进
   function lineCls(l) {
@@ -1039,7 +1066,9 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
         ${lastPoll && html`<span class="muted">上次拉取 ${lastPoll.toLocaleTimeString()}</span>`}
         <label class="chk"><input type="checkbox" checked=${notify} onChange=${(e) => setNotify(e.target.checked)} /> 完成提醒</label>
         <div class="spacer"></div>
-        <button class="btn btn-danger btn-sm" onClick=${doStop}>■ 停止该 campaign</button>
+        <button class="btn btn-danger btn-sm" disabled=${stopDisabled}
+          title=${stopDisabled ? '该 campaign 已停止/结束，无需停止' : '杀掉远端 runner 与 esrally 进程（目录保留，可断点续跑）'}
+          onClick=${doStop}>■ 停止该 campaign</button>
       </div>
 
       <div class="camp-chips" title="最近 campaign 快速切换">
@@ -1074,10 +1103,19 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
         <summary>⚠ 还有 ${warnTail.length} 条警告（矛盾判定 / STATE 冲突 / 窗底等）</summary>
         ${warnTail.map((w, i) => html`<div key=${i} class="warn-box">⚠ ${w.text}</div>`)}
       </details>` : null}
+      ${(queue && (queue.fields || []).length) ? html`
+        <div class="camp-chips" style="margin-top:10px" title="按状态筛选场次表（口径与上方状态卡一致）">
+          <span class="muted" style="font-size:12px;align-self:center">筛选</span>
+          ${STAT_F.map(([code, label]) => html`
+            <button key=${code} class=${'camp-chip' + (statFilter === code ? ' on' : '')}
+              onClick=${() => setStatFilter(code)}>
+              ${label} <small>${statCounts[code]}</small>
+            </button>`)}
+        </div>` : null}
       <table class="tbl">
         <thead><tr><th>seq</th><th>场次</th><th>状态</th><th>用时</th><th>recall</th><th>说明</th><th></th></tr></thead>
         <tbody>
-          ${(queue && queue.fields || []).map((f) => {
+          ${fields.map((f) => {
             const cls = f.status === 'VALID' ? 'st-ok' : f.status === 'RUNNING' ? 'st-run'
               : (f.status === 'SKIP' || f.status === 'DEADLINE-SKIP') ? 'st-skip'
               : f.status === 'PENDING' ? 'st-pend' : 'st-bad';
@@ -1103,8 +1141,10 @@ function ProgressView({ boot, camps, curCid, setCurCid, reload, EX }) {
                   onClick=${() => setDrawerFid(f.fid)}>详情</button>` : null}
               </td></tr>`;
           })}
-          ${(!queue || !(queue.fields || []).length) && html`
+          ${(!allFields.length) && html`
             <tr><td colspan="7" class="muted">（等待选择 campaign）</td></tr>`}
+          ${(allFields.length > 0 && fields.length === 0) && html`
+            <tr><td colspan="7" class="muted">（没有「${STAT_F.find((x) => x[0] === statFilter)[1]}」状态的场次）</td></tr>`}
         </tbody>
       </table>
     </div>

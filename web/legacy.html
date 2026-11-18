@@ -139,7 +139,15 @@
   <button onclick="loadCampaigns()">刷新列表</button>
   <label style="margin-left:10px"><input type="checkbox" id="pauto" checked> 自动刷新（5s）</label>
   <label style="margin-left:10px"><input type="checkbox" id="pnotify"> 完成提醒</label>
-  <button onclick="doStop()" style="float:right;background:#fee2e2;border:1px solid #fca5a5;color:#b00">■ 停止该 campaign</button>
+  <select id="pstatf" style="margin-left:10px" onchange="renderProgress(LASTQ)" title="按状态筛选场次表（口径与状态卡一致）">
+   <option value="ALL">全部状态</option>
+   <option value="RUN">运行中</option>
+   <option value="VALID">有效</option>
+   <option value="FAIL">失败</option>
+   <option value="SKIP">跳过</option>
+   <option value="PEND">待跑</option>
+  </select>
+  <button id="pstop" onclick="doStop()" title="杀掉远端 runner 与 esrally 进程（目录保留，可断点续跑）" style="float:right;background:#fee2e2;border:1px solid #fca5a5;color:#b00">■ 停止该 campaign</button>
  </fieldset>
  <div id="pcur" class="pcur">（未选择）</div>
  <div class="pbar"><i id="pbar" style="width:0"></i></div>
@@ -221,6 +229,7 @@ let CSRF = '', PREVIEW = null;
 function writeHeaders(){return {'Content-Type':'application/json','X-Raceway-CSRF':CSRF};}
 // 控制台状态：当前看的 campaign、轮询定时器、campaign 摘要列表、上一轮"是否已结束"（完成提醒用）
 let CURCID = null, POLLT = null, CAMPS = [], PREV_ENDED = null;
+let LASTQ = null; // 最近一次 /api/queue 响应（状态筛选切换时重渲染用）
 const VT = {VALID:'✓已跑',DEGRADED:'~降级',HALF:'半',SKIP:'跳过',FAIL:'✗失败',UNKNOWN:'?'};
 const VC = {VALID:'v-ok',DEGRADED:'v-deg',HALF:'v-half',SKIP:'v-skip',FAIL:'v-fail',UNKNOWN:'v-none'};
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
@@ -533,6 +542,7 @@ async function pollNow(){
 }
 
 function renderProgress(d){
+  LASTQ=d;
   const s=d.stats||{};
   const run=(d.fields||[]).find(function(f){return f.status==='RUNNING';});
   // 标签页标题当状态栏用：切到别的页也能瞄一眼进度
@@ -578,7 +588,28 @@ function renderProgress(d){
   }
   document.getElementById('pwarns').innerHTML=warns
     .map(function(w){return '<div class="warn">⚠ '+esc(w)+'</div>';}).join('');
-  document.getElementById('prows').innerHTML=(d.fields||[]).map(function(f){
+  // 已停止（已结束/已中止）的 campaign 禁用停止按钮 —— 没有进程可杀，点了也只会白报错
+  const curCampStale=CAMPS.find(function(x){return x.cid===CURCID;});
+  const stopBtn=document.getElementById('pstop');
+  if(stopBtn){
+    const stopOff=!CURCID||(curCampStale?curCampStale.ended:(d.campaign===CURCID&&d.ended));
+    stopBtn.disabled=stopOff;
+    stopBtn.title=stopOff?'该 campaign 已停止/结束，无需停止':'杀掉远端 runner 与 esrally 进程（目录保留，可断点续跑）';
+  }
+  // 场次表按状态筛选（口径与新版控制台一致：DEGRADED 算有效、*-FAIL 算失败）
+  function statMatch(code,st){
+    switch(code){
+      case 'RUN': return st==='RUNNING';
+      case 'VALID': return st==='VALID'||st==='DEGRADED';
+      case 'FAIL': return /FAIL/.test(st);
+      case 'SKIP': return st==='SKIP'||st==='DEADLINE-SKIP';
+      case 'PEND': return st==='PENDING';
+      default: return true;
+    }
+  }
+  const statf=document.getElementById('pstatf')?document.getElementById('pstatf').value:'ALL';
+  const fields=(d.fields||[]).filter(function(f){return statMatch(statf,f.status);});
+  document.getElementById('prows').innerHTML=fields.length?fields.map(function(f){
     const cls=f.status==='VALID'?'st-ok':f.status==='RUNNING'?'st-run':
       (f.status==='SKIP'||f.status==='DEADLINE-SKIP')?'st-skip':
       f.status==='PENDING'?'st-pend':'st-bad';
@@ -598,7 +629,9 @@ function renderProgress(d){
     return '<tr class="'+(f.status==='RUNNING'?'now':'')+'"><td>'+f.seq+'</td><td>'+esc(f.fid)+'</td>'+
       '<td class="'+cls+'">'+esc(f.status)+'</td><td>'+esc(f.duration||'-')+'</td>'+
       '<td>'+esc(f.recall||'-')+'</td><td>'+esc(note)+'</td></tr>';
-  }).join('');
+  }).join(''):'<tr><td colspan="6" class="sub">（没有「'+
+    ({ALL:'全部',RUN:'运行中',VALID:'有效',FAIL:'失败',SKIP:'跳过',PEND:'待跑'}[statf]||statf)+
+    '」状态的场次）</td></tr>';
 }
 
 function renderHistory(){
@@ -656,6 +689,8 @@ async function reorderCamp(cid){
 
 async function doStop(){
   if(!CURCID){ setMsg(false,'未选择 campaign'); return; }
+  const curCamp=CAMPS.find(function(x){return x.cid===CURCID;});
+  if(curCamp&&curCamp.ended){ setMsg(false,'该 campaign 已停止/结束，无需停止'); return; }
   if(!confirm('确认停止 '+CURCID+'？\n将杀掉远端 runner 与 esrally 进程；campaign 目录保留，可断点续跑。'))return;
   setMsg(true,'停止中…');
   try{
