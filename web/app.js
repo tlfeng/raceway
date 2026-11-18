@@ -1934,12 +1934,19 @@ function ExportView({ boot, camps, EX }) {
     if (status !== 200) { setExpInfo('读取失败: ' + (j.error || '未知')); return; }
     const list = j.exports || [];
     setExports(list);
-    if (list.length) setExp(list[0].tag);
+    // 保留当前选择（重新生成/刷新后不把用户已选的 tag 跳回第一项）；没有则取第一个
+    setExp((prev) => list.some((e) => e.tag === prev) ? prev : (list[0] ? list[0].tag : ''));
     setExpInfo(list.length
       ? '断言未通过或缺失的导出，bench-apply 会在预检拒绝，不会发任何请求。'
       : '（exports/ 下没有可入库的导出）');
   }
   useEffect(() => { loadExports(); }, []);
+  // 「一键生成导出」成功后自动带上新 tag（extras.js ExportGenView 发事件）
+  useEffect(() => {
+    const onR = () => loadExports();
+    window.addEventListener('raceway-exports-refresh', onR);
+    return () => window.removeEventListener('raceway-exports-refresh', onR);
+  }, []);
 
   async function doApply() {
     if (!exp) { toast.err('请先刷新并选择导出'); return; }

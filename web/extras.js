@@ -77,8 +77,11 @@
       async function save() {
         if (!sel) return;
         const p = (sel.path || '').trim();
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(p) || p.includes('..')) {
-          toast.err('文件名只能是字母数字与 ._-（可含 / 目录）'); return;
+        // 与后端 safe_track_path 同口径：分段校验，允许 / 子目录（如 geonames/index.json）
+        const segs = p.split('/');
+        if (!p || p.length > 200 || p.startsWith('/') || p.includes('\\')
+          || !segs.every((s) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s))) {
+          toast.err('路径每段只能是字母数字与 ._-，可用 / 分目录（如 geonames/index.json）'); return;
         }
         setBusy(true);
         const body = { path: p, content: draft };
@@ -157,6 +160,8 @@
       const [text, setText] = useState('');
       const [busy, setBusy] = useState(false);
       useEffect(() => { if (!cid && camps[0]) setCid(camps[0].cid); }, [camps]);
+      // 跟随进度页/快切条当前选中的 campaign（curCid 变化即带上，不用再手选）
+      useEffect(() => { if (curCid) setCid(curCid); }, [curCid]);
 
       async function gen() {
         if (!cid) { toast.err('先选一个 campaign'); return; }
@@ -213,7 +218,8 @@
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(tag.trim())) {
           toast.err('导出 tag 只能是安全文件名（字母数字开头）'); return;
         }
-        setBusy(true); setStartedAt(Date.now()); setElapsed(0); setSummary(null);
+        const t0 = Date.now(); // 不能读闭包里的 startedAt —— setState 后本闭包里还是旧值（null）
+        setBusy(true); setStartedAt(t0); setElapsed(0); setSummary(null);
         setOut('生成中：build-race-store → bench-export…（可能数分钟，取决于场次与指标量）');
         try {
           const { status, j } = await postJSON('/api/export-gen', { tag: tag.trim(), campaigns: sel });
@@ -221,7 +227,9 @@
           else {
             setOut(j.log || '已生成导出 ' + tag);
             setSummary(j.summary || null);
-            toast.ok('导出已生成: ' + tag + '（耗时 ' + Math.round((Date.now() - startedAt) / 1000) + 's）');
+            toast.ok('导出已生成: ' + tag + '（耗时 ' + Math.round((Date.now() - t0) / 1000) + 's）');
+            // 让同页的「结果入库」清单自动带上新 tag（监听方：app.js ExportView）
+            window.dispatchEvent(new CustomEvent('raceway-exports-refresh'));
           }
         } catch (e) { setOut(String(e)); toast.err(String(e)); }
         setBusy(false); setStartedAt(null);
@@ -519,6 +527,13 @@
         setBusy(false);
       }
       useEffect(() => { if (cid) load(); }, [cid, file]);
+      // 行数档位改动立即重读（跳过挂载首轮 —— [cid,file] 已经拉过）；
+      // 关键字过滤刻意保留回车触发，避免输入中途空转
+      const firstN = useRef(true);
+      useEffect(() => {
+        if (firstN.current) { firstN.current = false; return; }
+        if (cid && file) load();
+      }, [n]);
       // 抽屉里点产物切过来时，跟随目标文件（initialFile 只在点击时变化，改 file 自动触发 load）
       useEffect(() => { if (initialFile) setFile(initialFile); }, [initialFile]);
       function copyAll() {
@@ -536,7 +551,8 @@
           ${isCustom && html`<input class="input x-grow" placeholder="相对路径，如 monitors/ENV-SUMMARY.csv" value=${file}
             onInput=${(e) => setFile(e.target.value)}
             onKeyDown=${(e) => { if (e.key === 'Enter') load(); }} />`}
-          <select class="input" value=${n} onInput=${(e) => setN(+e.target.value)}>
+          <select class="input" value=${n} onInput=${(e) => setN(+e.target.value)}
+            title="改动行数立即重读（关键字过滤仍需回车）">
             <option value="100">100 行</option><option value="300">300 行</option>
             <option value="1000">1000 行</option><option value="5000">5000 行</option>
           </select>
@@ -570,9 +586,9 @@
         <p class="muted">给没有结束行的 campaign 补一行合法结束行；活跃 runner 会被自动跳过，不碰集群/判定。先预演确认再执行。</p>
         <div class="row">
           <label class="check-item"><input type="checkbox" checked=${dry} onChange=${(e) => setDry(e.target.checked)} /> 预演（dry-run，不改动）</label>
-          ${!dry && !confirm ? html`<button class="btn btn-ghost btn-sm" onClick=${() => setConfirm(true)}>执行收尾…</button>`
-            : html`<button class="btn btn-danger btn-sm" onClick=${run} disabled=${busy}>${dry ? '预演' : '确认执行'}收尾</button>`}
-          ${dry ? html`<button class="btn btn-sm" onClick=${run} disabled=${busy}>${busy ? '运行中…' : '预演'}</button>` : null}
+          ${dry ? html`<button class="btn btn-secondary btn-sm" onClick=${run} disabled=${busy}>${busy ? '运行中…' : '预演'}</button>`
+            : !confirm ? html`<button class="btn btn-ghost btn-sm" onClick=${() => setConfirm(true)}>执行收尾…</button>`
+            : html`<button class="btn btn-danger btn-sm" onClick=${run} disabled=${busy}>确认执行收尾</button>`}
         </div>
         ${out ? html`<pre class="mono" style="max-height:300px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:8px">${out}</pre>` : null}
       </div>`;
