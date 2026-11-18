@@ -61,26 +61,76 @@ PROG_LINES = [
     '[00:27:30] 卡点 precheck：机器安静 ✓',
 ]
 
-def queue_payload():
-    now = time.time()
+# 四个 campaign 各占一种 UI 状态，方便离线把每个状态都点一遍：
+#   running → 进度条 / RUNNING 行 / 停止按钮可用
+#   ended-ok → ✔ 已结束 / 停止按钮禁用
+#   ended-abort → 已中止 / 失败行 / 矛盾判定警告 / 停止按钮禁用
+#   stale → 没收尾且 mtime 久未更新 / 卡死警告（去收尾 + 停止并收尾）/ 停止按钮可用
+CID_RUN = 'jdk3-20261115-093000'
+CID_END = 'jdk3-20261112-140500'
+CID_ABORT = 'jdk3-20261108-090100'
+CID_STALE = 'jdk3-20261110-071500'
+
+
+def queue_payload(cid=None):
+    if cid not in (None, CID_RUN, CID_END, CID_ABORT, CID_STALE):
+        return None  # 未知 cid → 上层回 404（与后端一致，别让演示页拿错数据）
     fields = []
-    st = ['VALID', 'RUNNING', 'PENDING', 'PENDING', 'PENDING', 'PENDING']
-    dur = ['16m 24s', '', '', '', '', '']
-    for i, fid in enumerate(FIDS):
-        f = {'seq': i + 1, 'fid': fid, 'status': st[i], 'recall': 'recall' if i % 2 == 0 else 'norecall',
-             'duration': dur[i], 'detail': ''}
-        if st[i] == 'RUNNING':
-            f['phase'] = 'search'
-            f['elapsed_min'] = 8.4
-        if st[i] == 'VALID':
-            f['env_verdict'] = 'OK'
-        if st[i] == 'RUNNING':
-            f['env_verdict'] = 'OK'
-        fields.append(f)
-    return {'campaign': 'jdk3-20261115-093000', 'ended': False, 'started_at': '09:30:00',
+    if cid in (None, CID_RUN):
+        st = ['VALID', 'RUNNING', 'PENDING', 'PENDING', 'PENDING', 'PENDING']
+        dur = ['16m 24s', '', '', '', '', '']
+        for i, fid in enumerate(FIDS):
+            f = {'seq': i + 1, 'fid': fid, 'status': st[i], 'recall': 'recall' if i % 2 == 0 else 'norecall',
+                 'duration': dur[i], 'detail': ''}
+            if st[i] == 'RUNNING':
+                f['phase'] = 'search'
+                f['elapsed_min'] = 8.4
+            if st[i] in ('VALID', 'RUNNING'):
+                f['env_verdict'] = 'OK'
+            fields.append(f)
+        return {'campaign': CID_RUN, 'ended': False, 'started_at': '09:30:00',
+                'rounds': 2, 'tracks': ['geonames'],
+                'stats': {'total': 6, 'valid': 1, 'failed': 0, 'skipped': 0, 'pending': 4,
+                          'est_remaining_min': 96},
+                'fields': fields, 'warnings': []}
+    if cid == CID_END:
+        for i, fid in enumerate(FIDS):
+            fields.append({'seq': i + 1, 'fid': fid, 'status': 'VALID',
+                           'recall': 'recall' if i % 2 == 0 else 'norecall',
+                           'duration': '16m %02ds' % (24 + i * 3), 'detail': '',
+                           'env_verdict': 'OK'})
+        return {'campaign': CID_END, 'ended': True, 'started_at': '14:05:00',
+                'rounds': 2, 'tracks': ['geonames'],
+                'stats': {'total': 6, 'valid': 6, 'failed': 0, 'skipped': 0, 'pending': 0,
+                          'est_remaining_min': 0},
+                'fields': fields, 'warnings': []}
+    if cid == CID_ABORT:
+        st = ['VALID', 'VALID', 'RACE-FAIL', 'VALID', 'DEADLINE-SKIP', 'PENDING']
+        det = {2: 'rally 执行失败：已自动重试 3 次仍败，看 logs 尾部',
+               4: '预计用时超出 DEADLINE 窗底', 5: '窗口关闭时还没轮到'}
+        for i, fid in enumerate(FIDS):
+            f = {'seq': i + 1, 'fid': fid, 'status': st[i], 'recall': 'recall' if i % 2 == 0 else 'norecall',
+                 'duration': ('15m %02ds' % (i * 7)) if st[i] == 'VALID' else '', 'detail': det.get(i, '')}
+            if st[i] == 'VALID':
+                f['env_verdict'] = 'OK'
+            fields.append(f)
+        return {'campaign': CID_ABORT, 'ended': True, 'started_at': '09:01:00',
+                'rounds': 2, 'tracks': ['geonames'],
+                'stats': {'total': 6, 'valid': 3, 'failed': 1, 'skipped': 1, 'pending': 1,
+                          'est_remaining_min': None},
+                'fields': fields,
+                'warnings': ['STATE.txt 与 RACES.md 判定矛盾：r2-geonames-es819（STATE=OK，RACES=RACE-FAIL）——'
+                             '确认后手动改 STATE，或以 RACES.md 为准']}
+    # 卡死态：runner 被杀（或宿主重启），进度文件长期无更新，没收尾行
+    fields.append({'seq': 1, 'fid': FIDS[0], 'status': 'RUNNING', 'recall': 'recall',
+                   'duration': '', 'detail': '', 'phase': 'bulk-index', 'elapsed_min': 71.2})
+    for i, fid in enumerate(FIDS[1:], start=2):
+        fields.append({'seq': i, 'fid': fid, 'status': 'PENDING', 'recall': 'norecall',
+                       'duration': '', 'detail': ''})
+    return {'campaign': CID_STALE, 'ended': False, 'started_at': '07:15:00',
             'rounds': 2, 'tracks': ['geonames'],
-            'stats': {'total': 6, 'valid': 1, 'failed': 0, 'skipped': 0, 'pending': 4,
-                      'est_remaining_min': 96},
+            'stats': {'total': 6, 'valid': 0, 'failed': 0, 'skipped': 0, 'pending': 5,
+                      'est_remaining_min': 190},
             'fields': fields, 'warnings': []}
 
 MON_STATE = {}
@@ -134,6 +184,9 @@ class H(BaseHTTPRequestHandler):
         p = u.path
         if p == '/' or p == '/index.html':
             with open(WEB + '/index.html', encoding='utf-8') as f:
+                return self._send(200, 'text/html; charset=utf-8', f.read())
+        if p == '/legacy':
+            with open(WEB + '/legacy.html', encoding='utf-8') as f:
                 return self._send(200, 'text/html; charset=utf-8', f.read())
         if p.startswith('/web/'):
             try:
@@ -218,24 +271,37 @@ class H(BaseHTTPRequestHandler):
         if p == '/api/campaigns':
             now = time.time()
             camps = [
-                {'cid': 'jdk3-20261115-093000', 'ended': False, 'valid': 1, 'total': 6,
+                {'cid': CID_RUN, 'ended': False, 'valid': 1, 'total': 6,
                  'mtime': now - 120, 'last': '[2/6] r1-geonames-ez2510-kona25 · search'},
-                {'cid': 'jdk3-20261112-140500', 'ended': True, 'valid': 6, 'total': 6,
+                {'cid': CID_END, 'ended': True, 'valid': 6, 'total': 6,
                  'mtime': now - 260000, 'last': '✔ 全部完成 6/6 有效'},
-                {'cid': 'jdk3-20261108-090100', 'ended': True, 'valid': 4, 'total': 6,
+                {'cid': CID_STALE, 'ended': False, 'valid': 0, 'total': 6,
+                 'mtime': now - 4800, 'last': '[1/6] r1-geonames-ez2510-jdk21 · bulk-index（之后无更新）'},
+                {'cid': CID_ABORT, 'ended': True, 'valid': 3, 'total': 6,
                  'mtime': now - 700000, 'last': '中止：DEADLINE 达成，2 场 DEADLINE-SKIP'},
             ]
-            return self._json(200, {'campaigns': camps, 'active': camps[0]['cid'], 'total': 3})
+            return self._json(200, {'campaigns': camps, 'active': camps[0]['cid'], 'total': len(camps)})
         if p == '/api/queue':
-            return self._json(200, queue_payload())
+            qp = queue_payload((q.get('cid') or [None])[0])
+            if qp is None:
+                return self._json(404, {'error': 'unknown campaign（mock 里只有 jdk3-20261115/12/11/08 四场）'})
+            return self._json(200, qp)
         if p == '/api/logtail':
             return self._json(200, {'lines': '\n'.join(PROG_LINES[-(int((q.get('n') or ['40'])[0])):])})
         if p == '/api/monitor':
             return self._json(200, monitor_payload(q.get('fid', ['x'])[0]))
         if p == '/api/campaign-result':
+            cid = (q.get('cid') or [''])[0]
+            qp = queue_payload(cid) or queue_payload(CID_RUN)
+            stmap = dict((f['fid'], f['status']) for f in qp['fields'])
             rows = []
             for i, fid in enumerate(FIDS):
-                verdict = 'VALID' if i == 0 else ('RUNNING' if i == 1 else 'PENDING')
+                verdict = stmap.get(fid, 'PENDING')
+                # 没跑的场没有指标（测试「有指标/无指标」两种行的渲染）
+                if verdict in ('PENDING', 'SKIP', 'DEADLINE-SKIP'):
+                    rows.append({'fid': fid, 'track': 'geonames', 'round': (i // 3) + 1,
+                                 'verdict': verdict, 'metrics': []})
+                    continue
                 rows.append({'fid': fid, 'track': 'geonames', 'round': (i // 3) + 1,
                              'verdict': verdict, 'metrics': [
                                  {'phase': 'wq', 'task': 'index-append',
@@ -244,7 +310,7 @@ class H(BaseHTTPRequestHandler):
                                  {'phase': 'wq', 'task': 'knn-search-10-100',
                                   'throughput': 212 - i * 5, 'tput_unit': 'ops/s',
                                   'lat_p50': 46.9, 'lat_p99': 120.0, 'lat_unit': 'ms'}]})
-            return self._json(200, {'cid': q.get('cid', [''])[0], 'rows': rows})
+            return self._json(200, {'cid': cid, 'rows': rows})
         if p == '/api/race-detail':
             fid = q.get('fid', ['x'])[0]
             return self._json(200, {
