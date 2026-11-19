@@ -500,6 +500,8 @@ python3 bench-compose.py serve --ssh root@HOST --es-auth 'admin:xxx'
 
 **① 启动排程** —— 勾选矩阵（车 × 赛道 × 圈数），按可用历史覆盖剔除已完成格子，生成排程、dry-run 预览、起跑。空选车或未知车名直接拒绝。每次请求生成独立不可变快照，车定义、排程、参数与摘要绑定；同 tag 只能复用相同内容，不覆盖另一个排程。起跑成功须确认 PID、campaign 和摘要，不以后台命令已提交当作成功。预计总耗时超出 `DS_HOURS` 会警告，实际截止由 runner 首次持久化。勾选状态记在 localStorage，成功后跳进度页。
 
+车有两个来源：车定义文件，以及 **pkg/ 自动识别**（引擎包按包名确定性推导成车，见 ⑨）。测新功能（向量量化 / 索引加密 / 快照探针）不需要手写赛道 id —— 基座下的「功能开关」chips 枚举了已支持的开关臂（`geo-enc`、`geo-snap`、`geo-snap-enc`、`hv1024x-int8`、`hv1024x-bbq`），点选即按约定 id 进排程；params 由 `vm-bench-lib.sh track_params` 按 id 解析，challenge 由 `run-bench.sh track_challenge` 按 id 选定（geo-snap 族 → `encrypted-store-snapshot`，其余 full），编排页在每个开关上标出它指向的 challenge。开关臂的引擎限制（加密/快照族 Easysearch 专有）在编排侧拦截。
+
 **② 运行进度** —— 自动选中最近一个没收尾的跑分：进度条、总场次/有效/失败/待跑卡片、剩余分钟数和预计完成时刻、当前场次与阶段、已跑多久。页面标题当状态栏（`▶ 场次 · 阶段`），切走也能瞄。`PROGRESS.txt` 的实时日志直接贴在页面上。场次表可按状态筛选（全部/运行中/有效/失败/跳过/待跑，chip 上带计数；筛选口径与状态卡一致，DEGRADED 算有效、任意 `*-FAIL` 算失败）。可以一键停掉整个跑分，会二次确认，停完自动补结束行；已结束/已中止的 campaign 停止按钮置灰（没有进程可杀）。
 
 **③ 历史与结果** —— 跑分清单、关键字筛选、复看进度与「按此重排」。两场对比显式传各自 campaign 到 A/B 取数池，支持相同车代号跨池比较；远端执行本机对比程序及 `result_selection.py` / `identity.py` 依赖，输出有效逐圈值、中位差值与极差，不解析 Markdown 报告。车代号留空会自动选择，正式比较建议明确填写。

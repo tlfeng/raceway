@@ -171,10 +171,14 @@ def base_of(tid):
     量化档不是压缩档的子集，所以要单独剥 —— 否则 hv1024x-int8 归一不出来，
     整场会被 track_unknown 闸门挡掉。
     独立目录家族（os 族 / bbqdisk）的后缀是名字的一部分，先于量化剥离判断。
+    加密/快照族（geo-enc / geo-snap / geo-snap-enc）与 runner track_base 同口径
+    归到 geo（库里 track 存基座名，track_variant 承载具体臂）。
     """
     c = canonical_id(tid)
     if '-codec-' in c:
         c = c.split('-codec-', 1)[0]
+    if c in ('geo-enc', 'geo-snap', 'geo-snap-enc'):
+        return 'geo'
     for b in DIR_FAMILY_BASES:
         if c == b or c.startswith(b + '-'):
             return c
@@ -212,7 +216,12 @@ def engines_of(tid):
 
     ZSTD 系列压缩与 index.source_reuse 都是 Easysearch 专有（ES 的 index.codec
     只有 default/best_compression，也不认 index.source_reuse）。
+    加密/快照族同理：ES 不认 index.encryption.profile / type=encrypted 仓库
+    （与 vm-bench-lib track_engines 的显式 case 同口径）。
     """
+    c = canonical_id(tid)
+    if c in ('geo-enc', 'geo-snap', 'geo-snap-enc'):
+        return 'easysearch'
     if not is_variant(tid):
         return None
     if source_reuse_of(tid) or compression_of(tid) == 'ZSTD':

@@ -41,6 +41,18 @@ TRACKS = [
      'variant': True, 'compression': 'default', 'source_reuse': False},
     {'name': 'codec-best_sr', 'label': 'best_compression + sr', 'est': 41, 'group': 'base', 'base': 'geonames',
      'variant': True, 'compression': 'best_compression', 'source_reuse': True, 'engines': 'easysearch'},
+    # 功能开关臂：点选即按约定 id 进排程（params/challenge 由 runner 侧按 id 解析）
+    {'name': 'geo-enc', 'label': '索引加密', 'est': 42, 'group': 'base', 'base': 'geonames',
+     'variant': True, 'switches': {'encrypted': True}, 'challenge': 'full', 'engines': 'easysearch'},
+    {'name': 'geo-snap', 'label': '快照探针·明文s3', 'est': 44, 'group': 'base', 'base': 'geonames',
+     'variant': True, 'switches': {'snapshot': 's3'}, 'challenge': 'encrypted-store-snapshot', 'engines': 'easysearch'},
+    {'name': 'geo-snap-enc', 'label': '快照探针·加密s3 · 索引加密', 'est': 46, 'group': 'base', 'base': 'geonames',
+     'variant': True, 'switches': {'snapshot': 'enc_s3', 'encrypted': True}, 'challenge': 'encrypted-store-snapshot',
+     'engines': 'easysearch'},
+    {'name': 'hv1024x-int8', 'label': '量化 int8_hnsw', 'est': 20, 'group': 'vector', 'base': 'hv1024',
+     'variant': True, 'switches': {'quant': 'int8_hnsw'}, 'challenge': 'full'},
+    {'name': 'hv1024x-bbq', 'label': '量化 bbq_hnsw', 'est': 20, 'group': 'vector', 'base': 'hv1024',
+     'variant': True, 'switches': {'quant': 'bbq_hnsw'}, 'challenge': 'full'},
 ]
 TOKENS = ['default', 'best', 'zstd']
 TOKEN_LABEL = {'default': 'default', 'best': 'best_compression', 'zstd': 'zstd'}
