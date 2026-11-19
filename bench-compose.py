@@ -450,6 +450,39 @@ VARIANT_EST_FACTOR = {
     ('bc', False): 1.0, ('bc', True): 1.05,
 }
 
+# 功能开关臂：测新功能（向量量化 / 索引加密 / 快照探针）不手写赛道 id ——
+# 编排目录直接枚举成带开关元数据的变体，前端渲染成开关 chips，点选即按
+# 约定 id 进排程。id 即约定：vm-bench-lib.sh track_params 按 id 解析出
+# --track-params（encrypted_store / snapshot_repo_* / vector_index_type），
+# run-bench.sh track_challenge 按 id 选 challenge（geo-snap 族 →
+# encrypted-store-snapshot，其余派生 full）—— 编排侧只枚举，不发明机制。
+# est 系数是保守估计（加密/探针臂无实测），跑完一轮用 --est 覆盖。
+SWITCH_ARMS = (
+    # (变体 id, 基座, 开关元数据, est 系数, 引擎限制)
+    ('geo-enc', 'geo', {'encrypted': True}, 1.1, 'easysearch'),
+    ('geo-snap', 'geo', {'snapshot': 's3'}, 1.15, 'easysearch'),
+    ('geo-snap-enc', 'geo', {'snapshot': 'enc_s3', 'encrypted': True}, 1.2, 'easysearch'),
+    ('hv1024x-int8', 'hv1024x', {'quant': 'int8_hnsw'}, 1.0, None),
+    ('hv1024x-bbq', 'hv1024x', {'quant': 'bbq_hnsw'}, 1.0, None),
+)
+
+
+def challenge_of(tid):
+    """赛道 id → rally 挑战名。复刻 run-bench.sh track_challenge 的映射，
+    给编排页展示「这个变体跑的是哪个 challenge」。"""
+    return 'encrypted-store-snapshot' if tid in ('geo-snap', 'geo-snap-enc') else 'full'
+
+
+def switch_label(sw):
+    bits = []
+    if sw.get('quant'):
+        bits.append('量化 ' + sw['quant'])
+    if sw.get('encrypted'):
+        bits.append('索引加密')
+    if sw.get('snapshot'):
+        bits.append('快照探针·' + ('加密s3' if sw['snapshot'] == 'enc_s3' else '明文s3'))
+    return ' · '.join(bits)
+
 
 def build_catalog():
     """完整赛道清单：每个基础赛道 + 它的 6 个压缩变体（仅支持变体的基座）。
@@ -464,7 +497,7 @@ def build_catalog():
         cat[base] = {'name': base, 'label': label, 'est': est, 'group': grp,
                      'base': base, 'compression': None, 'source_reuse': None,
                      'engines': H.engines_of(base), 'variant': False,
-                     'dataset': dataset}
+                     'dataset': dataset, 'switches': None, 'challenge': challenge_of(base)}
         if not can_codec:
             continue
         for tok in CODEC_TOKENS:
@@ -477,8 +510,18 @@ def build_catalog():
                     'group': grp, 'base': base,
                     'compression': TOKEN_CODEC[tok], 'source_reuse': sr,
                     'engines': H.engines_of(vid), 'variant': True,
-                    'dataset': dataset,
+                    'dataset': dataset, 'switches': None, 'challenge': challenge_of(vid),
                 }
+    # 功能开关臂（量化 / 加密 / 快照探针）：挂在各自基座下，variant=True
+    for vid, base, sw, est_factor, eng in SWITCH_ARMS:
+        spec = BASE_TRACKS[base]
+        est = spec[1]
+        dataset = spec[2] if len(spec) > 2 else None
+        cat[vid] = {'name': vid, 'label': switch_label(sw),
+                    'est': int(round(est * est_factor)), 'group': BASE_GROUP[base],
+                    'base': base, 'compression': None, 'source_reuse': None,
+                    'engines': eng, 'variant': True, 'dataset': dataset,
+                    'switches': sw, 'challenge': challenge_of(vid)}
     return cat
 
 
@@ -517,7 +560,9 @@ def compat_problems(cars, rows):
     by_name = {a.name: a for a in cars}
     out = []
     for car, tk, rnd in rows:
-        allow = H.engines_of(tk)
+        # 引擎限制以编排目录条目优先（功能开关臂如 geo-enc 是 Easysearch 专有，
+        # 但在 tracks/ 没有独立目录，H.engines_of 的字符串规则看不到）
+        allow = (TRACK_CATALOG.get(tk) or {}).get('engines') or H.engines_of(tk)
         if not allow:
             continue
         a = by_name.get(car)
@@ -1639,16 +1684,18 @@ def pkg_auto_cars(root, file_cars):
     """pkg/ 里未被车定义覆盖的引擎包 → 自动车（不用写车定义文件就能编排）。
 
     车名按包名确定性推导（同一包永远同名，跨 campaign 身份稳定，结果可合池）：
-      easysearch-2.6.0-3020-… -> ez260-3020 / elasticsearch-8.19.23-… -> es819。
+      easysearch-2.6.0-3020-… -> ez260-3020 / elasticsearch-8.19.23-… -> es81923。
     已被车定义覆盖的 (engine, ver, build) 不重复出现；车定义里有同名车时文件优先。
     JDK 包不自动成车（单靠 JDK 包构不成一台车，配对 JDK_DIR 走车定义文件）。
+    robust：残包（.part/.tmp/校验和旁挂）、隐藏文件、零字节、子目录一律跳过；
+    推导名撞车（不同文件推出同名，理论不可能，防目录被人为改装）时只收第一个。
     每次调用都重扫 pkg/ —— 放进新包即出现，删掉包即消失；ssh 模式由调用方 gate
     （包在压测机上，本地扫描读不到）。
     """
     pkg_dir, _, _ = pkg_dir_from_env(root)
     if '$' in pkg_dir or not os.path.isabs(pkg_dir) or not os.path.isdir(pkg_dir):
         return []
-    covered, names = set(), set()
+    covered, names, taken = set(), set(), set()
     for a in file_cars:
         names.add(a.name)
         eng = (a.engine or '').lower()
@@ -1668,7 +1715,14 @@ def pkg_auto_cars(root, file_cars):
             covered.add((eng, ver, ''))
     out = []
     for fname in sorted(os.listdir(pkg_dir)):
-        if not os.path.isfile(os.path.join(pkg_dir, fname)):
+        # 残包与旁挂文件：下载中断（.part/.tmp/.crdownload）、校验和/说明旁挂、隐藏文件
+        if fname.startswith('.') or ' ' in fname:
+            continue
+        if fname.endswith(('.part', '.tmp', '.crdownload', '.sha256', '.sha256sum',
+                           '.md5', '.asc', '.txt', '.md', '.json')):
+            continue
+        fp = os.path.join(pkg_dir, fname)
+        if not os.path.isfile(fp) or os.path.islink(fp) or os.path.getsize(fp) <= 0:
             continue
         for pat, eng in PKG_ENGINE_PATTERNS:
             m = pat.match(fname)
@@ -1679,12 +1733,13 @@ def pkg_auto_cars(root, file_cars):
             if (eng, ver, build) in covered:
                 break
             cname = PKG_ENGINE_SHORT[eng] + ver.replace('.', '') + (('-' + build) if build else '')
-            if not re.fullmatch(SAFE_NAME.pattern, cname) or cname in names:
-                break  # 推导名不合法或与车定义撞名：文件优先，不自动出现
+            if not re.fullmatch(SAFE_NAME.pattern, cname) or cname in names or cname in taken:
+                break  # 推导名不合法 / 与车定义撞名 / 本轮已占用：文件优先，不自动出现
             config = 'ENGINE_NAME=%s ENGINE_VERSION=%s %sCAR_LABEL=%s' % (
                 eng, ver, ('ENGINE_BUILD=%s ' % build) if build else '', cname)
             out.append(Car(name=cname, label=cname, engine=eng, build=build,
                            jdk_dir='', config=config))
+            taken.add(cname)
             break
     return out
 

@@ -555,13 +555,27 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
               <span class="muted"> ${selN}/${groupNames.length}</span>
             </div>
             ${bases.map((b) => {
-              const vs = tracks.filter((t) => t.base === b.name && t.variant);
+              const vs = tracks.filter((t) => t.base === b.name && t.variant && !t.switches);
+              const arms = tracks.filter((t) => t.base === b.name && t.switches);
               return html`<div key=${b.name} class="track-block">
                 <label class="check-item" title=${b.name + (b.dataset ? ' · ' + b.dataset + ' 语料' : '') + ' · 基座（不带压缩变体）· ~' + b.est + 'min'}>
                   <input type="checkbox" checked=${form.tracks.includes(b.name)}
                     onChange=${(e) => setForm((f) => Object.assign({}, f, { tracks: toggled(f.tracks, b.name, e.target.checked) }))} />
                   <b>${b.label}</b> <small>(${b.name}, ~${b.est}min)${b.dataset ? ' · ' + b.dataset + ' 语料' : ''}</small>
                 </label>
+                ${arms.length ? html`
+                  <div class="row" style="margin:4px 0 0 16px;flex-wrap:wrap;gap:6px">
+                    <span class="muted" style="font-size:12px">功能开关：</span>
+                    ${arms.map((t) => html`<label key=${t.name} class="check-item"
+                      title=${t.name + ' · challenge: ' + t.challenge + ' · ~' + t.est + 'min'
+                        + (t.engines ? ' · 只支持 ' + t.engines : '')}>
+                      <input type="checkbox" checked=${form.tracks.includes(t.name)}
+                        onChange=${(e) => setForm((f) => Object.assign({}, f, { tracks: toggled(f.tracks, t.name, e.target.checked) }))} />
+                      <span>${t.label} <small class="mono">${t.name}</small>
+                        <small class="badge badge-run">${t.challenge === 'full' ? 'challenge full' : '⇒ ' + t.challenge}</small>
+                        <small>(~${t.est}min)</small></span>
+                    </label>`)}
+                  </div>` : null}
                 ${vs.length ? html`
                   <details class="fold" style="margin-left:16px">
                     <summary>变体网格（压缩 × source_reuse）· ${vs.length} 个</summary>

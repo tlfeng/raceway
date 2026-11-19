@@ -90,6 +90,42 @@ class TestPkgAutoCars(unittest.TestCase):
         self.assertEqual(C.pkg_auto_cars(tempfile.mkdtemp(prefix='rw-empty-'), []), [])
         self.assertEqual(C.pkg_auto_cars(os.path.join(tempfile.mkdtemp(), 'nope'), []), [])
 
+    def test_skips_partial_hidden_and_sidecar_files(self):
+        """残包 / 隐藏文件 / 校验和旁挂 / 子目录 / 零字节一律不成车。"""
+        root = tempfile.mkdtemp(prefix='rw-root-')
+        d = os.path.join(root, 'pkg')
+        os.mkdir(d)
+        # 完整包 + 各种噪音
+        noise = [EZ, '.easysearch-9.9.9-1-linux-amd64-bundle.tar.gz',
+                 'easysearch-9.9.8-1-linux-amd64-bundle.tar.gz.part',
+                 'easysearch-9.9.7-1-linux-amd64-bundle.tar.gz.tmp',
+                 'easysearch-9.9.6-1-linux-amd64-bundle.tar.gz.sha256',
+                 'easysearch-9.9.5-1-linux-amd64-bundle.tar.gz.md5',
+                 'elasticsearch-9.9.4-linux-x86_64.tar.gz.crdownload',
+                 'README.md', 'notes.txt']
+        for n in noise:
+            with open(os.path.join(d, n), 'w') as f:
+                f.write('x')
+        with open(os.path.join(d, 'elasticsearch-0.0.0-linux-x86_64.tar.gz'), 'w') as f:
+            pass  # 零字节
+        sub = os.path.join(d, 'easysearch-9.9.3-1-linux-amd64-bundle.tar.gz')
+        os.mkdir(sub)  # 同名子目录
+        cars = C.pkg_auto_cars(root, [])
+        self.assertEqual([a.name for a in cars], ['ez260-3020'])
+
+    def test_no_symlinks_as_packages(self):
+        root = tempfile.mkdtemp(prefix='rw-root-')
+        d = os.path.join(root, 'pkg')
+        os.mkdir(d)
+        real = os.path.join(root, 'real.tar.gz')
+        with open(real, 'w') as f:
+            f.write('x')
+        try:
+            os.symlink(real, os.path.join(d, EZ))
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink 不可用')
+        self.assertEqual(C.pkg_auto_cars(root, []), [])
+
     def test_snapshot_accepts_auto_car(self):
         """自动车走同一套 make_snapshot/validate_cars：render_cars 能渲染出车定义文件。"""
         d = mkpkg(EZ)

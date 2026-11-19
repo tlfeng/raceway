@@ -108,7 +108,17 @@ class TestDerivationParity(unittest.TestCase):
 
     def test_base_of(self):
         b = bash_derive('track_base', self.ids)
+        # 共享基座的量化臂（hv1024x-int8 / hv1024x-bbq）在 bash track_base 里返回
+        # **自身**（家族基座，track_params 按自身判分片口径），而 H.base_of 刻意
+        # 剥成 hv1024x 作入库归一（bench-history.py base_of docstring）——
+        # 这是文档化的分歧，其余 id 必须与 bash 逐项一致。
+        # 注意 hv1024x-os-bbq / hv1024x-bbqdisk 是独立目录家族（后缀是名字的一部分），
+        # 不在特例里，base_of 原样返回自身。
+        quant_ids = {'hv1024x-int8', 'hv1024x-bbq'} & set(self.ids)
         for i in self.ids:
+            if i in quant_ids:
+                self.assertEqual('hv1024x', H.base_of(i), '量化族入库归一应为 hv1024x: %s' % i)
+                continue
             self.assertEqual(b.get(i), H.base_of(i), 'base 不一致: %s' % i)
 
     def test_compression(self):
@@ -141,8 +151,9 @@ class TestCatalog(unittest.TestCase):
 
     def test_every_variant_capable_base_has_six_variants(self):
         for base in C.BASE_TRACKS:
+            # 功能开关臂（量化/加密/快照探针）不是压缩变体，不进这个计数
             vs = [v for v in C.TRACK_CATALOG.values()
-                  if v['base'] == base and v['variant']]
+                  if v['base'] == base and v['variant'] and not v.get('switches')]
             if not self._can_codec(base):
                 # 不支持变体的基座（index.json 无 index_codec 条件块）：
                 # 清单里不应出现任何变体 —— 排了也会被起跑前守卫拦下，不如不生成
@@ -168,9 +179,13 @@ class TestCatalog(unittest.TestCase):
                           '编排台可排的赛道 %s 入库归一后不在规范词表里' % base)
 
     def test_variant_id_matches_dir_naming(self):
-        """变体 id 必须与变体目录名一致（runner 按 id 找目录）。"""
+        """变体 id 必须与变体目录名一致（runner 按 id 找目录）。
+
+        功能开关臂（量化/加密/快照探针）走 --track-params 选通，没有独立
+        目录命名规则，不进这条校验。
+        """
         for name, v in C.TRACK_CATALOG.items():
-            if not v['variant']:
+            if not v['variant'] or v.get('switches'):
                 continue
             self.assertEqual(name, '%s-codec-%s%s' % (
                 v['base'],
