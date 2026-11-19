@@ -574,3 +574,41 @@ class CarsWriteTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class SwitchArmCatalogTests(unittest.TestCase):
+    """功能开关臂：测新功能（量化/加密/快照探针）不手写赛道 id。
+
+    守的契约：目录枚举带开关元数据与 challenge 字段（复刻 run-bench
+    track_challenge 的映射）；引擎限制在编排侧可拦（es × 加密臂）。
+    """
+
+    def test_arms_in_catalog_with_switches(self):
+        for vid in ('geo-enc', 'geo-snap', 'geo-snap-enc', 'hv1024x-int8', 'hv1024x-bbq'):
+            e = C.TRACK_CATALOG[vid]
+            self.assertTrue(e['variant'])
+            self.assertTrue(e['switches'], vid + ' 应带开关元数据')
+            self.assertEqual(e['base'], C.SWITCH_ARMS[[a[0] for a in C.SWITCH_ARMS].index(vid)][1])
+
+    def test_challenge_mapping_matches_runner(self):
+        # run-bench.sh track_challenge：geo-snap 族 → encrypted-store-snapshot，其余 full
+        self.assertEqual(C.TRACK_CATALOG['geo-snap']['challenge'], 'encrypted-store-snapshot')
+        self.assertEqual(C.TRACK_CATALOG['geo-snap-enc']['challenge'], 'encrypted-store-snapshot')
+        self.assertEqual(C.TRACK_CATALOG['geo-enc']['challenge'], 'full')
+        self.assertEqual(C.TRACK_CATALOG['hv1024x-bbq']['challenge'], 'full')
+        self.assertEqual(C.TRACK_CATALOG['geo']['challenge'], 'full')
+
+    def test_encrypted_arm_is_easysearch_only(self):
+        self.assertEqual(C.TRACK_CATALOG['geo-enc']['engines'], 'easysearch')
+        self.assertEqual(C.TRACK_CATALOG['geo-snap-enc']['engines'], 'easysearch')
+
+    def test_compat_blocks_es_on_encrypted_arm(self):
+        es = C.Car(name='es819', label='es819', engine='elasticsearch', build='', jdk_dir='', config='')
+        rows = [('es819', 'geo-enc', 1)]
+        bad = C.compat_problems([es], rows)
+        self.assertTrue(bad, 'ES × geo-enc 应在编排侧被拦')
+
+    def test_codec_variants_unchanged(self):
+        e = C.TRACK_CATALOG['geo-codec-zstd-sr']
+        self.assertIsNone(e['switches'])
+        self.assertEqual(e['challenge'], 'full')
