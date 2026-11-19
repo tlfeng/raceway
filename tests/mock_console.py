@@ -212,7 +212,9 @@ class H(BaseHTTPRequestHandler):
                                          'jdk_stat': {'exists': True, 'size': 209715200, 'mtime': 1750000000}}],
                                     'pkg_files': [
                                         {'name': 'easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz', 'size': 734003200, 'mtime': 1762500000, 'exists': True},
+                                        {'name': 'easysearch-2.6.0-3020-linux-amd64-bundle.tar.gz', 'size': 748682240, 'mtime': 1763200000, 'exists': True},
                                         {'name': 'openjdk-26_linux-x64_bin.tar.gz', 'size': 209715200, 'mtime': 1750000000, 'exists': True},
+                                        {'name': 'openjdk-27_linux-x64_bin.tar.gz', 'size': 215502848, 'mtime': 1763200000, 'exists': True},
                                         {'name': 'agent-patched-1.18.15.jar', 'size': 1048576, 'mtime': 1740000000, 'exists': True}],
                                     'bundles': [{'key': 'BUNDLE_EZ3015', 'path': '/opt/raceway/pkg/easysearch-2.5.0-3015-linux-amd64-bundle.tar.gz',
                                                  'exists': True, 'size': 734003200, 'mtime': 1762500000}]})
@@ -229,11 +231,6 @@ class H(BaseHTTPRequestHandler):
                                              {'name': 'es819', 'label': 'es819', 'engine': 'elasticsearch',
                                               'build': '', 'jdk_dir': ''}],
                                     'diagnostics': []})
-        if p == '/api/cars-write':
-            import hashlib as _h
-            return self._json(200, {'path': '/opt/raceway/schedules/dimsweep-cars.conf',
-                                    'sha256': _h.sha256(b'written').hexdigest(), 'unchanged': False,
-                                    'cars': [], 'problems': []})
         if p == '/api/cluster-status':
             return self._json(200, {'available': True, 'driver': 'esrally-185',
                                     'engine': ['2.5.0-3015'], 'up': False,
@@ -422,6 +419,36 @@ class H(BaseHTTPRequestHandler):
                                                          'query': [{'task': 'default', 'a_tput': 212, 'b_tput': 226, 'delta_tput': 6.6, 'a_p50': 46.9, 'b_p50': 44.1, 'delta_p50': -6.0, 'a_p99': 120, 'b_p99': 108, 'delta_p99': -10.0}]}]}})
         if p in ('/api/track-write', '/api/track-delete'):
             return self._json(200, {'ok': True})
+        if p == '/api/cars-write':
+            # 与真后端同语义：expect 与当前内容不符 → 409 并发冲突；成功回解析后的车表
+            import hashlib as _h
+            current = ('# raceway 车定义\njdk25 ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 '
+                       'ENGINE_BUILD=3015 CAR_LABEL=jdk25\n'
+                       'es819 ENGINE_NAME=elasticsearch ENGINE_VERSION=8.19.23 CAR_LABEL=es819\n')
+            expect = body.get('expect')
+            if expect and expect != _h.sha256(current.encode()).hexdigest():
+                return self._json(409, {'error': '车定义已被他人修改 —— 点「重新加载」拿最新内容'})
+            content = body.get('content') or ''
+            cars, problems, labels = [], [], {}
+            for i, line in enumerate(content.split('\n'), start=1):
+                s = line.strip()
+                if not s or s.startswith('#'):
+                    continue
+                toks = s.split()
+                kv = dict(t.split('=', 1) for t in toks[1:] if '=' in t)
+                name = toks[0]
+                label = kv.get('CAR_LABEL') or kv.get('ARM_LABEL') or name
+                labels[label] = labels.get(label, 0) + 1
+                if 'ENGINE_NAME' not in kv:
+                    problems.append(('error', '行 %d：缺 ENGINE_NAME' % i))
+                cars.append({'name': name, 'label': label, 'engine': kv.get('ENGINE_NAME', '?'),
+                             'build': kv.get('ENGINE_BUILD', ''), 'jdk_dir': kv.get('JDK_DIR', '')})
+            for l, n in labels.items():
+                if n > 1:
+                    problems.append(('error', 'CAR_LABEL 重复: ' + l))
+            return self._json(200, {'path': '/opt/raceway/schedules/dimsweep-cars.conf',
+                                    'sha256': _h.sha256(content.encode()).hexdigest(), 'unchanged': False,
+                                    'cars': cars, 'problems': problems})
         if p == '/api/export-gen':
             return self._json(200, {'log': 'build-race-store …\nbench-export …\nOK exports/mock',
                                     'summary': {'generated_utc': '2026-11-17T00:00:00Z',
