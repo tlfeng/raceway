@@ -1702,7 +1702,9 @@ function TracksView({ boot, EX, reloadBoot }) {
                   <td style="max-width:340px;white-space:normal">${vs.length
                     ? vs.map((v) => html`<span key=${v.name} class="mono"
                         style=${'font-size:11px;margin-right:6px;' + (v.engines ? 'color:hsl(221 83% 50%)' : '')}
-                        title=${v.engines ? '只支持 ' + v.engines : '两侧通用'}>${v.name}${v.engines ? ' *' : ''}</span>`)
+                        title=${(v.switches ? '功能开关臂 · ' : '')
+                          + (v.engines ? '只支持 ' + v.engines : '两侧通用')
+                          + ' · challenge: ' + v.challenge}>${v.name}${v.engines ? ' *' : ''}</span>`)
                     : '—'}</td>
                   <td>${b.engines ? html`<span class="badge badge-run">${b.engines}</span>`
                     : vEngs.length ? html`<span class="muted">基座通用 · * 变体限 ${vEngs.join('/')}</span>`
