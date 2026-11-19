@@ -24,6 +24,8 @@ CARS = [
     {'name': 'ez2510-jdk21', 'engine': 'easysearch', 'build': '3010', 'jdk_dir': '/opt/jdks/jdk21', 'label': 'ez2510'},
     {'name': 'ez2510-kona25', 'engine': 'easysearch', 'build': '3010', 'jdk_dir': '/opt/jdks/kona25', 'label': 'kona25'},
     {'name': 'es819', 'engine': 'elasticsearch', 'build': '', 'jdk_dir': '', 'label': 'es819'},
+    # pkg/ 自动车：未被车定义覆盖的引擎包按包名推导（bootstrap 带 auto=True）
+    {'name': 'ez260-3020', 'engine': 'easysearch', 'build': '3020', 'jdk_dir': '', 'label': 'ez260-3020', 'auto': True},
 ]
 GROUPS = [['base', '基座 / 官方语料'], ['vector', '向量检索'], ['ds', '维度扫描（多档位）'], ['write', '写入与更新']]
 TRACKS = [
