@@ -478,7 +478,7 @@ OpenSearch 的 HNSW 搜索预算使用 `ef_search`，不等同于 ES 的每分�
 - **⑥ 赛道文件**：浏览/新建/编辑/删除 `tracks/`，原子写 + sha256 并发校验。`tracks/` 是定版目录，改动需重新同步压测机才生效。
 - **⑦ 场次详情**：实测身份卡（sidecar）、逐任务指标（race.json）、每节点 5s 监控曲线（`monitors/<fid>-<node>.csv`）、日志全文（含关键字过滤）、campaign 收尾（`close-campaign.sh`，默认 dry-run）。
 - **⑧ 报告与导出**：按 campaign 导出 Markdown/HTML 报告；一键生成导出（build-race-store → bench-export，tag 不覆盖）。
-- **⑨ 引擎与JDK**：`pkg/` 包盘点 + 车依赖核对（与 runner resolve_engine 的 die 点同口径）；新包放进 `pkg/` 后点「＋ 车定义」按包名推导一行车定义模板，进车定义编辑器确认保存，即可在「启动排程」勾选起跑。
+- **⑨ 引擎与JDK**：`pkg/` 包盘点 + 车依赖核对（与 runner resolve_engine 的 die 点同口径）。pkg/ 里的引擎包**自动按包名推导成可选的车**（确定性车名，如 `easysearch-2.6.0-3020-…` → `ez260-3020`；每次进页重读，放进新包即出现）—— 不用写车定义文件即可在「启动排程」勾选起跑。需要配 JDK（JDK_DIR/JDK_WANT）或自定义标签时，点「＋ 车定义」把包固定进车定义文件。
 - **深链**：`#/progress/<cid>`、`#/detail/<cid>` 等；编排预设存 localStorage，可导入导出 JSON；est 自动校准按历史同赛道有效场次中位耗时回填。
 - **命令行入口**：上述新能力全部可用 `bench-tools.py <action>` 从 shell 使用（sidecar/detail/monitor/log/report/est/track-ls|read|write|del/export-gen/close），与 Web/Go 复用同一套 `api_*` 函数，本地与 `--ssh` 都支持。例：
   ```bash

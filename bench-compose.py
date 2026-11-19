@@ -1247,11 +1247,18 @@ def api_snapshot(st, body):
     selected = body.get('cars')
     if not isinstance(selected, list) or not selected or not all(isinstance(x, str) for x in selected):
         raise ValueError('请至少选择一台车')
-    known = {a.name for a in st.cars}
-    unknown = set(selected) - known
-    if unknown or len(set(selected)) != len(selected):
-        raise ValueError('未知或重复车名: %s' % '、'.join(sorted(unknown or set(selected))))
-    cars = tuple(a for a in st.cars if a.name in selected)
+    if len(set(selected)) != len(selected):
+        raise ValueError('车名重复: %s' % '、'.join(sorted({x for x in selected if selected.count(x) > 1})))
+    # pkg/ 自动车每次请求重扫（放进新包即可编排）；ssh 模式包在压测机上，本地读不到
+    auto = [] if st.args.ssh else pkg_auto_cars(st.args.root, st.cars)
+    pool = {a.name: a for a in st.cars}
+    for a in auto:
+        pool.setdefault(a.name, a)
+    unknown = set(selected) - set(pool)
+    if unknown:
+        raise ValueError('未知车名: %s' % '、'.join(sorted(unknown)))
+    sel = set(selected)
+    cars = tuple([a for a in st.cars if a.name in sel] + [a for a in auto if a.name in sel])
     hard = [m for s, m in validate_cars(cars) if s == 'error']
     if hard:
         raise ValueError('；'.join(hard))
@@ -1508,6 +1515,36 @@ def api_cars_write(st, body):
                  'problems': st.problems}
 
 
+def pkg_dir_from_env(root):
+    """解析 vm-bench.env 的 PKG_DIR（支持 ${ROOT}/${PKG_DIR} 引用）。
+
+    返回 (pkg_dir, bundles, config_warning)；读不到 env 时回落 root/pkg 并给提示。
+    api_assets（盘点）与 pkg_auto_cars（自动车）共用同一解析口径。
+    """
+    pkg_dir, bundles = None, []
+    config_warning = None
+    envf = os.path.join(root, 'vm-bench.env')
+    try:
+        with open(envf, encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#') or '=' not in s:
+                    continue
+                k, _, v = s.partition('=')
+                k = k.strip()
+                v = v.split(' #', 1)[0].strip().strip('"').strip("'")
+                v = v.replace('${ROOT}', root).replace('$ROOT', root)
+                if pkg_dir:
+                    v = v.replace('${PKG_DIR}', pkg_dir).replace('$PKG_DIR', pkg_dir)
+                if k == 'PKG_DIR':
+                    pkg_dir = v
+                elif k.startswith('BUNDLE_'):
+                    bundles.append({'key': k, 'path': v})
+    except OSError:
+        config_warning = '无法读取 vm-bench.env，包路径可能与实际配置不同'
+    return pkg_dir or os.path.join(root, 'pkg'), bundles, config_warning
+
+
 def api_assets(st):
     """引擎安装包与 JDK 的只读盘点，并关联车定义的起跑依赖。
 
@@ -1521,28 +1558,7 @@ def api_assets(st):
     """
     if st.args.ssh:
         return 200, {'available': False, 'reason': 'ssh 模式下包盘点在压测机本机控制台查看'}
-    envf = os.path.join(st.args.root, 'vm-bench.env')
-    pkg_dir, bundles = None, []
-    config_warning = None
-    try:
-        with open(envf, encoding='utf-8') as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith('#') or '=' not in s:
-                    continue
-                k, _, v = s.partition('=')
-                k = k.strip()
-                v = v.split(' #', 1)[0].strip().strip('"').strip("'")
-                v = v.replace('${ROOT}', st.args.root).replace('$ROOT', st.args.root)
-                if pkg_dir:
-                    v = v.replace('${PKG_DIR}', pkg_dir).replace('$PKG_DIR', pkg_dir)
-                if k == 'PKG_DIR':
-                    pkg_dir = v
-                elif k.startswith('BUNDLE_'):
-                    bundles.append({'key': k, 'path': v})
-    except OSError:
-        config_warning = '无法读取 vm-bench.env，包路径可能与实际配置不同'
-    pkg_dir = pkg_dir or os.path.join(st.args.root, 'pkg')
+    pkg_dir, bundles, config_warning = pkg_dir_from_env(st.args.root)
     if '$' in pkg_dir or not os.path.isabs(pkg_dir):
         return 200, {'available': False, 'reason': '无法安全解析 PKG_DIR；请检查 vm-bench.env'}
 
@@ -1607,6 +1623,70 @@ def api_assets(st):
         b.update(stat_path(b['path']))
     return 200, {'available': True, 'pkg_dir': pkg_dir, 'deps': deps,
                  'pkg_files': pkg_files, 'bundles': bundles, 'config_warning': config_warning}
+
+
+# 引擎包文件名 → 命名规则（与 runner resolve_engine / api_assets 三条一一对应）。
+# (正则, 引擎名)；easysearch 第 2 组是 build，ES/OS 只有版本。
+PKG_ENGINE_PATTERNS = (
+    (re.compile(r'^easysearch-(\d+\.\d+\.\d+)-(\d+)-linux-amd64-bundle\.tar\.gz$'), 'easysearch'),
+    (re.compile(r'^elasticsearch-(\d+\.\d+\.\d+)-linux-x86_64\.tar\.gz$'), 'elasticsearch'),
+    (re.compile(r'^opensearch-(\d+\.\d+\.\d+)-linux-x64\.tar\.gz$'), 'opensearch'),
+)
+PKG_ENGINE_SHORT = {'easysearch': 'ez', 'elasticsearch': 'es', 'opensearch': 'os'}
+
+
+def pkg_auto_cars(root, file_cars):
+    """pkg/ 里未被车定义覆盖的引擎包 → 自动车（不用写车定义文件就能编排）。
+
+    车名按包名确定性推导（同一包永远同名，跨 campaign 身份稳定，结果可合池）：
+      easysearch-2.6.0-3020-… -> ez260-3020 / elasticsearch-8.19.23-… -> es819。
+    已被车定义覆盖的 (engine, ver, build) 不重复出现；车定义里有同名车时文件优先。
+    JDK 包不自动成车（单靠 JDK 包构不成一台车，配对 JDK_DIR 走车定义文件）。
+    每次调用都重扫 pkg/ —— 放进新包即出现，删掉包即消失；ssh 模式由调用方 gate
+    （包在压测机上，本地扫描读不到）。
+    """
+    pkg_dir, _, _ = pkg_dir_from_env(root)
+    if '$' in pkg_dir or not os.path.isabs(pkg_dir) or not os.path.isdir(pkg_dir):
+        return []
+    covered, names = set(), set()
+    for a in file_cars:
+        names.add(a.name)
+        eng = (a.engine or '').lower()
+        ver = build = ''
+        for tok in (a.config or '').split():
+            k, _, v = tok.partition('=')
+            if k == 'ENGINE_VERSION':
+                ver = v
+            elif k == 'ENGINE_BUILD':
+                build = v
+        if eng == 'easysearch':
+            # runner 侧缺省 2.5.0/3015；车定义省略时按缺省口径算已覆盖
+            covered.add((eng, ver or '2.5.0', build or '3015'))
+        elif eng == 'elasticsearch' and ver:
+            covered.add((eng, ver, ''))
+        elif eng == 'opensearch' and ver:
+            covered.add((eng, ver, ''))
+    out = []
+    for fname in sorted(os.listdir(pkg_dir)):
+        if not os.path.isfile(os.path.join(pkg_dir, fname)):
+            continue
+        for pat, eng in PKG_ENGINE_PATTERNS:
+            m = pat.match(fname)
+            if not m:
+                continue
+            ver = m.group(1)
+            build = m.group(2) if m.lastindex and m.lastindex >= 2 else ''
+            if (eng, ver, build) in covered:
+                break
+            cname = PKG_ENGINE_SHORT[eng] + ver.replace('.', '') + (('-' + build) if build else '')
+            if not re.fullmatch(SAFE_NAME.pattern, cname) or cname in names:
+                break  # 推导名不合法或与车定义撞名：文件优先，不自动出现
+            config = 'ENGINE_NAME=%s ENGINE_VERSION=%s %sCAR_LABEL=%s' % (
+                eng, ver, ('ENGINE_BUILD=%s ' % build) if build else '', cname)
+            out.append(Car(name=cname, label=cname, engine=eng, build=build,
+                           jdk_dir='', config=config))
+            break
+    return out
 
 
 def api_cluster_status(st):
@@ -2488,8 +2568,12 @@ def _route_get_core(st, path, q):
             with st.lock:
                 st.reload_cars()
                 refresh_catalog()
+        # 自动车：pkg/ 未被车定义覆盖的引擎包，每次进页都重读（ssh 模式包在压测机，不扫）
+        auto = [] if st.args.ssh else pkg_auto_cars(st.args.root, st.cars)
         return 200, 'application/json', json.dumps({
-            'cars': [{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars],
+            'cars': ([{k: v for k, v in a._asdict().items() if k != 'config'} for a in st.cars]
+                     + [dict({k: v for k, v in a._asdict().items() if k != 'config'}, auto=True)
+                        for a in auto]),
             'problems': st.problems, 'ds_tiers': DS_TIERS,
             # 全部可起跑的赛道（不是只有 ds-*）：geo/codec 变体、hnsw、hv1024、nested
             'tracks': [dict(v, name=k) for k, v in TRACK_CATALOG.items()],

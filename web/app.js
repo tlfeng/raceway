@@ -513,18 +513,33 @@ function ComposeView({ boot, form, setForm, schedBox, setSchedBox, outBox, setOu
       <p class="card-desc">矩阵勾选 → <b>自动剔除指标库里已跑过的格</b> → dry-run 预览（runner 自己的语义）→ 互斥预检后起跑。
         交错由服务端复刻 <code>order_for_round</code>；本页不做任何绕过 precheck 的事。勾选会记住（localStorage），下次打开不用重勾。</p>
 
-      <div class="card-title" style="margin-top:10px">车（来自车定义文件）
+      <div class="card-title" style="margin-top:10px">车
         <div class="spacer"></div>
         <button class="btn btn-ghost btn-sm" onClick=${toggleAllCars}>${(boot.cars || []).every((a) => form.cars.includes(a.name)) ? '清空' : '全选'}</button>
       </div>
+      ${(boot.cars || []).some((a) => !a.auto) ? null : html`<p class="muted" style="margin:4px 0">（车定义文件里没有车 —— ssh 模式或文件缺失时只显示 pkg/ 自动识别的车）</p>`}
       <div class="grid-checks">
-        ${(boot.cars || []).map((a) => html`
+        ${(boot.cars || []).filter((a) => !a.auto).map((a) => html`
           <label key=${a.name} class="check-item">
             <input type="checkbox" checked=${form.cars.includes(a.name)}
               onChange=${(e) => setForm((f) => Object.assign({}, f, { cars: toggled(f.cars, a.name, e.target.checked) }))} />
             <span>${a.name} <small>(${a.engine}${a.build ? '@' + a.build : ''}${a.jdk_dir ? ' + ' + a.jdk_dir.split('/').pop() : ''})</small></span>
           </label>`)}
       </div>
+      ${(boot.cars || []).some((a) => a.auto) && html`
+        <div class="card-title" style="margin-top:14px">pkg/ 自动识别
+          <small class="muted">（未写入车定义文件 · 包名即车名，可直接勾选起跑）</small></div>
+        <div class="grid-checks">
+          ${(boot.cars || []).filter((a) => a.auto).map((a) => html`
+            <label key=${a.name} class="check-item"
+              title=${'由 pkg/ 包自动推导（' + a.engine + (a.build ? ' · build ' + a.build : '') + '）；车名确定性生成，跨 campaign 身份稳定'}>
+              <input type="checkbox" checked=${form.cars.includes(a.name)}
+                onChange=${(e) => setForm((f) => Object.assign({}, f, { cars: toggled(f.cars, a.name, e.target.checked) }))} />
+              <span>${a.name} <small>(${a.engine}${a.build ? '@' + a.build : ''} · 自动)</small></span>
+            </label>`)}
+        </div>
+        <p class="card-desc" style="margin:4px 0 0">新包放进 pkg/ 即出现在这里，每次进页自动重读 —— 不用手写车定义。
+          要配 JDK（JDK_DIR/JDK_WANT）或自定义标签时，用「引擎与JDK」页的「＋ 车定义」把它固定进车定义文件。</p>`}
 
       <div class="card-title" style="margin-top:14px">赛道（全部可起跑的赛道，按族分组 · 点组名整组勾选/清空）</div>
       ${(boot.track_groups || []).map((g) => {
@@ -1913,7 +1928,9 @@ function AssetsView({ reloadBoot }) {
 
     <div class="card">
       <div class="card-title">本地包仓库（${d.pkg_dir} · ${(d.pkg_files || []).length} 个文件）</div>
-      <p class="card-desc">新包放进 pkg/ 后在这里点「＋ 车定义」，按包名推导一行车定义模板（引擎/版本/build 与 runner resolve_engine 同口径），进车定义编辑器确认后保存，即可在「启动排程」勾选起跑。</p>
+      <p class="card-desc">pkg/ 里的引擎包会按包名自动出现在「启动排程」（确定性车名，可直接勾选起跑，每次进页自动重读）。
+        这里点「＋ 车定义」是把包<b>固定</b>进车定义文件 —— 需要配 JDK（JDK_DIR/JDK_WANT）或自定义标签时才用；
+        推导口径与 runner resolve_engine 一致，确认车名/标签后保存，保存走原子写 + sha256 并发校验。</p>
       <table class="tbl">
         <thead><tr><th>文件</th><th class="num">大小</th><th>修改时间</th><th>被引用</th><th></th></tr></thead>
         <tbody>
