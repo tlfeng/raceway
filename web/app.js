@@ -1690,7 +1690,8 @@ function TracksView({ boot, EX, reloadBoot }) {
 }
 
 // ==================== 车定义编辑器（runner 同口径校验 + 原子保存） ====================
-function CarsEditorDrawer({ onClose, onSaved }) {
+// appendLine：外部（如「引擎与JDK」页按包名推导）要求追加的一行模板，进编辑器由人确认后保存
+function CarsEditorDrawer({ onClose, onSaved, appendLine }) {
   const [info, setInfo] = useState(null);   // {path, content, sha256, diagnostics}
   const [draft, setDraft] = useState('');
   const [diag, setDiag] = useState([]);
@@ -1709,7 +1710,13 @@ function CarsEditorDrawer({ onClose, onSaved }) {
         return;
       }
       setInfo({ path: j.path });
-      setDraft(j.content);
+      let content = j.content || '';
+      if (appendLine && !content.split('\n').some((l) => l.trim() === appendLine)) {
+        // 从包名推导的模板行：追加到末尾（草稿层追加，不落盘 —— 保存才生效）；
+        // 「重新加载」时已含该行则不重复追加
+        content = content.replace(/\s*$/, '') + '\n' + appendLine + '\n';
+      }
+      setDraft(content);
       setLoadedSha(j.sha256);
       setDiag(j.diagnostics || []);
     } catch (e) { setInfo({ path: '', reason: String(e) }); }
@@ -1786,6 +1793,8 @@ function CarsEditorDrawer({ onClose, onSaved }) {
         ${!busy && info && info.reason ? html`<div class="warn-box">⚠ ${info.reason}</div>
           <p class="muted">编辑器不可用 —— 请在压测机上直接编辑该文件。</p>` : null}
         ${!busy && info && !info.reason ? html`<div>
+          ${appendLine && html`<div class="warn-box">已按包名推导并追加一行车定义模板（<span class="mono">${appendLine}</span>）
+            —— 车名/标签可改，确认后保存。车名或 CAR_LABEL 与现有行冲突会被校验拦下。</div>`}
           ${conflict && html`<div class="warn-box">⚠ 内容已被他人修改。点「重新加载」会覆盖你这里的草稿，请先复制重要修改。</div>`}
           ${draftErrors.length ? html`<div class="warn-box">✘ ${draftErrors.length} 处问题（保存会被拒绝）：
             ${draftErrors.slice(0, 6).map((x, i) => html`<div key=${i}>${x.line ? '行 ' + x.line + '：' : ''}${x.message}</div>`)}
@@ -1812,8 +1821,37 @@ function fmtSize(n) {
   return n + ' B';
 }
 
+// 包文件名 → 车定义模板行。命名规则与 runner resolve_engine / api_assets 一一对应
+// （easysearch-<ver>-<build>-linux-amd64 / elasticsearch-<ver>-linux-x86_64 /
+//   opensearch-<ver>-linux-x64 / openjdk-<v>_linux-x64_bin）。认不出的包返回 null。
+function pkgToCarLine(name) {
+  let m = /^easysearch-(\d+\.\d+\.\d+)-(\d+)-linux-amd64-bundle\.tar\.gz$/.exec(name);
+  if (m) {
+    const tag = 'ez' + m[1].replace(/\./g, '');
+    return tag + ' ENGINE_NAME=easysearch ENGINE_VERSION=' + m[1] + ' ENGINE_BUILD=' + m[2] + ' CAR_LABEL=' + tag;
+  }
+  m = /^elasticsearch-(\d+\.\d+\.\d+)-linux-x86_64\.tar\.gz$/.exec(name);
+  if (m) {
+    const tag = 'es' + m[1].replace(/\./g, '');
+    return tag + ' ENGINE_NAME=elasticsearch ENGINE_VERSION=' + m[1] + ' CAR_LABEL=' + tag;
+  }
+  m = /^opensearch-(\d+\.\d+\.\d+)-linux-x64\.tar\.gz$/.exec(name);
+  if (m) {
+    const tag = 'os' + m[1].replace(/\./g, '');
+    return tag + ' ENGINE_NAME=opensearch ENGINE_VERSION=' + m[1] + ' CAR_LABEL=' + tag;
+  }
+  m = /^openjdk-(\d+)_linux-x64_bin\.tar\.gz$/.exec(name);
+  if (m) {
+    const tag = 'jdk' + m[1];
+    return tag + ' ENGINE_NAME=easysearch ENGINE_VERSION=2.5.0 ENGINE_BUILD=3015'
+      + ' JDK_DIR=/opt/jdks/jdk-' + m[1] + ' CAR_LABEL=' + tag + ' JDK_WANT=' + m[1] + '|OpenJDK';
+  }
+  return null;
+}
+
 function AssetsView({ reloadBoot }) {
   const [carsEditor, setCarsEditor] = useState(false);
+  const [appendLine, setAppendLine] = useState(null); // 从包名推导的车定义模板行（进编辑器追加）
   const [d, setD] = useState(null);   // {available, pkg_dir, deps, pkg_files, bundles}
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -1869,26 +1907,32 @@ function AssetsView({ reloadBoot }) {
       ${d.config_warning ? html`<div class="warn-box">⚠ ${d.config_warning}</div>` : null}
       <p class="card-desc">引擎包路径按 runner 的命名规则推导；节点 JDK 未检查。JDK 控制机安装包仅在节点缺少对应路径、且支持自动安装时需要。本页只读，实际部署来源以 ibs 配置与运行日志为准。</p>
     </div>
-    ${carsEditor && html`<${CarsEditorDrawer} onClose=${() => setCarsEditor(false)}
+    ${carsEditor && html`<${CarsEditorDrawer} appendLine=${appendLine}
+      onClose=${() => { setCarsEditor(false); setAppendLine(null); }}
       onSaved=${() => reloadBoot && reloadBoot(true)} />`}
 
     <div class="card">
       <div class="card-title">本地包仓库（${d.pkg_dir} · ${(d.pkg_files || []).length} 个文件）</div>
+      <p class="card-desc">新包放进 pkg/ 后在这里点「＋ 车定义」，按包名推导一行车定义模板（引擎/版本/build 与 runner resolve_engine 同口径），进车定义编辑器确认后保存，即可在「启动排程」勾选起跑。</p>
       <table class="tbl">
-        <thead><tr><th>文件</th><th class="num">大小</th><th>修改时间</th><th>被引用</th></tr></thead>
+        <thead><tr><th>文件</th><th class="num">大小</th><th>修改时间</th><th>被引用</th><th></th></tr></thead>
         <tbody>
           ${(d.pkg_files || []).map((f) => {
             const path = d.pkg_dir + '/' + f.name;
             const ref = d.deps.some((r) => r.pkg === path || r.jdk_pkg === path) ? '引擎/JDK'
               : (d.bundles || []).some((b) => b.path === path) ? 'BUNDLE_*' : '—';
+            const line = ref === '—' ? pkgToCarLine(f.name) : null;
             return html`<tr key=${f.name}>
               <td class="mono" style="font-size:12px;word-break:break-all">${f.name}</td>
               <td class="num">${fmtSize(f.size)}</td>
               <td class="muted">${new Date(f.mtime * 1000).toLocaleDateString()}</td>
               <td>${ref === '—' ? html`<span class="muted">—</span>` : html`<span class="badge badge-run">${ref}</span>`}</td>
+              <td style="white-space:nowrap">${line ? html`
+                <button class="btn btn-secondary btn-sm" onClick=${() => { setAppendLine(line); setCarsEditor(true); }}
+                  title=${'追加车定义行：' + line}>＋ 车定义</button>` : null}</td>
             </tr>`;
           })}
-          ${!(d.pkg_files || []).length && html`<tr><td colspan="4" class="muted">（目录为空）</td></tr>`}
+          ${!(d.pkg_files || []).length && html`<tr><td colspan="5" class="muted">（目录为空）</td></tr>`}
         </tbody>
       </table>
     </div>
