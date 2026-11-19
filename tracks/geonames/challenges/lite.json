@@ -14,11 +14,22 @@
 
    派生方式：与 encrypted-store.json 同款 —— create-index 的 operation 级 settings
    合并覆盖 index.json 的 store.type，两个臂各自把 store.type 钉死，因此残留的
-   encrypted_store 参数不会把"常规"臂偷偷跑成加密臂。 #}
+   encrypted_store 参数不会把"常规"臂偷偷跑成加密臂。
+
+   加密臂跨引擎：Easysearch 用 store.type=encrypted + index.encryption.profile；
+   OpenSearch 的 storage-encryption 插件用 store.type=cryptofs + key_provider。
+   默认值保持 Easysearch 语义；跑 OpenSearch 时传
+     enc_store_type=cryptofs, enc_index_settings={"index.store.crypto.key_provider":"dummy"}
+   index.encryption.profile 只在 store.type=encrypted 时才写，避免 OpenSearch 拒收未知设置。 #}
 {% for _enc in [false, true] %}
+{% set p_enc_store_type = enc_store_type | default('encrypted') %}
 {% set p_lite_settings = {"index.store.type": store_type | default('fs')} %}
 {% if index_settings is defined and index_settings is mapping %}{% set _ = p_lite_settings.update(index_settings) %}{% endif %}
-{% if _enc %}{% set _ = p_lite_settings.update({"index.store.type": "encrypted", "index.encryption.profile": "index"}) %}{% endif %}
+{% if _enc %}
+{% set _ = p_lite_settings.update({"index.store.type": p_enc_store_type}) %}
+{% if p_enc_store_type == 'encrypted' %}{% set _ = p_lite_settings.update({"index.encryption.profile": "index"}) %}{% endif %}
+{% if enc_index_settings is defined and enc_index_settings is mapping %}{% set _ = p_lite_settings.update(enc_index_settings) %}{% endif %}
+{% endif %}
     {
       "name": "lite{{ '-encrypted' if _enc else '' }}",
       "description": "缩量探针（{{ '索引加密 store' if _enc else '常规 fs store' }}）：{{ lite_ingest_percentage | default(5) }}% 语料（≈57 万条）+ 单段 force-merge + 7 个代表查询，合计 5-10 分钟。写段/合并/查询与另一臂逐项同序同预算，唯一差异是 store 设置；数字仅用于两臂 A/B，不进 full 台账。",

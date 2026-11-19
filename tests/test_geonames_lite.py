@@ -13,6 +13,9 @@
   3. 查询段墙钟 = Σ(warmup + iterations) / target-throughput，必须落在 2-3 分钟：
      上限 180 s 保住 5-10 分钟档，下限 120 s 防止有人把它砍成没有统计意义的空跑。
      写段与 force-merge 随机器浮动，不在断言范围。
+  4. runner/lib 真的接了这两个臂（track_challenge / track_base / track_dir /
+     track_params 的 LITE_PCT / 引擎与装机门）—— 挑战文件写得再对，
+     没人把它映射成挑战名也是白搭（之前只能手工 esrally 跑，编排页看不见）。
 
 没装 jinja2 的机器只跑 source 级断言（渲染类用例 skip）；跑赛道的机器上全量执行。
 跑法：
@@ -21,6 +24,9 @@
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,8 +107,10 @@ class SourceTest(unittest.TestCase):
         src = source()
         flag = src.find('{% if _enc %}')
         self.assertGreaterEqual(flag, 0, '找不到 _enc 开关')
-        self.assertGreater(src.find('"index.store.type": "encrypted"'), flag,
+        self.assertGreater(src.find('"index.store.type": p_enc_store_type'), flag,
                            '加密键必须落在 {% if _enc %} 分支内')
+        self.assertGreater(src.find('"index.encryption.profile": "index"'), flag,
+                           'profile 键必须落在 {% if _enc %} 分支内')
 
     def test_default_data_volume_is_small(self):
         self.assertIn('lite_ingest_percentage | default(%d)' % DECLARED_PCT, source())
@@ -141,6 +149,19 @@ class RenderTest(unittest.TestCase):
         for k, v in ENC.items():
             self.assertEqual(create_settings(self.enc)[k], v)
 
+    def test_opensource_cryptofs_arm(self):
+        """OpenSearch storage-encryption：store.type=cryptofs + key_provider，
+        且不得带 Easysearch 的 index.encryption.profile（OpenSearch 会拒收未知设置）。"""
+        arms = rendered(enc_store_type='cryptofs',
+                        enc_index_settings={'index.store.crypto.key_provider': 'dummy'})
+        plain = next(c for c in arms if c['name'] == 'lite')
+        enc = next(c for c in arms if c['name'] == 'lite-encrypted')
+        self.assertEqual(create_settings(plain)['index.store.type'], 'fs')
+        s = create_settings(enc)
+        self.assertEqual(s['index.store.type'], 'cryptofs')
+        self.assertEqual(s['index.store.crypto.key_provider'], 'dummy')
+        self.assertNotIn('index.encryption.profile', s)
+
     def test_stray_encrypted_param_cannot_poison_plain_arm(self):
         """index.json 会按 encrypted_store 写加密键，常规臂必须用 operation settings 压回去。"""
         plain = next(c for c in rendered(encrypted_store=True) if c['name'] == 'lite')
@@ -176,6 +197,82 @@ class RenderTest(unittest.TestCase):
         for doc in (self.plain, self.enc):
             names = [task_name(t) for t in doc['schedule']]
             self.assertEqual(len(names), len(set(names)), '%s 任务名重复：%s' % (doc['name'], names))
+
+
+def _runner_function(name):
+    """从 run-bench.sh 抽一个函数全文（供独立执行）。"""
+    with open(os.path.join(ROOT, 'run-bench.sh'), encoding='utf-8') as f:
+        text = f.read()
+    m = re.search(r'^' + re.escape(name) + r'\(\).*?^\}', text, re.M | re.S)
+    if not m:
+        raise AssertionError('run-bench.sh 缺函数: %s' % name)
+    return m.group(0) + '\n'
+
+
+def _lib_probe(script, env_extra=None):
+    """在临时目录里 source vm-bench-lib.sh 跑一段 bash（自带最小 vm-bench.env）。"""
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copy(os.path.join(ROOT, 'vm-bench-lib.sh'), d)
+        with open(os.path.join(d, 'vm-bench.env'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write('ROOT=%s\n' % ROOT)
+        env = dict(os.environ)
+        env.update(env_extra or {})
+        sp = os.path.join(d, '_probe.sh')
+        with open(sp, 'w', encoding='utf-8', newline='\n') as f:
+            f.write("cd '%s' || exit 9\nsource ./vm-bench-lib.sh || exit 8\n%s" % (d, script))
+        return subprocess.run(['bash', sp], capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', env=env, timeout=30)
+
+
+class RunnerWiringTests(unittest.TestCase):
+    """lite 两个臂要能从编排页排进 runner，而不是只能手工 esrally。"""
+
+    def test_challenge_mapping(self):
+        """geo-lite → lite；geo-lite-enc → lite-encrypted；geo-enc 仍是 full。"""
+        p = subprocess.run(['bash'], input=(
+            "set -e\n" + _runner_function('track_challenge') +
+            '[ "$(track_challenge geo-lite)" = lite ] || exit 1\n'
+            '[ "$(track_challenge geo-lite-enc)" = lite-encrypted ] || exit 1\n'
+            '[ "$(track_challenge geo-enc)" = full ] || exit 1\n'),
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_base_dir_and_default_percentage(self):
+        p = _lib_probe(
+            'for t in geo-lite geo-lite-enc; do\n'
+            '  [ "$(track_base $t)" = geo ] || { echo "base $t -> $(track_base $t)" >&2; exit 1; }\n'
+            '  [ "$(track_dir $t)" = "$ROOT/tracks/geonames" ] || { echo "dir $t" >&2; exit 1; }\n'
+            '  case "$(track_params $t)" in *lite_ingest_percentage:%d*) ;; '
+            '*) echo "pct $t -> $(track_params $t)" >&2; exit 1;; esac\n'
+            'done\n' % DECLARED_PCT)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_lite_pct_knob_moves_both_arms_together(self):
+        """百分比只留一个旋钮：两臂填不同值就没有 A/B 意义了。"""
+        p = _lib_probe(
+            'for t in geo-lite geo-lite-enc; do\n'
+            '  case "$(track_params $t)" in *lite_ingest_percentage:7*) ;; '
+            '*) echo "pct $t -> $(track_params $t)" >&2; exit 1;; esac\n'
+            'done\n', env_extra={'LITE_PCT': '7'})
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_engines_and_enc_gate(self):
+        """明文臂两侧通用；加密臂锁 Easysearch 且跑前要装加密套件。"""
+        p = _lib_probe(
+            '[ -z "$(track_engines geo-lite)" ] || { echo "geo-lite 不该限引擎" >&2; exit 1; }\n'
+            '[ "$(track_engines geo-lite-enc)" = easysearch ] || exit 1\n'
+            'track_needs_enc geo-lite && { echo "明文臂不该装加密套件" >&2; exit 1; }\n'
+            'track_needs_enc geo-lite-enc || { echo "加密臂漏了装机门" >&2; exit 1; }\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_availability_table_lists_lite_arms(self):
+        with open(os.path.join(ROOT, 'vm-bench-lib.sh'), encoding='utf-8') as f:
+            lib = f.read()
+        m = re.search(r'for _t in ([^)]+); do', lib)
+        self.assertIsNotNone(m, '可用性表结构变了')
+        for t in ('geo-lite', 'geo-lite-enc'):
+            self.assertIn(' %s ' % t, m.group(1),
+                          '可用性表缺 %s（run-bench.sh list / doctor 会漏）' % t)
 
 
 if __name__ == '__main__':
