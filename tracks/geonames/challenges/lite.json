@@ -1,0 +1,129 @@
+{# 缩量探针：一份 schedule 经 `_enc` 开关生成两个挑战（常规 / 索引加密）。
+
+   存在的理由：full / encrypted-store 的查询段按 target-throughput 定死 ≈ 78 分钟，
+   跟数据量无关 —— 想快速看"加密 store 到底贵多少"，只能同时砍数据量**和**查询预算。
+
+   口径：
+   · 数据量走 --track-params 的 lite_ingest_percentage（默认 5% ≈ 57 万条），
+     两个臂吃同一个语料前缀，条数一致 → force-merge 与 store 体积可直接对比。
+   · 查询段按 target-throughput 定死 ≈ 162 s，不受机器快慢影响；写段 + force-merge
+     随机器浮动，合计落在 5-10 分钟档（首跑后按实测写吞吐调 lite_ingest_percentage）。
+   · 不含 *_with_after_* 系列：它们的 search_after 烘死 [1000000]/[5000000]，
+     缩量后命中为空，延迟数字没有意义。
+   · 数字只用于加密/明文的臂间 A/B，不与 full 台账混记（渠道不同，口径不同）。
+
+   派生方式：与 encrypted-store.json 同款 —— create-index 的 operation 级 settings
+   合并覆盖 index.json 的 store.type，两个臂各自把 store.type 钉死，因此残留的
+   encrypted_store 参数不会把"常规"臂偷偷跑成加密臂。 #}
+{% for _enc in [false, true] %}
+{% set p_lite_settings = {"index.store.type": store_type | default('fs')} %}
+{% if index_settings is defined and index_settings is mapping %}{% set _ = p_lite_settings.update(index_settings) %}{% endif %}
+{% if _enc %}{% set _ = p_lite_settings.update({"index.store.type": "encrypted", "index.encryption.profile": "index"}) %}{% endif %}
+    {
+      "name": "lite{{ '-encrypted' if _enc else '' }}",
+      "description": "缩量探针（{{ '索引加密 store' if _enc else '常规 fs store' }}）：{{ lite_ingest_percentage | default(5) }}% 语料（≈57 万条）+ 单段 force-merge + 7 个代表查询，合计 5-10 分钟。写段/合并/查询与另一臂逐项同序同预算，唯一差异是 store 设置；数字仅用于两臂 A/B，不进 full 台账。",
+      "schedule": [
+        {
+          "operation": "delete-index"
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "settings": {{ p_lite_settings | tojson }}
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "geonames",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "operation": {
+            "operation-type": "bulk",
+            "name": "index-append-lite",
+            "bulk-size": {{lite_bulk_size | default(2000)}},
+            "ingest-percentage": {{lite_ingest_percentage | default(5)}}
+          },
+          "clients": {{bulk_indexing_clients | default(8)}},
+          "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+        },
+        {
+          "name": "refresh-after-index",
+          "operation": "refresh"
+        },
+        {
+          "operation": {
+            "operation-type": "force-merge",
+            "request-timeout": 7200,
+            "max-num-segments": {{lite_max_num_segments | default(1)}}
+          }
+        },
+        {
+          "name": "refresh-after-force-merge",
+          "operation": "refresh"
+        },
+        {
+          "name": "wait-until-merges-finish",
+          "operation": {
+            "operation-type": "index-stats",
+            "index": "_all",
+            "condition": {
+              "path": "_all.total.merges.current",
+              "expected-value": 0
+            },
+            "retry-until-success": true,
+            "include-in-reporting": false
+          }
+        },
+        {
+          "operation": "default",
+          "warmup-iterations": 200,
+          "iterations": 1000,
+          "target-throughput": 40
+        },
+        {
+          "operation": "term",
+          "warmup-iterations": 200,
+          "iterations": 1000,
+          "target-throughput": 50
+        },
+        {
+          "operation": "phrase",
+          "warmup-iterations": 200,
+          "iterations": 1000,
+          "target-throughput": 50
+        },
+        {
+          "operation": "country_agg_uncached",
+          "warmup-iterations": 10,
+          "iterations": 50,
+          "target-throughput": 4
+        },
+        {
+          "operation": "scroll",
+          "warmup-iterations": 3,
+          "iterations": 20,
+          "target-throughput": 1
+        },
+        {
+          "operation": "desc_sort_population",
+          "warmup-iterations": 30,
+          "iterations": 200,
+          "target-throughput": 10
+        },
+        {
+          "operation": "painless_static",
+          "warmup-iterations": 30,
+          "iterations": 200,
+          "target-throughput": 10
+        }
+      ]
+    }{{ ',' if not loop.last }}
+{% endfor %}
