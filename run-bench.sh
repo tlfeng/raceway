@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # run-bench.sh —— 性能编排（配置 × 赛道 × 轮次，在压测机上运行；单入口，esrally 风格）
-#   ./run-bench.sh <geo|geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
+#   ./run-bench.sh <geo|geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc|geo-write|geo-write-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list> [rounds=3] [配置文件]
 #   ./run-bench.sh list                          # 列可用赛道/配置模板/近期 campaign
 #   ./run-bench.sh --help                        # 用法页（赛道、三种编排、前置条件）
 #
