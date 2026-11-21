@@ -25,6 +25,11 @@ import os
 import re
 import unittest
 
+try:
+    import jinja2 as _jinja2
+except ImportError:
+    _jinja2 = None
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GEO = os.path.join(ROOT, 'tracks', 'geonames')
 CHALLENGE = os.path.join(GEO, 'challenges', 'encrypted-store.json')
@@ -146,26 +151,13 @@ class EncryptedStoreChallengeTest(unittest.TestCase):
 
 
 def render_index_json(params):
-    """按测试友好的 Jinja 语义渲染 index.json 的 settings 段（条件块三态）。"""
-    s = _read(INDEX_JSON)
-    # encrypted_store 条件块：开了保留块内文本，关了整块消失（含 else 的 fs 行保留）
-    on = r'\{%-\s*if\s+encrypted_store\s+is\s+defined\s+and\s+encrypted_store\s*%\}(.*?)\{%-\s*else\s*%\}.*?\{%-\s*endif\s*%\}'
-    off = r'\{%-\s*if\s+encrypted_store\s+is\s+defined\s+and\s+encrypted_store\s*%\}.*?\{%-\s*else\s*%\}(.*?)\{%-\s*endif\s*%\}'
-    if params.get('encrypted_store'):
-        s = re.sub(on, lambda m: m.group(1), s, flags=re.S)
-    else:
-        s = re.sub(off, lambda m: m.group(1), s, flags=re.S)
-    s = re.sub(r'\{%\s*if\s+index_codec\s+is\s+defined\s*%\}.*?\{%\s*endif\s*%\}', '', s, flags=re.S)
-    s = re.sub(r'\{%\s*if\s+source_reuse\s+is\s+defined\s+and\s+source_reuse\s*%\}.*?\{%\s*endif\s*%\}',
-               '', s, flags=re.S)
-    s = re.sub(r'\{%.*?%\}', '', s, flags=re.S)          # 其余语句标签（flavor 门、p_include）
-    s = re.sub(r'\{#.*?#\}', '', s, flags=re.S)          # 注释
-    # {{expr | default(V)}} → V（V 可能带引号）；其余占位遮成 "X"
-    s = re.sub(r"\{\{[^{}]*\|\s*default\(([^)]+)\)\s*\}\}",
-               lambda m: m.group(1).strip().strip("'\""), s)
-    return json_after_masking(s)
+    """真 jinja2 渲染 index.json（三态条件块：cryptofs / encrypted / fs）。"""
+    import jinja2
+    env = jinja2.Environment(undefined=jinja2.Undefined)
+    return json.loads(env.from_string(_read(INDEX_JSON)).render(**params))
 
 
+@unittest.skipIf(_jinja2 is None, '需要 jinja2（index.json 是 Jinja 模板）')
 class EncryptedStoreIndexJsonTest(unittest.TestCase):
     def test_default_renders_plain_fs(self):
         """encrypted_store 默认关：store.type 走 store_type 指定值，无加密键。"""

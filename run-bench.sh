@@ -53,7 +53,7 @@ declare -F track_params >/dev/null 2>&1 \
 
 # 赛道/模式名单：用法提示、参数校验、文件头注释三处共用这一份（WHAT_ARGS）。
 # 收敛成一份后，文案与实际 case 的漂移由 tests/test_codec_variants.py 挡住。
-WHAT_ARGS='geo|geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list'
+WHAT_ARGS='geo|geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc|geo-write|geo-write-enc|gdef|gzstd|gbc|<赛道>-codec-<def|zstd|bc>[-sr]|hnsw|hv1024|nested|hv1024x|hv1024x-int8|hv1024x-bbq|hv1024x-codec-zstd-sr|hv1024x-bbqdisk|hv1024x-os|hv1024x-os-bbq|hv1024x-os-disk|upsert|codec|both|all|ds|ds-<档名>|list'
 
 # 用法页：./run-bench.sh --help —— 压测机是纯命令行环境，参数、赛道清单、前置条件、
 # 产物在哪全在这一页里，不用去翻源码。
@@ -82,6 +82,8 @@ raceway · 压测编排入口（用法页）
   geo-snap-enc           geonames 加密索引 + 加密仓库（s3 委托）快照闭环 仅 Easysearch
   geo-lite               geonames 缩量探针（5% 语料 ≈5min，fs store）       LITE_PCT 调百分比
   geo-lite-enc           geonames 缩量探针 · 索引加密（与上臂逐项同预算）Easysearch=encrypted store；OpenSearch=cryptofs 插件
+  geo-write              geonames 纯写入（全量语料 bulk+单段合并，70s 预热滤冷启动）
+  geo-write-enc          geonames 纯写入 · 索引加密（与上臂逐项同预算）Easysearch=encrypted store；OpenSearch=cryptofs 插件
   hnsw                   96 维 200 万向量            tracks/hnsw（语料 TRACK_HNSW_BASE）
   hv1024                 1024 维 100 万向量          tracks/hv1024
   nested                 nested 文档                 tracks/nested
@@ -123,7 +125,7 @@ suggest_track() { # <错的名字> → 猜一个 id（空 = 猜不出来）
   local w="$1" c
   for c in hv1024x-codec-zstd-sr hv1024x-int8 hv1024x-bbq hv1024x-bbqdisk \
            hv1024x-os-bbq hv1024x-os-disk hv1024x-os hv1024x hv1024 geonames-upsert \
-           hnsw nested geo geo-enc geo-snap geo-snap-enc geo-lite geo-lite-enc codec both all ds list gdef gzstd gbc; do
+           hnsw nested geo geo-enc geo-snap geo-snap-enc geo-lite geo-lite-enc geo-write geo-write-enc codec both all ds list gdef gzstd gbc; do
     [ "$w" = "$c" ] && { printf '%s' "$c"; return 0; }
   done
   for c in hv1024x-codec-zstd-sr geo-codec-zstd-sr geo-codec-def-sr geo-codec-bc-sr \
@@ -178,6 +180,9 @@ CLUSTER_WAIT_SEC=${CLUSTER_WAIT_SEC:-300}   # 集群卡点轮询超时（静默�
 : "${TIMEOUT_GEO_SNAP_W:=21600}"
 # 缩量探针族（geo-lite/geo-lite-enc）：正常 5-10 分钟一场，卡住就尽早止损（默认 30min）
 : "${TIMEOUT_GEO_LITE_W:=1800}"
+# 写入族（geo-write / geo-write-enc）：全量语料纯写段，正常 8-15 分钟一场，
+# 但加密臂 force-merge 单段可能显著变慢，超时留足 60 分钟。
+: "${TIMEOUT_GEO_WRITE_W:=3600}"
 # 缩量探针的数据量：两臂共用这一个值（吃同一语料前缀才可比），5 = 约 57 万条
 : "${LITE_PCT:=5}"
 : "${TIMEOUT_HNSW_W:=10800}"; : "${TIMEOUT_HNSW_Q:=5400}"
@@ -229,7 +234,7 @@ else
 fi
 
 if [ "$WHAT" = list ]; then
-  echo "可用赛道: geo geo-enc geo-snap geo-snap-enc geo-lite geo-lite-enc gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk geonames-upsert codec both all ds"
+  echo "可用赛道: geo geo-enc geo-snap geo-snap-enc geo-lite geo-lite-enc geo-write geo-write-enc gdef gzstd gbc hnsw hv1024 nested hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk geonames-upsert codec both all ds"
   echo "  单跑某个压缩变体：<赛道>-codec-<def|zstd|bc>[-sr]（如 geo-codec-zstd-sr、geo-codec-bc）"
   echo
   echo "赛道 → 定义目录 → 现在能不能跑："
@@ -256,6 +261,8 @@ case "$WHAT" in
            # geonames 快照探针族（挑战=encrypted-store-snapshot；仓库三臂见 vm-bench-lib track_params）
   geo-lite|geo-lite-enc) TRACKS=("$WHAT");;
            # geonames 缩量探针族（挑战=lite / lite-encrypted；数据量走 LITE_PCT → lite_ingest_percentage）
+  geo-write|geo-write-enc) TRACKS=("$WHAT");;
+           # geonames 写入族（挑战=write-only：全量语料 bulk+单段合并，无查询段；加密臂按引擎选通）
   *-codec-*) TRACKS=("$WHAT");;     # 单独跑某个压缩变体（任意基础赛道；压缩档走 --track-params）
   gdef|gzstd|gbc) TRACKS=("$WHAT");; # 仍认的短名别名（= geo-codec-*）
   hnsw) TRACKS=(hnsw);;
@@ -827,11 +834,12 @@ cpu_affinity_assert() { # <engine>
 }
 
 # ---------- track -------------------------------------------------------------
-track_challenge() { # <赛道id> → rally 挑战名（快照族走 encrypted-store-snapshot，缩量族走 lite/lite-encrypted，其余派生 full）
+track_challenge() { # <赛道id> → rally 挑战名（快照族走 encrypted-store-snapshot，缩量族走 lite/lite-encrypted，写入族走 write-only，其余派生 full）
   case "$1" in
     geo-snap|geo-snap-enc) echo "encrypted-store-snapshot";;
     geo-lite)     echo "lite";;
     geo-lite-enc) echo "lite-encrypted";;
+    geo-write|geo-write-enc) echo "write-only";;
     *) echo "full";;
   esac; }
 prepare_hnsw() {
@@ -1011,6 +1019,7 @@ track_tmo_w() { local b; b=$(track_base "$1"); case "$b" in
   geonames-upsert) echo "${TIMEOUT_UPSERT_W:-$TIMEOUT_GEO_W}";;
   geo) case "$1" in geo-snap|geo-snap-enc) echo "$TIMEOUT_GEO_SNAP_W";;
                      geo-lite|geo-lite-enc) echo "$TIMEOUT_GEO_LITE_W";;
+                     geo-write|geo-write-enc) echo "$TIMEOUT_GEO_WRITE_W";;
                      *) echo "$TIMEOUT_GEO_W";; esac;;
   hnsw) echo "$TIMEOUT_HNSW_W";;
   hv1024) echo "$TIMEOUT_HV1024_W";;

@@ -122,9 +122,9 @@ track_canonical() { # <短 id> → 规范 id
   esac; }
 track_is_variant() { # <id> → 是变体则 0
   case "$(track_canonical "$1")" in *-codec-*) return 0;; *) return 1;; esac; }
-track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀；geo-enc/geo-snap/geo-lite 族是 geonames 的加密/快照/缩量变体）
+track_base() { # <id> → 基础赛道 id（变体剥掉 -codec-... 后缀；geo-enc/geo-snap/geo-lite/geo-write 族是 geonames 的加密/快照/缩量/写入变体）
   local c; c=$(track_canonical "$1")
-  case "$c" in geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc) echo geo;; *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
+  case "$c" in geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc|geo-write|geo-write-enc) echo geo;; *-codec-*) echo "${c%%-codec-*}";; *) echo "$c";; esac; }
 track_dir() { # <赛道/变体 id> → 目录
   local c; c=$(track_canonical "$1")
   case "$c" in
@@ -142,9 +142,9 @@ track_dir() { # <赛道/变体 id> → 目录
       # 向量量化族四臂（hnsw / int8 / bbq / zstd+sr）**一份基座定义**，
       # 量化档走 --track-params（vector_index_type）。
       echo "$ROOT/tracks/hv1024x";;
-    geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc)
-      # 加密/快照/缩量变体走同一定版目录：encrypted_store、快照仓库参数、
-      # lite 的数据量都经 --track-params 或挑战文件选通。
+    geo-enc|geo-snap|geo-snap-enc|geo-lite|geo-lite-enc|geo-write|geo-write-enc)
+      # 加密/快照/缩量/写入变体走同一定版目录：encrypted_store、快照仓库参数、
+      # lite 的数据量、写入族的引擎选通都经 --track-params 或挑战文件选通。
       echo "$ROOT/tracks/geonames";;
     geo) echo "$ROOT/tracks/geonames";;
     hnsw) echo "$ROOT/tracks/hnsw";;
@@ -189,7 +189,7 @@ tracks_need_hnsw_prep() { # <赛道 id...> → 0=需要准备 hnsw 语料/查询
 # run-bench.sh list 与 doctor.sh 共用这一份 —— 两处各写一份映射表 = 迟早漂移。
 track_availability_table() {
   local _t _d
-  for _t in geo geo-enc geo-snap geo-snap-enc geo-lite geo-lite-enc geonames-upsert hnsw hv1024 nested \
+  for _t in geo geo-enc geo-snap geo-snap-enc geo-lite geo-lite-enc geo-write geo-write-enc geonames-upsert hnsw hv1024 nested \
             hv1024x hv1024x-int8 hv1024x-bbq hv1024x-codec-zstd-sr \
             hv1024x-bbqdisk hv1024x-os hv1024x-os-bbq hv1024x-os-disk; do
     _d=$(track_dir "$_t" 2>/dev/null || echo "");   # 变体与基座同目录（压缩/量化走 params）
@@ -219,21 +219,22 @@ track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
 track_engines() { # <id> → 允许的引擎空格列表（空 = 两侧通用；消费方必须用词匹配，勿全等比较）
   local comp sr
   # 加密/快照族只 Easysearch 能跑（ES 不认 index.encryption.profile / type=encrypted 仓库）。
-  # geo-lite 是明文缩量臂 → 两侧通用；geo-lite-enc 双引擎：
-  #   Easysearch 走 encrypted store（模板默认），OpenSearch 走 cryptofs
-  #   （storage-encryption 插件，enc_store_type:cryptofs 由 track_params 按引擎注入）。
+  # geo-lite 是明文缩量臂 → 两侧通用；geo-lite-enc / geo-write-enc 双引擎：
+  #   Easysearch 走 encrypted store（encrypted_store:true → index.json 条件块），
+  #   OpenSearch 走 cryptofs（storage-encryption 插件，enc_store_type:cryptofs
+  #   由 track_params 按引擎注入）。
   case "$(track_canonical "$1")" in
     geo-enc|geo-snap|geo-snap-enc) echo "easysearch"; return 0;;
-    geo-lite-enc) echo "easysearch opensearch"; return 0;;
+    geo-lite-enc|geo-write-enc) echo "easysearch opensearch"; return 0;;
   esac
   track_is_variant "$1" || { echo ""; return 0; }
   comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
   if [ "$sr" = "true" ] || [ "$comp" = "ZSTD" ]; then echo "easysearch"; else echo ""; fi
 }
 
-track_needs_enc() { # <id> → 0=该变体跑前须装加密套件（三插件+keyring；geo-enc / geo-snap / geo-lite-enc 族）
+track_needs_enc() { # <id> → 0=该变体跑前须装加密套件（三插件+keyring / cryptofs；加密族变体）
   case "$(track_canonical "$1")" in
-    geo-enc|geo-snap|geo-snap-enc|geo-lite-enc) return 0;;
+    geo-enc|geo-snap|geo-snap-enc|geo-lite-enc|geo-write-enc) return 0;;
   esac
   return 1; }
 
@@ -259,6 +260,13 @@ track_params() { # <id> [engine] → esrally --track-params（空 = 不传；eng
   # 加密变体：index.json 的 encrypted_store 条件块写入 index.store.type=encrypted +
   # index.encryption.profile=index（只 Easysearch 认；写 false 会被 Jinja 当真值，必须不传才关）。
   [ "$1" = "geo-enc" ] && p="${p:+$p,}encrypted_store:true"
+  # 写入族加密臂按引擎选通（index.json 条件块同样认这两个标量）：
+  #   Easysearch → encrypted_store:true（encrypted store，模板默认语义）
+  #   OpenSearch → enc_store_type:cryptofs（cryptofs 分支烘 key_provider 默认 dummy）
+  [ "$1" = "geo-write-enc" ] && [ "${2:-}" = "opensearch" ] && \
+    p="${p:+$p,}enc_store_type:cryptofs"
+  [ "$1" = "geo-write-enc" ] && [ "${2:-}" != "opensearch" ] && \
+    p="${p:+$p,}encrypted_store:true"
   # 缩量探针（geo-lite / geo-lite-enc）：数据量由 lite_ingest_percentage 定，两臂必须用
   # **同一个值**（吃同一语料前缀）才有 A/B 意义，所以只留一个旋钮 LITE_PCT。
   # ⚠ 加密臂不传 encrypted_store：lite.json 的两个臂已各自把 store.type 钉在 operation 级
@@ -302,6 +310,14 @@ track_assert_storage_params() { # <赛道id>
     die "$id: $idx 没有 encrypted_store 条件块 —— 加密变体会静默跑成明文基座"
   fi
   case "$id" in
+    geo-write-enc)
+      # 写入族加密臂靠 index.json 的双分支（encrypted_store / enc_store_type）：
+      # 缺任一分支，对应引擎的加密会静默跑成明文基座。
+      grep -q 'encrypted_store' "$idx" || die "$id: $idx 没有 encrypted_store 条件块"
+      grep -q 'enc_store_type' "$idx" || die "$id: $idx 没有 enc_store_type 条件块 —— OpenSearch cryptofs 会静默失效";;
+    geo-write|geo-write-enc)
+      local wch="$dir/challenges/write-only.json"
+      [ -f "$wch" ] || die "$id: 缺挑战文件 $wch（仓库没同步全 tracks/）";;
     geo-snap|geo-snap-enc)
       local ch="$dir/challenges/encrypted-store-snapshot.json"
       [ -f "$ch" ] || die "$id: 缺挑战文件 $ch（仓库没同步全 tracks/）"
