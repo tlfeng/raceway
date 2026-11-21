@@ -6,7 +6,10 @@
       {% if p_include_non_serverless_index_settings %}
     "index.number_of_shards": {{number_of_shards | default(5)}},
     "index.number_of_replicas": {{number_of_replicas | default(0)}},
-    {%- if encrypted_store is defined and encrypted_store %}
+    {%- if enc_store_type is defined and enc_store_type == 'cryptofs' %}
+    "index.store.type": "cryptofs",
+    "index.store.crypto.key_provider": "{{crypto_key_provider | default('dummy')}}",
+    {%- elif encrypted_store is defined and encrypted_store %}
     "index.store.type": "encrypted",
     "index.encryption.profile": "index",
     {%- else %}
