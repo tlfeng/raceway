@@ -162,6 +162,25 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(s['index.store.crypto.key_provider'], 'dummy')
         self.assertNotIn('index.encryption.profile', s)
 
+    def test_cryptofs_bakes_default_key_provider_without_json_params(self):
+        """rally CLI 传不了 JSON：只传标量 enc_store_type=cryptofs 时，模板必须自己
+        烘出 key_provider 默认值（dummy），crypto_key_provider 标量旋钮可覆盖，
+        enc_index_settings（渲染侧）优先级最高。"""
+        enc = next(c for c in rendered(enc_store_type='cryptofs') if c['name'] == 'lite-encrypted')
+        self.assertEqual(create_settings(enc)['index.store.crypto.key_provider'], 'dummy')
+        enc = next(c for c in rendered(enc_store_type='cryptofs',
+                                       crypto_key_provider='aws-kms')
+                   if c['name'] == 'lite-encrypted')
+        self.assertEqual(create_settings(enc)['index.store.crypto.key_provider'], 'aws-kms')
+
+    def test_encrypted_profile_still_baked_for_easysearch_arm(self):
+        """Easysearch 默认语义不回归：encrypted + profile=index，无 cryptofs 杂键。"""
+        enc = next(c for c in rendered() if c['name'] == 'lite-encrypted')
+        s = create_settings(enc)
+        self.assertEqual(s['index.store.type'], 'encrypted')
+        self.assertEqual(s['index.encryption.profile'], 'index')
+        self.assertNotIn('index.store.crypto.key_provider', s)
+
     def test_stray_encrypted_param_cannot_poison_plain_arm(self):
         """index.json 会按 encrypted_store 写加密键，常规臂必须用 operation settings 压回去。"""
         plain = next(c for c in rendered(encrypted_store=True) if c['name'] == 'lite')
@@ -257,12 +276,31 @@ class RunnerWiringTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_engines_and_enc_gate(self):
-        """明文臂两侧通用；加密臂锁 Easysearch 且跑前要装加密套件。"""
+        """明文臂两侧通用；加密臂双引擎（Easysearch + OpenSearch cryptofs）且跑前要装加密套件。
+        消费方必须词匹配（allow 是空格词表），这里也按词表断言。"""
         p = _lib_probe(
             '[ -z "$(track_engines geo-lite)" ] || { echo "geo-lite 不该限引擎" >&2; exit 1; }\n'
-            '[ "$(track_engines geo-lite-enc)" = easysearch ] || exit 1\n'
+            'allow="$(track_engines geo-lite-enc)"\n'
+            'case " $allow " in *" easysearch "*&*" opensearch "*) ;; '
+            '*) echo "geo-lite-enc 引擎表不对: $allow" >&2; exit 1;; esac\n'
             'track_needs_enc geo-lite && { echo "明文臂不该装加密套件" >&2; exit 1; }\n'
             'track_needs_enc geo-lite-enc || { echo "加密臂漏了装机门" >&2; exit 1; }\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_track_params_engine_aware_enc_arm(self):
+        """geo-lite-enc 的 store 类型按引擎选通：OpenSearch 注入 enc_store_type:cryptofs
+        （标量，CLI 可传）；Easysearch/缺省不注入（走模板默认 encrypted 语义）。"""
+        p = _lib_probe(
+            'os="$(track_params geo-lite-enc opensearch)"\n'
+            'ez="$(track_params geo-lite-enc easysearch)"\n'
+            'case "$os" in *enc_store_type:cryptofs*) ;; *) echo "OS 缺 cryptofs: $os" >&2; exit 1;; esac\n'
+            'case "$ez" in *enc_store_type*) echo "EZ 不该注入 enc_store_type: $ez" >&2; exit 1;; esac\n'
+            'case "$(track_params geo-lite)" in *enc_store_type*) echo "明文臂不该有" >&2; exit 1;; esac\n'
+            'for t in "geo-lite-enc opensearch" "geo-lite easysearch"; do\n'
+            '  set -- $t\n'
+            '  case "$(track_params $1 $2)" in *lite_ingest_percentage:*) ;; '
+            '*) echo "pct 丢了: $t" >&2; exit 1;; esac\n'
+            'done\n')
         self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_availability_table_lists_lite_arms(self):
