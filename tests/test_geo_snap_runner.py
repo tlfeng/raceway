@@ -148,9 +148,13 @@ class TestSnapRunnerWiring(unittest.TestCase):
                         'enc 门必须在集群就绪（wipe+卡点）之后')
         for status in ('ENC-SETUP-FAIL', 'ENC-GATE-FAIL', 'S3-BACKEND-FAIL'):
             self.assertIn('| %s |' % status, body, 'run_field 缺失败态 %s' % status)
-        # geo-snap 族装机必须带 s3 客户端参数；geo-enc 不带
-        self.assertIn('ops.enc setup $s3args --yes', body)
+        # geo-snap 族装机必须带 s3 客户端参数；geo-enc 不带。
+        # 引擎分支：opensearch 走 ops.enc --engine opensearch（cryptofs）， EZ 不带 --engine
+        self.assertIn('ops.enc setup $enceng $s3args --yes', body)
         self.assertIn('case "$tk" in geo-snap*) s3args=', body)
+        self.assertIn('enceng="--engine opensearch"', body,
+                      'run_field 必须按引擎给 ops.enc 传 --engine')
+        self.assertIn('cryptofs', body, 'enc 门必须有 OpenSearch cryptofs 冒烟分支')
 
     def test_minio_lifecycle(self):
         """MinIO：幂等拉起 + 建桶；campaign 收尾与 _close_on_exit 都要关。"""
