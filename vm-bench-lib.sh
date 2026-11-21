@@ -216,12 +216,15 @@ track_index() { # <id> → 索引名（变体沿用基础赛道的索引名）
     nested) echo "sonested";;
     *) echo "vectors";;
   esac; }
-track_engines() { # <id> → 允许的引擎（空 = 两侧通用）
+track_engines() { # <id> → 允许的引擎空格列表（空 = 两侧通用；消费方必须用词匹配，勿全等比较）
   local comp sr
   # 加密/快照族只 Easysearch 能跑（ES 不认 index.encryption.profile / type=encrypted 仓库）。
-  # geo-lite 是明文缩量臂 → 两侧通用；geo-lite-enc 走 encrypted store → 只 Easysearch。
+  # geo-lite 是明文缩量臂 → 两侧通用；geo-lite-enc 双引擎：
+  #   Easysearch 走 encrypted store（模板默认），OpenSearch 走 cryptofs
+  #   （storage-encryption 插件，enc_store_type:cryptofs 由 track_params 按引擎注入）。
   case "$(track_canonical "$1")" in
-    geo-enc|geo-snap|geo-snap-enc|geo-lite-enc) echo "easysearch"; return 0;;
+    geo-enc|geo-snap|geo-snap-enc) echo "easysearch"; return 0;;
+    geo-lite-enc) echo "easysearch opensearch"; return 0;;
   esac
   track_is_variant "$1" || { echo ""; return 0; }
   comp=$(track_compression "$1"); sr=$(track_source_reuse "$1")
@@ -234,7 +237,7 @@ track_needs_enc() { # <id> → 0=该变体跑前须装加密套件（三插件+k
   esac
   return 1; }
 
-track_params() { # <id> → esrally --track-params（空 = 不传）
+track_params() { # <id> [engine] → esrally --track-params（空 = 不传；engine 用于加密臂选通）
   # 分片口径：只有"模板类基座"需要传 —— geonames / nested / hv1024 的 index.json
   # 是 Jinja 模板（"index.number_of_shards": {{number_of_shards | default(N)}}），
   # 不传就落到模板默认值（geonames 5、nested 1、hv1024 3），与其余赛道的 3 分片口径
@@ -263,6 +266,12 @@ track_params() { # <id> → esrally --track-params（空 = 不传）
   case "$1" in
     geo-lite|geo-lite-enc) p="${p:+$p,}lite_ingest_percentage:${LITE_PCT:-5}";;
   esac
+  # 缩量加密臂 × OpenSearch：cryptofs 走上游 storage-encryption 插件。enc_store_type 是
+  # 标量参数（rally CLI 传不了 JSON），key_provider 由 lite.json 的 cryptofs 分支烘默认
+  # dummy（crypto_key_provider 参数可覆盖）。Easysearch 加密臂走模板默认 encrypted 语义，
+  # 不传（传了反而会覆盖掉 index.encryption.profile 分支）。
+  [ "$1" = "geo-lite-enc" ] && [ "${2:-}" = "opensearch" ] && \
+    p="${p:+$p,}enc_store_type:cryptofs"
   # 快照探针族：仓库参数走 encrypted-store-snapshot.json 的 p_repo_settings 三臂链
   #（明文 s3 / 加密+s3 委托 / 默认 fs）。桶与 base_path 必须从旋钮显式传，别靠模板默认 ——
   # 桶名在 runner 侧是 S3_BUCKET 旋钮，两边漂了快照就落到没人清理的桶里。

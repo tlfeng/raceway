@@ -81,7 +81,7 @@ raceway · 压测编排入口（用法页）
   geo-snap               geonames 加密索引 + 明文 s3 仓库快照闭环（MinIO）仅 Easysearch
   geo-snap-enc           geonames 加密索引 + 加密仓库（s3 委托）快照闭环 仅 Easysearch
   geo-lite               geonames 缩量探针（5% 语料 ≈5min，fs store）       LITE_PCT 调百分比
-  geo-lite-enc           geonames 缩量探针 · 索引加密（与上臂逐项同预算）仅 Easysearch
+  geo-lite-enc           geonames 缩量探针 · 索引加密（与上臂逐项同预算）Easysearch=encrypted store；OpenSearch=cryptofs 插件
   hnsw                   96 维 200 万向量            tracks/hnsw（语料 TRACK_HNSW_BASE）
   hv1024                 1024 维 100 万向量          tracks/hv1024
   nested                 nested 文档                 tracks/nested
@@ -452,10 +452,14 @@ check_track_engine_compat() {
     cfg=$(car_config "$car")
     eng=$(car_engine "$cfg")
     [ -n "$eng" ] || continue
-    if [ "$eng" != "$allow" ]; then
-      echo "  不兼容: 车 $car（引擎 $eng）× 变体 $tk（该变体只支持 $allow）" >&2
-      bad=1
-    fi
+    # allow 是空格分隔的引擎词表（track_engines 契约），必须词匹配而非全等
+    case " $allow " in
+      *" $eng "*) ;;
+      *)
+        echo "  不兼容: 车 $car（引擎 $eng）× 变体 $tk（该变体只支持 $allow）" >&2
+        bad=1
+        ;;
+    esac
   done < <(schedule_lines)
   [ "$bad" = 0 ] || die "排程里有引擎与变体不兼容的组合（见上）—— 起跑前拦下，别白跑"
   return 0
@@ -698,6 +702,15 @@ purge_stale_index_data() {
       wipe_engine_data_on_vm "$ip" "$eng" || return 1
     done
   done
+}
+
+# 读 ibs env 的一个键（.env.local 优先，.env 兜底）—— OpenSearch 的 admin 凭证住在
+# ibs env 里（vm-bench.env 只有 Easysearch 的），排程混跑两引擎时按引擎各取各的。
+ibs_ens_val() { # <KEY>
+  local k="$1" v
+  v=$(grep -E "^${k}=" "$IBS_ROOT/configs/.env.local" 2>/dev/null | tail -1 | cut -d= -f2-)
+  [ -n "$v" ] || v=$(grep -E "^${k}=" "$IBS_ROOT/configs/.env" 2>/dev/null | tail -1 | cut -d= -f2-)
+  printf '%s' "${v//\"/}"
 }
 
 # 确保引擎已安装且 build 正确。以 ip.txt 第4列完整 build 号为部署状态单一事实来源
@@ -1536,8 +1549,17 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   local rep="$CAMP_DIR/results/$fid-wq.md"
   local rlog="$CAMP_DIR/logs/$fid-wq.log"
   local HOSTS; HOSTS=$(target_hosts)
-  local OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false"
-  local tp; tp=$(track_params "$tk")
+  # 两个引擎都是 https + basic auth（ibs 部署默认开安全层），只是凭证来源不同：
+  # Easysearch 用 vm-bench.env 的 ADMIN_USER/ADMIN_PW，OpenSearch 用 ibs env 的
+  # OS_ADMIN_USER / OS_INITIAL_ADMIN_PASSWORD（ibs_ens_val 从 .env.local → .env 兜底）。
+  local OPTS
+  case "$eng" in
+    opensearch)
+      OPTS="use_ssl:true,basic_auth_user:'$(ibs_ens_val OS_ADMIN_USER)',basic_auth_password:'$(ibs_ens_val OS_INITIAL_ADMIN_PASSWORD)',verify_certs:false";;
+    *)
+      OPTS="use_ssl:true,basic_auth_user:'$ADMIN_USER',basic_auth_password:'$ADMIN_PW',verify_certs:false";;
+  esac
+  local tp; tp=$(track_params "$tk" "$eng")
   # 快照探针族：快照名按 campaign+场次唯一 —— 同仓库同名快照二次 create 会被拒
   # （delete-repository 预清场救不了：只注销仓库不清数据），轮次/重试/跨 campaign
   # 都要分开（fid 已含轮次与重试，CAMP_ID 区分 campaign）。曾实测：上个 campaign
@@ -1594,11 +1616,19 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
 
   # 2c) 加密套件装机（wipe 前：插件/keystore/yml 落盘，wipe 冷重启后生效；幂等，已装跳过）。
   #     geo-snap 族还要配 s3 客户端（endpoint + keystore 凭证），明文臂和加密委托臂共用。
+  #     引擎分支：Easysearch 走三插件+keyring；OpenSearch 走 storage-encryption 插件
+  #     （ops.enc --engine opensearch：装插件 + crypto.enabled + libcrypto symlink）。
   if track_needs_enc "$tk"; then
     local s3args=""
     case "$tk" in geo-snap*) s3args="--s3-endpoint $S3_ENDPOINT --s3-access $S3_ACCESS_KEY --s3-secret $S3_SECRET_KEY";; esac
-    PROGSTEP "  加密套件装机开始（幂等；geo-snap 族含 s3 客户端）..."
-    if ! ( cd "$IBS_ROOT" && timeout 900 python3 -m ops.enc setup $s3args --yes ) \
+    local enceng=""
+    [ "$eng" = opensearch ] && enceng="--engine opensearch"
+    [ "$eng" = opensearch ] && { [ "$tk" = geo-snap ] || [ "$tk" = geo-snap-enc ]; } && {
+      echo "| $fid | ENC-SETUP-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+      PROGSTEP "[$seq] $fid ENC-SETUP-FAIL（OpenSearch 无加密仓库委托，快照族不可跑）"; return 1
+    }
+    PROGSTEP "  加密套件装机开始（幂等；$eng；geo-snap 族含 s3 客户端）..."
+    if ! ( cd "$IBS_ROOT" && timeout 900 python3 -m ops.enc setup $enceng $s3args --yes ) \
          > "$CAMP_DIR/logs/ibs-enc-$fid.log" 2>&1; then
       echo "| $fid | ENC-SETUP-FAIL | precheck=$PCTAG | - |" >> "$RACES"
       PROGSTEP "[$seq] $fid ENC-SETUP-FAIL（见 logs/ibs-enc-$fid.log）"; return 1
@@ -1614,9 +1644,38 @@ run_field() { # <conf_idx> <track> <round> <seq> [attempt]
   heap_assert "$eng" "$HEAP" "$(eng_dir_of "$eng")" "$(svc2_of "$eng")" || { echo "| $fid | HEAP-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid HEAP-ASSERT-FAIL（实际堆≠声明 heap:$HEAP）"; return 1; }
   cpu_affinity_assert "$eng" || { echo "| $fid | CPU-ASSERT-FAIL | precheck=$PCTAG | - |" >> "$RACES"; PROGSTEP "[$seq] $fid CPU-ASSERT-FAIL"; return 1; }
 
-  # 3b) 加密就绪门：全集群 encryption status 无 UNAVAILABLE/INCONSISTENT 且有 READY
+  # 3b) 加密就绪门（按引擎）：
+  #     Easysearch — 全集群 encryption status 无 UNAVAILABLE/INCONSISTENT 且有 READY
   #     （装机在 wipe 前落盘、冷启动才生效 —— 门禁不过说明 keyring/profile 没装对）
+  #     OpenSearch — cryptofs 冒烟：建→写→查→删一个 dummy-provider 临时索引，
+  #     直接验证插件加载、libcrypto、crypto.enabled 全链路（无 _encryption/status API）
   if track_needs_enc "$tk"; then
+    if [ "$eng" = opensearch ]; then
+      local H1="https://${VM_IPS[0]}:$HTTP_PORT"
+      local OSAUTH="-k -u $(ibs_ens_val OS_ADMIN_USER):$(ibs_ens_val OS_INITIAL_ADMIN_PASSWORD)"
+      curl $OSAUTH -s --max-time 30 -XDELETE "$H1/enc-gate-smoke" > /dev/null 2>&1
+      local smoke_out="" smoke_ok=1
+      smoke_out=$(curl $OSAUTH -s --max-time 30 -XPUT "$H1/enc-gate-smoke" -H "Content-Type: application/json" \
+        -d '{"settings":{"number_of_shards":1,"number_of_replicas":0,"index.store.type":"cryptofs","index.store.crypto.key_provider":"dummy"}}') || smoke_ok=0
+      if [ "$smoke_ok" = 1 ] && printf '%s' "$smoke_out" | grep -q acknowledged; then
+        curl $OSAUTH -s --max-time 30 -XPUT "$H1/enc-gate-smoke/_doc/1" -H "Content-Type: application/json" \
+          -d '{"name":"gate"}' > /dev/null 2>&1 || smoke_ok=0
+      fi
+      if [ "$smoke_ok" = 1 ]; then
+        curl $OSAUTH -s --max-time 30 -XPOST "$H1/enc-gate-smoke/_refresh" > /dev/null 2>&1
+        local hits
+        hits=$(curl $OSAUTH -s --max-time 30 "$H1/enc-gate-smoke/_search?q=name:gate" \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["hits"]["total"]["value"])' 2>/dev/null) || hits=0
+        [ "$hits" = "1" ] || smoke_ok=0
+      fi
+      curl $OSAUTH -s --max-time 30 -XDELETE "$H1/enc-gate-smoke" > /dev/null 2>&1
+      if [ "$smoke_ok" != 1 ]; then
+        printf '%s' "${smoke_out:-（空响应）}" > "$CAMP_DIR/logs/enc-gate-$fid.out" 2>/dev/null
+        echo "| $fid | ENC-GATE-FAIL | precheck=$PCTAG | - |" >> "$RACES"
+        PROGSTEP "[$seq] $fid ENC-GATE-FAIL（cryptofs 冒烟未过，logs/enc-gate-$fid.out）"; return 1
+      fi
+      PROGSTEP "  加密就绪门通过（cryptofs 冒烟 OK）"
+    else
     local encout
     encout=$(curl -sk -u "$ADMIN_USER:$ADMIN_PW" --max-time 30 \
       "https://${VM_IPS[0]}:$HTTP_PORT/_encryption/status" 2>/dev/null)
@@ -1631,6 +1690,7 @@ if "READY" not in d: sys.exit(1)' > "$CAMP_DIR/logs/enc-gate-$fid.out" 2>&1; the
     fi
     printf '%s' "$encout" > "$CAMP_DIR/results/$fid-enc-status.json"
     PROGSTEP "  加密就绪门通过（profiles READY）"
+    fi
   fi
 
   # 3c) 快照族 s3 后端：MinIO 幂等拉起 + 建桶（VM 侧经网桥 IP 访问）
@@ -1910,7 +1970,7 @@ for _pi in "${!PLAN_FIDS[@]}"; do
   _base_fid="$fid"
   apply_config "${PLAN_CONFIGS[$_pi]}"
   _allow=$(track_engines "$tk")
-  if [ -n "$_allow" ] && [ "$ENGINE_NAME" != "$_allow" ]; then
+  if [ -n "$_allow" ] && ! case " $_allow " in *" $ENGINE_NAME "*) true;; *) false;; esac; then
     PROGSTEP "[$seqn] $fid 跳过（引擎 $ENGINE_NAME 不支持该变体，该变体只支持 $_allow）"
     state_write SKIP "$fid"; continue
   fi

@@ -18,9 +18,12 @@
 
    加密臂跨引擎：Easysearch 用 store.type=encrypted + index.encryption.profile；
    OpenSearch 的 storage-encryption 插件用 store.type=cryptofs + key_provider。
-   默认值保持 Easysearch 语义；跑 OpenSearch 时传
-     enc_store_type=cryptofs, enc_index_settings={"index.store.crypto.key_provider":"dummy"}
-   index.encryption.profile 只在 store.type=encrypted 时才写，避免 OpenSearch 拒收未知设置。 #}
+   默认值保持 Easysearch 语义；跑 OpenSearch 时传 enc_store_type=cryptofs
+   （runner 的 track_params 按引擎注入）——cryptofs 分支自动烘
+   index.store.crypto.key_provider={{ crypto_key_provider | default('dummy') }}，
+   标量旋钮 crypto_key_provider 可覆盖（rally CLI 传不了 JSON，enc_index_settings
+   仍保留给渲染侧/测试用，且优先级最高）。index.encryption.profile 只在
+   store.type=encrypted 时才写，避免 OpenSearch 拒收未知设置。 #}
 {% for _enc in [false, true] %}
 {% set p_enc_store_type = enc_store_type | default('encrypted') %}
 {% set p_lite_settings = {"index.store.type": store_type | default('fs')} %}
@@ -28,6 +31,7 @@
 {% if _enc %}
 {% set _ = p_lite_settings.update({"index.store.type": p_enc_store_type}) %}
 {% if p_enc_store_type == 'encrypted' %}{% set _ = p_lite_settings.update({"index.encryption.profile": "index"}) %}{% endif %}
+{% if p_enc_store_type == 'cryptofs' %}{% set _ = p_lite_settings.update({"index.store.crypto.key_provider": crypto_key_provider | default('dummy')}) %}{% endif %}
 {% if enc_index_settings is defined and enc_index_settings is mapping %}{% set _ = p_lite_settings.update(enc_index_settings) %}{% endif %}
 {% endif %}
     {
