@@ -14,6 +14,11 @@
 · 唯一口径改动 = force-merge 的 max-num-segments 由上游的可选参数改为
   `{{max_num_segments | default(1)}}`（raceway 口径 = 强制单段）
 
+· raceway 口径改动 2（20261122）= 写段收尾任务 wait-until-merges-finish 去掉
+  `include-in-reporting: false`：expected_tasks 把它记为 terminal 生命周期证据，
+  race_metric_ok 逐个断言其指标 —— 不上报则整场必 METRIC-NULL-FAIL。
+  （query-only 查段沿用上游原文，不受影响）
+
 · Jinja 控制标签（`{% if %}`）剥掉 → 各自文件里是静态定义；唯独 `post_ingest_sleep`
   保留条件块（它是默认关的参数开关，固化就变成"每次都睡 30s"）
 
@@ -151,6 +156,11 @@ def derive():
 
     write_ops = keep(raw_ops[:cut + 1])
     query_ops = keep(raw_ops[cut + 1:])
+
+    # 口径改动 2：收尾任务必须可上报（见文件头"raceway 口径改动 2"）。
+    # 连同前一行遗留的悬空逗号一起剥掉。
+    if write_ops and 'include-in-reporting' in write_ops[-1]:
+        write_ops[-1] = re.sub(r',\s*"include-in-reporting"\s*:\s*false', '', write_ops[-1])
 
     # post_ingest_sleep 是上游的服务端less调参开关（默认关，runner 从不传）
     # → 必须保留条件块，不能固化成"每次都睡 30s"

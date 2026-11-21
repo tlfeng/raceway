@@ -20,8 +20,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX_JSON = os.path.join(ROOT, 'tracks', 'geonames', 'index.json')
@@ -207,6 +210,72 @@ class RunnerWiringTest(unittest.TestCase):
             'track_assert_storage_params geo-write || exit 1\n'
             'track_assert_storage_params geo-write-enc || exit 1\n')
         self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_expected_tasks_terminal_rule_for_write_only(self):
+        """expected_tasks 的无查询挑战规则：末任务 index-stats = 生命周期证据（terminal）。
+
+        write-only 挑战没有查询段 —— 硬断言"必须声明查询任务"会让整个写入族
+        TASKS-FAIL（20261122 实测 28 场全灭）。规则泛化后 upsert 的 final-stats
+        特例同样被覆盖。"""
+        body = self._expected_tasks_body()
+        spec = {
+            'operations': [
+                {'name': 'index-append', 'operation-type': 'bulk'},
+                {'name': 'wait-until-merges-finish', 'operation-type': 'index-stats'},
+            ],
+            'challenges': [{'name': 'write-only', 'schedule': [
+                {'operation': 'index-append'},
+                {'operation': 'wait-until-merges-finish'},
+            ]}],
+        }
+        out = self._run_expected_tasks(body, spec, 'write-only')
+        self.assertTrue(out['write'], '写任务必须进 expected')
+        self.assertEqual(out['terminal'], ['wait-until-merges-finish'],
+                         '末任务 index-stats 必须记为 terminal 证据')
+
+    def test_expected_tasks_query_challenge_keeps_terminal_empty(self):
+        body = self._expected_tasks_body()
+        spec = {
+            'operations': [
+                {'name': 'index-append', 'operation-type': 'bulk'},
+                {'name': 'q1', 'operation-type': 'search'},
+            ],
+            'challenges': [{'name': 'full', 'schedule': [
+                {'operation': 'index-append'},
+                {'operation': 'q1'},
+            ]}],
+        }
+        out = self._run_expected_tasks(body, spec, 'full')
+        self.assertTrue(out['query'], '有查询任务时不该走 terminal 规则')
+        self.assertEqual(out['terminal'], [])
+
+    def _expected_tasks_body(self):
+        with open(RUN_BENCH, encoding='utf-8') as f:
+            text = f.read()
+        m = re.search(r"^expected_tasks\(\).*?<<'PY'.*?^(.*?)^PY$", text, re.M | re.S)
+        self.assertIsNotNone(m, 'expected_tasks 的内嵌 python 找不到')
+        return m.group(1)
+
+    def _run_expected_tasks(self, body, spec, challenge):
+        loader = types.ModuleType('esrally.track.loader')
+        loader.render_template_from_file = lambda path, params: json.dumps(spec)
+        opts = types.ModuleType('esrally.utils.opts')
+        opts.to_dict = lambda raw: {}
+        modules = {'esrally': types.ModuleType('esrally'),
+                   'esrally.track': types.ModuleType('esrally.track'),
+                   'esrally.track.loader': loader,
+                   'esrally.utils': types.ModuleType('esrally.utils'),
+                   'esrally.utils.opts': opts}
+        fd, out = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        os.unlink(out)          # expected_tasks 用 'x' 独占创建，必须先移除空壳
+        try:
+            with patch.dict(sys.modules, modules), \
+                 patch.object(sys, 'argv', ['et', '/fake/track', '', out, challenge]):
+                exec(compile(body, '<expected_tasks>', 'exec'), {})
+            return json.load(open(out, encoding='utf-8'))
+        finally:
+            os.unlink(out)
 
 
 if __name__ == '__main__':

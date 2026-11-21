@@ -1276,13 +1276,14 @@ def visit(tasks):
         if group:
             expected[group].append(name)
 visit(full['schedule'])
-if not expected['query'] and pathlib.Path(root).name == 'geonames-upsert':
-    # upsert 协议没有 search：只允许其显式 final-stats 末任务作为生命周期完成证据。
-    if not flat or flat[-1] != ('final-stats', 'index-stats'):
-        raise ValueError('upsert 缺 final-stats 结束任务')
-    expected['terminal'] = ['final-stats']
+if not expected['query'] and flat and flat[-1][1] == 'index-stats':
+    # 无查询挑战以末任务 index-stats 作为生命周期完成证据：
+    #   upsert → final-stats；写入族（write-only）→ wait-until-merges-finish。
+    # race_metric_ok 对 terminal 组逐个断言"有指标且 0 错误"，因此该任务必须可上报
+    # （挑战里不得标 include-in-reporting: false，否则整场必 METRIC-NULL-FAIL）。
+    expected['terminal'] = [flat[-1][0]]
 if not expected['write'] or not (expected['query'] or expected['terminal']):
-    raise ValueError('full 必须声明写任务及查询任务（upsert 为 final-stats）')
+    raise ValueError('挑战缺写入任务，且既无查询任务也无 index-stats 收尾（write-only 族靠收尾任务证明跑完整段）')
 if len(set(expected['write'] + expected['query'])) != len(expected['write'] + expected['query']):
     raise ValueError('任务名重复')
 path = pathlib.Path(output)
