@@ -281,8 +281,10 @@ class RunnerWiringTests(unittest.TestCase):
         p = _lib_probe(
             '[ -z "$(track_engines geo-lite)" ] || { echo "geo-lite 不该限引擎" >&2; exit 1; }\n'
             'allow="$(track_engines geo-lite-enc)"\n'
-            'case " $allow " in *" easysearch "*&*" opensearch "*) ;; '
-            '*) echo "geo-lite-enc 引擎表不对: $allow" >&2; exit 1;; esac\n'
+            'case " $allow " in *" easysearch "*) ;; '
+            '*) echo "geo-lite-enc 缺 easysearch: $allow" >&2; exit 1;; esac\n'
+            'case " $allow " in *" opensearch "*) ;; '
+            '*) echo "geo-lite-enc 缺 opensearch: $allow" >&2; exit 1;; esac\n'
             'track_needs_enc geo-lite && { echo "明文臂不该装加密套件" >&2; exit 1; }\n'
             'track_needs_enc geo-lite-enc || { echo "加密臂漏了装机门" >&2; exit 1; }\n')
         self.assertEqual(p.returncode, 0, p.stderr)
